@@ -1,0 +1,3226 @@
+{% extends "base.html" %}
+
+{% block title %}Live Translator{% endblock %}
+
+{% block head_extra %}
+  <style>
+    /* This view is often used on a big screen: let it go full-width. */
+    :root {
+      --container: 100%;
+    }
+
+    /* Layout toggles (controlled via JS). */
+    .layout-hide-cz #czCard {
+      display: none;
+    }
+
+    .layout-hide-destb #destBCard {
+      display: none;
+    }
+
+    .layout-hide-cz.main-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    .layout-hide-destb.main-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.75fr);
+    }
+
+    .layout-hide-cz.layout-hide-destb.main-grid {
+      grid-template-columns: 1fr;
+    }
+
+    @media (max-width: 980px) {
+      .layout-hide-cz.main-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .layout-hide-destb.main-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Make the font size control less cramped. */
+    input[type="range"] {
+      width: 180px;
+      accent-color: var(--primary);
+    }
+
+    /* Disabled (unavailable) engine options appear grayed out. */
+    select option:disabled {
+      color: #999;
+      font-style: italic;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Compact header stats (latency, counts). */
+    .stats {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .stat {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 82%, var(--panel-2));
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .stat-value {
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-weight: 900;
+    }
+
+    /* --- Collapsible top bar: keep a thin stats row visible --- */
+    .topbar-inner {
+      align-items: stretch;
+      transition: padding 200ms ease;
+    }
+
+    .topbar-mainrow {
+      flex: 1 1 100%;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+      overflow: hidden;
+      max-height: 260px;
+      opacity: 1;
+      transform: translateY(0);
+      transition: max-height 220ms ease, opacity 180ms ease, transform 180ms ease;
+    }
+
+    .topbar-statsrow {
+      flex: 1 1 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+      min-width: 0;
+    }
+
+    .topbar-stats-left {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+
+    .topbar-stats-right {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--space-2);
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+    }
+
+    .topbar-stats-right > * {
+      flex: 0 0 auto;
+    }
+
+    .layout-compact-topbar .topbar-mainrow {
+      max-height: 0;
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+    }
+
+    .layout-compact-topbar .topbar-inner {
+      padding: 8px 10px;
+      gap: 0;
+    }
+
+    .layout-compact-topbar .topbar-statsrow .btn {
+      padding: 7px 10px;
+    }
+
+    .layout-compact-topbar .topbar-statsrow .icon-btn {
+      width: 36px;
+      height: 36px;
+    }
+
+    .layout-compact-topbar .topbar-statsrow .badge {
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+
+    .layout-compact-topbar .topbar-statsrow .stat {
+      padding: 6px 8px;
+      font-size: 11px;
+    }
+
+    #topbarCompactToggle .icon,
+    #fullscreenToggle .icon {
+      transition: transform 180ms ease;
+    }
+
+    .layout-compact-topbar #topbarCompactToggle .icon {
+      transform: rotate(180deg);
+    }
+  </style>
+{% endblock %}
+
+{% block header %}
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div id="topbarMainRow" class="topbar-mainrow">
+        <div class="brand">
+          <h1 class="brand-title">Live Translator</h1>
+          <p class="brand-subtitle">Web Speech API</p>
+        </div>
+        <div class="controls" role="group" aria-label="Controls">
+          <div class="control">
+            <label for="engineSelect">Engine</label>
+            <select id="engineSelect" aria-label="Speech engine">
+              <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="fontSize">Font</label>
+            <input
+              id="fontSize"
+              type="range"
+              min="12"
+              max="64"
+              step="1"
+              value="14"
+              aria-label="Transcript font size"
+            />
+          </div>
+          <div class="control">
+            <span class="toggle">
+              <input id="hideCz" type="checkbox" />
+              <label for="hideCz">Hide source language</label>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div id="topbarStatsRow" class="topbar-statsrow" role="group" aria-label="Stats bar">
+        <div class="topbar-stats-left" role="group" aria-label="Top bar actions">
+          <button class="btn icon-btn" id="topbarCompactToggle" type="button" aria-label="Hide top bar" title="Hide top bar" aria-pressed="false">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path fill="currentColor" d="M7 10l5 5 5-5H7z"/>
+            </svg>
+          </button>
+          <button class="btn icon-btn" id="fullscreenToggle" type="button" aria-label="Enter fullscreen" title="Enter fullscreen" aria-pressed="false">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path fill="currentColor" d="M7 14H5v5h5v-2H7v-3Zm0-4h3V7h2V5H5v5h2V7h3v3Zm10 7h-3v2h5v-5h-2v3Zm-3-12v2h3v3h2V5h-5Z"/>
+            </svg>
+          </button>
+          <button class="btn icon-btn" id="themeToggle" type="button" aria-label="Switch to dark theme" title="Switch to dark theme" aria-pressed="false">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" data-icon="sun" hidden>
+              <path fill="currentColor" d="M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12Zm0-16a1 1 0 0 1 1 1v1a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1Zm0 18a1 1 0 0 1 1 1v1a1 1 0 1 1-2 0v-1a1 1 0 0 1 1-1ZM4.22 5.64a1 1 0 0 1 1.41 0l.7.7a1 1 0 0 1-1.41 1.41l-.7-.7a1 1 0 0 1 0-1.41Zm13.15 13.15a1 1 0 0 1 1.41 0l.7.7a1 1 0 1 1-1.41 1.41l-.7-.7a1 1 0 0 1 0-1.41ZM2 13a1 1 0 0 1 1-1h1a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Zm18 0a1 1 0 0 1 1-1h1a1 1 0 1 1 0 2h-1a1 1 0 0 1-1-1ZM4.22 20.36a1 1 0 0 1 0-1.41l.7-.7a1 1 0 0 1 1.41 1.41l-.7.7a1 1 0 0 1-1.41 0ZM17.37 7.21a1 1 0 0 1 0-1.41l.7-.7a1 1 0 1 1 1.41 1.41l-.7.7a1 1 0 0 1-1.41 0Z"/>
+            </svg>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" data-icon="moon">
+              <path fill="currentColor" d="M10.5 2a.75.75 0 0 1 .7.98 7.5 7.5 0 1 0 9.32 9.32.75.75 0 0 1 1.23.8A9 9 0 1 1 9.72 1.07.75.75 0 0 1 10.5 2Z"/>
+            </svg>
+          </button>
+          <a class="btn icon-btn" id="githubRepoLink" href="https://github.com/Rhiz3K/realtime-stt-translator" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository" title="GitHub repository">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path
+                fill="currentColor"
+                d="M12 2C6.48 2 2 6.58 2 12.26c0 4.52 2.87 8.35 6.84 9.7.5.1.68-.22.68-.48 0-.24-.01-.86-.01-1.69-2.78.62-3.37-1.37-3.37-1.37-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1.01.07 1.54 1.07 1.54 1.07.9 1.58 2.36 1.12 2.94.86.09-.67.35-1.12.63-1.38-2.22-.26-4.56-1.15-4.56-5.12 0-1.13.39-2.06 1.03-2.78-.1-.26-.45-1.33.1-2.77 0 0 .84-.27 2.75 1.06a9.2 9.2 0 0 1 2.5-.35c.85 0 1.71.12 2.5.35 1.9-1.33 2.74-1.06 2.74-1.06.56 1.44.21 2.51.1 2.77.64.72 1.03 1.65 1.03 2.78 0 3.98-2.34 4.86-4.58 5.11.36.33.68.98.68 1.98 0 1.43-.01 2.58-.01 2.93 0 .26.18.58.69.48A10.02 10.02 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"
+              />
+            </svg>
+          </a>
+        </div>
+
+        <div class="topbar-stats-right" role="group" aria-label="Runtime controls">
+          <span class="badge badge--neutral" id="engineBadge" aria-label="Mode">Web Speech</span>
+          <button class="btn btn-primary" id="startButton" type="button" aria-label="Start recording">Start</button>
+          <button class="btn btn-danger" id="stopButton" type="button" aria-label="Stop recording" disabled>Stop</button>
+          <button class="btn icon-btn" id="settingsButton" type="button" aria-label="Settings" title="Settings">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path
+                fill="currentColor"
+                d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.1 7.1 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 12.9 1h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.58.23-1.12.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L1.72 7.98a.5.5 0 0 0 .12.64L3.87 10.2c-.04.31-.06.63-.06.94s.02.63.06.94L1.84 14.66a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.5.4 1.05.71 1.63.94l.36 2.54c.04.24.25.42.49.42h3.8c.24 0 .45-.18.49-.42l.36-2.54c.58-.23 1.12-.54 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM11 15a3 3 0 1 1 0-6 3 3 0 0 1 0 6Z"
+              />
+            </svg>
+          </button>
+          <span id="statusIndicator" class="badge badge--neutral" role="status" aria-live="polite">Disconnected</span>
+
+          <div class="stats" id="statsBar" role="group" aria-label="Stats">
+            <span class="stat" id="statLang" title="Translation languages (source -> targets)">
+              Lang
+              <span class="stat-value">—</span>
+            </span>
+            <span class="stat" id="statSegments" title="Segment counts">
+              Seg
+              <span class="stat-value">0/0</span>
+            </span>
+            <span class="stat" id="statStt" title="STT latency (time to first partial + last finalization)">
+              STT
+              <span class="stat-value">—</span>
+            </span>
+            <span class="stat" id="statTranslate" title="Translation latency (server translate + optional /ws round trip)">
+              TR
+              <span class="stat-value">—</span>
+            </span>
+            <span class="stat" id="statRtt" title="WebSocket ping/pong RTT (when supported)">
+              RTT
+              <span class="stat-value">—</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+{% endblock %}
+
+{% block message %}
+  <div id="uiMessage" class="message" role="status" aria-live="polite" hidden></div>
+
+  <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <div class="modal-overlay" data-close="true"></div>
+    <div class="modal-card" role="document">
+      <div class="modal-header">
+        <h2 class="modal-title" id="settingsTitle">Settings</h2>
+        <button class="btn icon-btn" type="button" id="settingsClose" aria-label="Close settings" title="Close">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M18.3 5.71 12 12.01l-6.3-6.3-1.41 1.41 6.3 6.3-6.3 6.29 1.41 1.41 6.3-6.29 6.3 6.29 1.41-1.41-6.3-6.29 6.3-6.3z"/>
+          </svg>
+        </button>
+      </div>
+
+      <form id="settingsForm">
+        <div class="modal-body">
+          <div class="field settings-section-title">Appearance</div>
+          <div class="form-grid" role="group" aria-label="Appearance">
+            <div class="field">
+              <label for="themeSelect">Theme</label>
+              <select id="themeSelect">
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+              <p class="hint">Overrides prefers-color-scheme</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="debugLogging" type="checkbox" />
+                <label for="debugLogging">Debug logging</label>
+              </span>
+              <p class="hint">Writes STT/WS events to the browser console</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Web Speech API</div>
+          <div class="form-grid" role="group" aria-label="Web Speech API">
+            <div class="field">
+              <label for="recognitionLang">Recognition language</label>
+              <select id="recognitionLang"></select>
+              <p class="hint">SpeechRecognition.lang (BCP-47)</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="processLocally" type="checkbox" />
+                <label for="processLocally">Process locally (experimental)</label>
+              </span>
+              <p class="hint">SpeechRecognition.processLocally</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="continuous" type="checkbox" />
+                <label for="continuous">Continuous</label>
+              </span>
+              <p class="hint">SpeechRecognition.continuous</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="interimResults" type="checkbox" />
+                <label for="interimResults">Interim results</label>
+              </span>
+              <p class="hint">SpeechRecognition.interimResults</p>
+            </div>
+            <div class="field">
+              <label for="maxAlternatives">Max alternatives</label>
+              <input id="maxAlternatives" type="number" min="1" max="5" step="1" />
+              <p class="hint">SpeechRecognition.maxAlternatives</p>
+            </div>
+            <div class="field">
+              <label for="phrases">Context phrases (experimental)</label>
+              <textarea id="phrases" rows="4" spellcheck="false" placeholder="one phrase per line, optionally: phrase|boost"></textarea>
+              <p class="hint">SpeechRecognition.phrases (SpeechRecognitionPhrase)</p>
+            </div>
+            <div class="field">
+              <button class="btn" id="checkWebSpeechLang" type="button">Check language availability</button>
+              <p class="hint" id="webSpeechLangStatus">&nbsp;</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Translation</div>
+          <div class="form-grid" role="group" aria-label="Translation">
+            <div class="field">
+              <label for="translateSrc">Source</label>
+              <select id="translateSrc"></select>
+            </div>
+            <div class="field">
+              <label for="translateDestA">Target A</label>
+              <select id="translateDestA"></select>
+            </div>
+            <div class="field">
+              <label for="translateDestB">Target B</label>
+              <select id="translateDestB"></select>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="translateInterim" type="checkbox" />
+                <label for="translateInterim">Translate interim text</label>
+              </span>
+              <p class="hint">More frequent updates; more load</p>
+            </div>
+            <div class="field">
+              <label for="interimInterval">Interim send interval (ms)</label>
+              <input id="interimInterval" type="number" min="150" max="5000" step="50" />
+              <p class="hint">Client-side throttle</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Deepgram API</div>
+          <div class="form-grid" role="group" aria-label="Deepgram API">
+            <div class="field">
+              <label for="deepgramModel">Deepgram model</label>
+              <select id="deepgramModel" disabled>
+                <option value="nova-3">nova-3</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="deepgramLanguage">Deepgram language</label>
+              <select id="deepgramLanguage"></select>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="deepgramInterimResults" type="checkbox" />
+                <label for="deepgramInterimResults">Deepgram interim results</label>
+              </span>
+              <p class="hint">Deepgram connect (interim_results)</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="deepgramPunctuate" type="checkbox" />
+                <label for="deepgramPunctuate">Punctuate</label>
+              </span>
+              <p class="hint">Deepgram connect (punctuate)</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">ElevenLabs Scribe</div>
+          <div class="form-grid" role="group" aria-label="ElevenLabs Scribe">
+            <div class="field">
+              <label for="elevenlabsMode">Mode</label>
+              <select id="elevenlabsMode">
+                <option value="server">Server-side (API key in .env)</option>
+                <option value="browser">Browser-side (own API key)</option>
+              </select>
+              <p class="hint">Browser mode connects directly to ElevenLabs</p>
+            </div>
+            <div class="field">
+              <label for="elevenlabsApiKey">API Key (browser mode)</label>
+              <input id="elevenlabsApiKey" type="password" autocomplete="off" placeholder="xi-..." />
+              <p class="hint">Stored locally, sent to our server only for token creation</p>
+            </div>
+            <div class="field">
+              <label for="elevenlabsLanguage">Language</label>
+              <select id="elevenlabsLanguage">
+                <option value="">(auto-detect)</option>
+              </select>
+              <p class="hint">Leave empty for auto-detection</p>
+            </div>
+            <div class="field">
+              <label for="elevenlabsCommitStrategy">Commit strategy</label>
+              <select id="elevenlabsCommitStrategy">
+                <option value="vad">VAD (auto)</option>
+                <option value="manual">Manual</option>
+              </select>
+              <p class="hint">VAD auto-commits on silence</p>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn" id="settingsCancel" type="button">Cancel</button>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="onboardingModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="onboardingTitle" hidden>
+    <div class="modal-overlay" data-close="true"></div>
+    <div class="modal-card" role="document">
+      <div class="modal-header">
+        <h2 class="modal-title" id="onboardingTitle">Language setup</h2>
+        <button class="btn icon-btn" type="button" id="onboardingClose" aria-label="Close language setup" title="Close">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M18.3 5.71 12 12.01l-6.3-6.3-1.41 1.41 6.3 6.3-6.3 6.29 1.41 1.41 6.3-6.29 6.3 6.29 1.41-1.41-6.3-6.29 6.3-6.3z"/>
+          </svg>
+        </button>
+      </div>
+
+      <form id="onboardingForm">
+        <div class="modal-body">
+          <p class="hint">Choose a source language and one or two target languages. You can change these later in Settings.</p>
+          <div class="form-grid" role="group" aria-label="Translation languages">
+            <div class="field">
+              <label for="onboardingSrc">Source</label>
+              <select id="onboardingSrc" required></select>
+            </div>
+            <div class="field">
+              <label for="onboardingDestA">Target A</label>
+              <select id="onboardingDestA" required></select>
+            </div>
+            <div class="field">
+              <label for="onboardingDestB">Target B (optional)</label>
+              <select id="onboardingDestB"></select>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn" id="onboardingCancel" type="button">Not now</button>
+          <button class="btn btn-primary" type="submit">Continue</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+
+{% block main_class %}main-grid{% endblock %}
+
+{% block main %}
+  <section id="czCard" class="card" aria-labelledby="czTitle">
+    <div class="card-header">
+      <h2 class="card-title" id="czTitle">Source</h2>
+    </div>
+    <div class="card-body">
+      <div class="log" id="recognizedContainer" tabindex="0" aria-label="Recognized text"></div>
+    </div>
+  </section>
+
+  <section id="destACard" class="card" aria-labelledby="enTitle">
+    <div class="card-header">
+      <h2 class="card-title" id="enTitle">Target A</h2>
+    </div>
+    <div class="card-body">
+      <div class="log" id="translationEnContainer" tabindex="0" aria-label="Translation"></div>
+    </div>
+  </section>
+
+  <section id="destBCard" class="card" aria-labelledby="ruTitle">
+    <div class="card-header">
+      <h2 class="card-title" id="ruTitle">Target B</h2>
+    </div>
+    <div class="card-body">
+      <div class="log" id="translationRuContainer" tabindex="0" aria-label="Translation"></div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+  <script>
+    // --- DOM elements ---
+    const engineSelect = document.getElementById('engineSelect');
+    const startButton = document.getElementById('startButton');
+    const stopButton  = document.getElementById('stopButton');
+    const statusIndicator = document.getElementById('statusIndicator');
+    const uiMessage = document.getElementById('uiMessage');
+    const fontSize = document.getElementById('fontSize');
+    const hideCz = document.getElementById('hideCz');
+    const engineBadge = document.getElementById('engineBadge');
+
+    // Top bar actions
+    const topbarCompactToggle = document.getElementById('topbarCompactToggle');
+    const fullscreenToggle = document.getElementById('fullscreenToggle');
+    const themeToggle = document.getElementById('themeToggle');
+    const githubRepoLink = document.getElementById('githubRepoLink');
+
+    // Header stats
+    const statLang = document.getElementById('statLang');
+    const statSegments = document.getElementById('statSegments');
+    const statStt = document.getElementById('statStt');
+    const statTranslate = document.getElementById('statTranslate');
+    const statRtt = document.getElementById('statRtt');
+    const statLangValue = statLang ? statLang.querySelector('.stat-value') : null;
+    const statSegmentsValue = statSegments ? statSegments.querySelector('.stat-value') : null;
+    const statSttValue = statStt ? statStt.querySelector('.stat-value') : null;
+    const statTranslateValue = statTranslate ? statTranslate.querySelector('.stat-value') : null;
+    const statRttValue = statRtt ? statRtt.querySelector('.stat-value') : null;
+
+    // Settings modal
+    const settingsButton = document.getElementById('settingsButton');
+    const settingsModal = document.getElementById('settingsModal');
+    const settingsClose = document.getElementById('settingsClose');
+    const settingsCancel = document.getElementById('settingsCancel');
+    const settingsForm = document.getElementById('settingsForm');
+
+    // Onboarding modal (first run language setup)
+    const onboardingModal = document.getElementById('onboardingModal');
+    const onboardingClose = document.getElementById('onboardingClose');
+    const onboardingCancel = document.getElementById('onboardingCancel');
+    const onboardingForm = document.getElementById('onboardingForm');
+    const onboardingSrcSelect = document.getElementById('onboardingSrc');
+    const onboardingDestASelect = document.getElementById('onboardingDestA');
+    const onboardingDestBSelect = document.getElementById('onboardingDestB');
+
+    const themeSelect = document.getElementById('themeSelect');
+    const debugLoggingCheckbox = document.getElementById('debugLogging');
+
+    const recognitionLangInput = document.getElementById('recognitionLang');
+    const translateSrcInput = document.getElementById('translateSrc');
+    const translateDestASelect = document.getElementById('translateDestA');
+    const translateDestBSelect = document.getElementById('translateDestB');
+    const continuousCheckbox = document.getElementById('continuous');
+    const interimResultsCheckbox = document.getElementById('interimResults');
+    const maxAlternativesInput = document.getElementById('maxAlternatives');
+    const processLocallyCheckbox = document.getElementById('processLocally');
+    const phrasesTextarea = document.getElementById('phrases');
+    const checkWebSpeechLangButton = document.getElementById('checkWebSpeechLang');
+    const webSpeechLangStatus = document.getElementById('webSpeechLangStatus');
+    const translateInterimCheckbox = document.getElementById('translateInterim');
+    const interimIntervalInput = document.getElementById('interimInterval');
+
+    const deepgramModelInput = document.getElementById('deepgramModel');
+    const deepgramLanguageInput = document.getElementById('deepgramLanguage');
+    const deepgramInterimResultsCheckbox = document.getElementById('deepgramInterimResults');
+    const deepgramPunctuateCheckbox = document.getElementById('deepgramPunctuate');
+
+    const elevenlabsModeInput = document.getElementById('elevenlabsMode');
+    const elevenlabsApiKeyInput = document.getElementById('elevenlabsApiKey');
+    const elevenlabsLanguageInput = document.getElementById('elevenlabsLanguage');
+    const elevenlabsCommitStrategyInput = document.getElementById('elevenlabsCommitStrategy');
+
+    const czTitleEl = document.getElementById('czTitle');
+    const enTitleEl = document.getElementById('enTitle');
+    const ruTitleEl = document.getElementById('ruTitle');
+
+    // Containers used to render segments
+    const recognizedContainer   = document.getElementById('recognizedContainer');
+    const translationEnContainer= document.getElementById('translationEnContainer');
+    const translationRuContainer= document.getElementById('translationRuContainer');
+
+    // WebSocket for translation
+    let socket;
+
+    // Deepgram audio pipeline
+    let audioContext;
+    let mediaStream;
+    let processor;
+    let gainNode;
+
+    // Enabled engines (from server env ENABLED_ENGINES).
+    const enabledEngines = new Set({{ enabled_engines | tojson }});
+
+    // Speech Recognition (Web Speech API)
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const webSpeechSupported = Boolean(SpeechRecognition);
+    let recognition = null;
+
+    // Some browsers (notably Chrome on Android) may emit onresult events where event.resultIndex
+    // can be 0 and event.results contains previously-finalized items. Track the highest finalized
+    // result index so we don't duplicate final segments.
+    let webSpeechLastFinalResultIndex = -1;
+    let webSpeechLastFinalText = '';
+    let webSpeechLastFinalAtMs = 0;
+
+    // --- Web Speech restart tracking ---
+    // Chrome frequently ends recognition sessions (silence timeout, network glitch,
+    // no-speech errors). We auto-restart in onend, but need to detect "flapping"
+    // (rapid restart loops) so we back off instead of burning CPU/network.
+    let _wsRestartCount = 0;
+    let _wsLastRestartAtMs = 0;
+    const _WS_RESTART_WINDOW_MS = 5000;     // reset counter after 5 s of stability
+    const _WS_RESTART_MAX_RAPID = 8;        // max rapid restarts before backing off
+    const _WS_RESTART_BACKOFF_MS = 3000;    // pause before next restart when flapping
+
+    // Web Speech API does not expose a public endpointing/pause setting for final results.
+    // To get faster updates we translate interim text with a client-side throttle.
+    let translateInterimEnabled = true;
+    let interimSendIntervalMs = 5000;
+    let lastInterimSentAtMs = 0;
+    let lastInterimSentText = '';
+
+    // Translation: source + 1-2 target languages (Target B is optional)
+    let translateSrc = 'cs';
+    let translateDestA = 'en';
+    let translateDestB = '';
+
+    // Engine
+    let currentEngine = 'webspeech';
+
+    // Web Speech parametry
+    let recognitionLang = 'cs-CZ';
+    let recognitionContinuous = true;
+    let recognitionInterimResults = true;
+    let recognitionMaxAlternatives = 1;
+    let recognitionProcessLocally = false;
+    let recognitionPhrasesText = '';
+
+    // Deepgram (client-side capture is fixed for this UI)
+    const DEEPGRAM_SAMPLE_RATE = 16000;
+
+    // Deepgram connect params (sent to server)
+    const deepgramModel = 'nova-3';
+    let deepgramLanguage = 'cs';
+    let deepgramInterimResults = true;
+    let deepgramPunctuate = true;
+
+    // ElevenLabs Scribe params
+    let elevenlabsMode = 'server';   // 'server' | 'browser'
+    let elevenlabsApiKey = '';       // user-provided key for browser mode (localStorage only)
+    let elevenlabsLanguage = '';
+    let elevenlabsCommitStrategy = 'vad';
+    let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
+
+    // Remote-provided language list for translation.
+    let translateLangChoices = null;
+
+    // --- WebSocket keepalive & auto-reconnect (Web Speech path) ---
+    let _wsKeepAliveId = null;
+    let _wsReconnectTimeoutId = null;
+    let _wsReconnectCount = 0;
+    const _WS_KEEPALIVE_MS = 25000;       // send ping every 25 s
+    const _WS_RECONNECT_MAX = 5;
+    const _WS_RECONNECT_DELAY_MS = 2000;  // 2 s between attempts
+
+    // Segment counters (each column separately, for alternating colors)
+    let czSegmentCount = 0;
+    let enSegmentCount = 0;
+    let ruSegmentCount = 0;
+
+    // --- Stats / timing ---
+    let _sessionStartPerf = 0;
+    let _sttTtfbMs = null;              // time-to-first-transcript
+    let _sttSegmentStartPerf = null;    // per-utterance start (best-effort)
+    let _sttLastFinalMs = null;
+    let _sttFinalEmaMs = null;
+
+    let _trLastServerMs = null;
+    let _trServerEmaMs = null;
+    let _trLastRttMs = null;
+    let _trRttEmaMs = null;
+
+    let _wsPingSentPerf = null;
+    let _wsLastRttMs = null;
+    let _wsRttEmaMs = null;
+
+    let _trNextClientId = 1;
+    const _trPending = new Map(); // client_id -> perfNow
+
+    function _ema(prev, next, alpha) {
+      const a = Number.isFinite(alpha) ? alpha : 0.25;
+      if (prev == null) return next;
+      return prev * (1 - a) + next * a;
+    }
+
+    function _fmtMs(value) {
+      if (value == null) return '—';
+      const v = Number(value);
+      if (!Number.isFinite(v)) return '—';
+      return String(Math.max(0, Math.round(v))) + 'ms';
+    }
+
+    function _resetStats() {
+      _sessionStartPerf = performance.now();
+      _sttTtfbMs = null;
+      _sttSegmentStartPerf = null;
+      _sttLastFinalMs = null;
+      _sttFinalEmaMs = null;
+      _trLastServerMs = null;
+      _trServerEmaMs = null;
+      _trLastRttMs = null;
+      _trRttEmaMs = null;
+      _wsPingSentPerf = null;
+      _wsLastRttMs = null;
+      _wsRttEmaMs = null;
+      _trPending.clear();
+      _trNextClientId = 1;
+      updateStatsBar();
+    }
+
+    function updateStatsBar() {
+      if (statSegmentsValue) {
+        const parts = [czSegmentCount, enSegmentCount];
+        if (String(translateDestB || '').trim()) {
+          parts.push(ruSegmentCount);
+        }
+        statSegmentsValue.textContent = parts.join('/');
+      }
+
+      if (statSttValue) {
+        const ttfb = _sttTtfbMs != null ? _fmtMs(_sttTtfbMs) : '—';
+        const fin = _sttLastFinalMs != null ? _fmtMs(_sttLastFinalMs) : '—';
+        statSttValue.textContent = `${ttfb} | ${fin}`;
+        if (statStt) {
+          const avg = _sttFinalEmaMs != null ? _fmtMs(_sttFinalEmaMs) : '—';
+          statStt.title = `STT latency: TTFB ${ttfb}, last final ${fin}, avg final ${avg}`;
+        }
+      }
+
+      if (statTranslateValue) {
+        const srv = _trLastServerMs != null ? _fmtMs(_trLastServerMs) : '—';
+        const rtt = _trLastRttMs != null ? _fmtMs(_trLastRttMs) : '—';
+        statTranslateValue.textContent = `${srv} | ${rtt}`;
+        if (statTranslate) {
+          const aSrv = _trServerEmaMs != null ? _fmtMs(_trServerEmaMs) : '—';
+          const aRtt = _trRttEmaMs != null ? _fmtMs(_trRttEmaMs) : '—';
+          statTranslate.title = `Translation: server ${srv} (avg ${aSrv}), /ws RTT ${rtt} (avg ${aRtt})`;
+        }
+      }
+
+      if (statRttValue) {
+        statRttValue.textContent = _wsLastRttMs != null ? _fmtMs(_wsLastRttMs) : '—';
+        if (statRtt) {
+          const avg = _wsRttEmaMs != null ? _fmtMs(_wsRttEmaMs) : '—';
+          statRtt.title = `WebSocket ping RTT: last ${statRttValue.textContent}, avg ${avg}`;
+        }
+      }
+    }
+
+    function clearMessage() {
+      uiMessage.textContent = '';
+      uiMessage.hidden = true;
+    }
+
+    function showMessage(text) {
+      uiMessage.textContent = text;
+      uiMessage.hidden = false;
+    }
+
+    function setStatus(state) {
+      statusIndicator.classList.remove('badge--neutral', 'badge--success', 'badge--danger', 'badge--warn');
+      if (state === 'connected') {
+        statusIndicator.classList.add('badge--success');
+        statusIndicator.textContent = 'Connected';
+        return;
+      }
+      if (state === 'connecting') {
+        statusIndicator.classList.add('badge--warn');
+        statusIndicator.textContent = 'Connecting…';
+        return;
+      }
+      if (state === 'error') {
+        statusIndicator.classList.add('badge--danger');
+        statusIndicator.textContent = 'Error';
+        return;
+      }
+      statusIndicator.classList.add('badge--neutral');
+      statusIndicator.textContent = 'Disconnected';
+    }
+
+    const SETTINGS_STORAGE_KEY = 'srlt_settings_v3';
+    const THEME_STORAGE_KEY = 'srlt_theme';
+    const DEBUG_STORAGE_KEY = 'srlt_debug';
+    const LAYOUT_FONT_STORAGE_KEY = 'srlt_log_font_px';
+    const LAYOUT_HIDE_CZ_STORAGE_KEY = 'srlt_hide_cz';
+    const TOPBAR_COMPACT_STORAGE_KEY = 'srlt_topbar_compact';
+    const FULLSCREEN_STORAGE_KEY = 'srlt_fullscreen';
+
+    let topbarCompactEnabled = false;
+    let fullscreenPreferred = false;
+
+    let onboardingRequired = false;
+    let _onboardingReturnFocus = null;
+
+    function hasSavedLanguageSettings() {
+      try {
+        const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return false;
+        const src = typeof parsed.translateSrc === 'string' ? parsed.translateSrc.trim() : '';
+        const a = typeof parsed.translateDestA === 'string' ? parsed.translateDestA.trim() : '';
+        return Boolean(src && a);
+      } catch (_e) {
+        return false;
+      }
+    }
+
+    function populateOnboardingLanguageLists() {
+      if (!onboardingSrcSelect || !onboardingDestASelect || !onboardingDestBSelect) return;
+      const tList = translateLangChoices || TRANSLATE_LANG_FALLBACK;
+
+      onboardingSrcSelect.replaceChildren();
+      onboardingDestASelect.replaceChildren();
+      onboardingDestBSelect.replaceChildren();
+
+      for (const item of tList) {
+        const optS = document.createElement('option');
+        optS.value = item.code;
+        optS.textContent = `${item.name} (${item.code})`;
+        onboardingSrcSelect.appendChild(optS);
+
+        const optA = document.createElement('option');
+        optA.value = item.code;
+        optA.textContent = `${item.name} (${item.code})`;
+        onboardingDestASelect.appendChild(optA);
+      }
+
+      const noneOpt = document.createElement('option');
+      noneOpt.value = '';
+      noneOpt.textContent = '(none)';
+      onboardingDestBSelect.appendChild(noneOpt);
+      for (const item of tList) {
+        const optB = document.createElement('option');
+        optB.value = item.code;
+        optB.textContent = `${item.name} (${item.code})`;
+        onboardingDestBSelect.appendChild(optB);
+      }
+
+      onboardingSrcSelect.value = translateSrc || 'cs';
+      onboardingDestASelect.value = translateDestA || 'en';
+      onboardingDestBSelect.value = String(translateDestB || '');
+    }
+
+    function openOnboarding() {
+      populateOnboardingLanguageLists();
+      onboardingModal.hidden = false;
+      _onboardingReturnFocus = document.activeElement;
+      if (onboardingSrcSelect) {
+        onboardingSrcSelect.focus();
+      }
+    }
+
+    function closeOnboarding() {
+      onboardingModal.hidden = true;
+      if (_onboardingReturnFocus && typeof _onboardingReturnFocus.focus === 'function') {
+        try { _onboardingReturnFocus.focus(); } catch (_e) { /* ignore */ }
+      } else if (settingsButton) {
+        settingsButton.focus();
+      }
+
+      if (onboardingRequired) {
+        showMessage('Language setup is required before you can start recording. Open Settings to configure it.');
+        if (startButton) {
+          startButton.disabled = true;
+        }
+      }
+    }
+
+    function saveOnboardingFromForm() {
+      translateSrc = onboardingSrcSelect.value || 'cs';
+      translateDestA = onboardingDestASelect.value || 'en';
+      translateDestB = String(onboardingDestBSelect.value || '').trim();
+      if (translateDestB && translateDestB === translateDestA) {
+        translateDestB = '';
+      }
+
+      populateSettingsLanguageLists();
+      applySettingsToForm();
+      updateTranslationTitles();
+      persistSettings();
+
+      onboardingRequired = false;
+      if (startButton) {
+        startButton.disabled = false;
+      }
+    }
+
+    const TRANSLATE_LANG_FALLBACK = [
+      { code: 'cs', name: 'Czech' },
+      { code: 'en', name: 'English' },
+      { code: 'de', name: 'German' },
+      { code: 'fr', name: 'French' },
+      { code: 'es', name: 'Spanish' },
+      { code: 'it', name: 'Italian' },
+      { code: 'pl', name: 'Polish' },
+      { code: 'uk', name: 'Ukrainian' },
+      { code: 'ru', name: 'Russian' },
+    ];
+
+    function clampInt(value, min, max, fallback) {
+      const parsed = Number.parseInt(String(value), 10);
+      if (!Number.isFinite(parsed)) {
+        return fallback;
+      }
+      return Math.min(max, Math.max(min, parsed));
+    }
+
+    function getTranslateLabel(code) {
+      const list = translateLangChoices || TRANSLATE_LANG_FALLBACK;
+      const found = list.find((l) => l.code === code);
+      return found ? found.name : code;
+    }
+
+    function applyRecognitionSettings() {
+      if (!recognition) {
+        return;
+      }
+      try {
+        recognition.lang = recognitionLang;
+        recognition.continuous = recognitionContinuous;
+        recognition.interimResults = recognitionInterimResults;
+        recognition.maxAlternatives = recognitionMaxAlternatives;
+
+        if ('processLocally' in recognition) {
+          try {
+            recognition.processLocally = Boolean(recognitionProcessLocally);
+          } catch (_e) {
+            // ignore
+          }
+        }
+
+        if ('phrases' in recognition && typeof window.SpeechRecognitionPhrase === 'function') {
+          const phraseLines = String(recognitionPhrasesText || '')
+            .split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 50);
+          const phraseObjects = phraseLines
+            .map((line) => {
+              const parts = line.split('|');
+              const phrase = (parts[0] || '').trim();
+              if (!phrase) {
+                return null;
+              }
+              const boostRaw = (parts[1] || '').trim();
+              const boost = boostRaw ? Number.parseFloat(boostRaw) : 1.0;
+              return new window.SpeechRecognitionPhrase(phrase, Number.isFinite(boost) ? boost : 1.0);
+            })
+            .filter(Boolean);
+
+          try {
+            recognition.phrases = phraseObjects;
+          } catch (_e) {
+            // ignore
+          }
+        }
+      } catch (e) {
+        console.debug('Unable to apply recognition settings:', e);
+      }
+    }
+
+    function applyEngineUi(engine) {
+      let e = ['deepgram', 'elevenlabs'].includes(engine) ? engine : 'webspeech';
+      // Fall back to first enabled engine if the selected one is disabled.
+      if (!enabledEngines.has(e)) {
+        e = enabledEngines.has('webspeech') ? 'webspeech'
+          : enabledEngines.has('deepgram') ? 'deepgram'
+          : enabledEngines.has('elevenlabs') ? 'elevenlabs'
+          : 'webspeech';
+      }
+      currentEngine = e;
+      engineSelect.value = e;
+      const labels = { webspeech: 'Web Speech', deepgram: 'Deepgram Nova-3', elevenlabs: 'ElevenLabs Scribe' };
+      engineBadge.textContent = labels[e] || e;
+      document.title = `Live Translator (${engineBadge.textContent})`;
+      try {
+        localStorage.setItem('srlt_engine', e);
+      } catch (_) {
+        // no-op
+      }
+
+      // Web Speech uses the browser recognizer; the connection badge is mostly noise.
+      if (statusIndicator) {
+        statusIndicator.hidden = e === 'webspeech';
+      }
+    }
+
+    function applyThemePreference(value) {
+      const v = value === 'light' || value === 'dark' ? value : 'system';
+      const root = document.documentElement;
+      if (v === 'system') {
+        root.removeAttribute('data-theme');
+      } else {
+        root.setAttribute('data-theme', v);
+      }
+
+      const meta = document.getElementById('themeColorMeta');
+      if (meta) {
+        const bg = v === 'dark' ? '#0b1220' : '#f6f7fb';
+        meta.setAttribute('content', bg);
+      }
+
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, v === 'system' ? '' : v);
+      } catch (_e) {
+        // no-op
+      }
+
+      updateThemeToggleUi();
+    }
+
+    function getThemePreference() {
+      try {
+        const v = localStorage.getItem(THEME_STORAGE_KEY);
+        return v === 'light' || v === 'dark' ? v : 'system';
+      } catch (_e) {
+        return 'system';
+      }
+    }
+
+    function getEffectiveTheme() {
+      const pref = getThemePreference();
+      if (pref === 'light' || pref === 'dark') {
+        return pref;
+      }
+      try {
+        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      } catch (_e) {
+        return 'light';
+      }
+    }
+
+    function updateThemeToggleUi() {
+      if (!themeToggle) return;
+      const effective = getEffectiveTheme();
+      const next = effective === 'dark' ? 'light' : 'dark';
+      const label = next === 'dark' ? 'Switch to dark theme' : 'Switch to light theme';
+      themeToggle.setAttribute('aria-label', label);
+      themeToggle.setAttribute('title', label);
+      themeToggle.setAttribute('aria-pressed', effective === 'dark' ? 'true' : 'false');
+
+      const sun = themeToggle.querySelector('[data-icon="sun"]');
+      const moon = themeToggle.querySelector('[data-icon="moon"]');
+      if (sun) sun.hidden = effective !== 'light';
+      if (moon) moon.hidden = effective !== 'dark';
+    }
+
+    function initThemeToggle() {
+      updateThemeToggleUi();
+
+      if (themeToggle) {
+        themeToggle.addEventListener('click', () => {
+          const effective = getEffectiveTheme();
+          const next = effective === 'dark' ? 'light' : 'dark';
+          applyThemePreference(next);
+          if (themeSelect) {
+            themeSelect.value = getThemePreference();
+          }
+        });
+      }
+
+      try {
+        const mm = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+        if (mm && typeof mm.addEventListener === 'function') {
+          mm.addEventListener('change', () => updateThemeToggleUi());
+        } else if (mm && typeof mm.addListener === 'function') {
+          mm.addListener(() => updateThemeToggleUi());
+        }
+      } catch (_e) {
+        // no-op
+      }
+    }
+
+    let debugEnabled = false;
+
+    function loadDebugPreference() {
+      try {
+        debugEnabled = localStorage.getItem(DEBUG_STORAGE_KEY) === '1';
+      } catch (_e) {
+        debugEnabled = false;
+      }
+    }
+
+    function setDebugPreference(enabled) {
+      debugEnabled = Boolean(enabled);
+      try {
+        localStorage.setItem(DEBUG_STORAGE_KEY, debugEnabled ? '1' : '0');
+      } catch (_e) {
+        // no-op
+      }
+    }
+
+    function dbg(...args) {
+      if (!debugEnabled) {
+        return;
+      }
+      console.log('[srlt]', ...args);
+    }
+
+    function applyFontSize(px) {
+      const v = Number(px);
+      if (!Number.isFinite(v)) return;
+      const clamped = Math.max(12, Math.min(64, v));
+      document.documentElement.style.setProperty('--log-font-size', `${clamped}px`);
+      try {
+        localStorage.setItem(LAYOUT_FONT_STORAGE_KEY, String(clamped));
+      } catch (_) {
+        // no-op
+      }
+    }
+
+    function applyHideCz(enabled) {
+      const main = document.getElementById('main');
+      if (!main) return;
+      main.classList.toggle('layout-hide-cz', Boolean(enabled));
+      try {
+        localStorage.setItem(LAYOUT_HIDE_CZ_STORAGE_KEY, enabled ? '1' : '0');
+      } catch (_) {
+        // no-op
+      }
+    }
+
+    function applyDestBVisibility() {
+      const main = document.getElementById('main');
+      if (!main) return;
+      const enabled = Boolean(String(translateDestB || '').trim());
+      main.classList.toggle('layout-hide-destb', !enabled);
+    }
+
+    function getTranslateDests() {
+      const dests = [];
+      const a = String(translateDestA || '').trim();
+      const b = String(translateDestB || '').trim();
+      if (a) dests.push(a);
+      if (b) dests.push(b);
+      return dests;
+    }
+
+    function applyTopbarCompact(enabled) {
+      topbarCompactEnabled = Boolean(enabled);
+      if (document.body) {
+        document.body.classList.toggle('layout-compact-topbar', topbarCompactEnabled);
+      }
+      try {
+        localStorage.setItem(TOPBAR_COMPACT_STORAGE_KEY, topbarCompactEnabled ? '1' : '0');
+      } catch (_e) {
+        // no-op
+      }
+
+      if (topbarCompactToggle) {
+        const label = topbarCompactEnabled ? 'Show top bar' : 'Hide top bar';
+        topbarCompactToggle.setAttribute('aria-label', label);
+        topbarCompactToggle.setAttribute('title', label);
+        topbarCompactToggle.setAttribute('aria-pressed', topbarCompactEnabled ? 'true' : 'false');
+      }
+    }
+
+    function initTopbarCompact() {
+      let stored = null;
+      try {
+        stored = localStorage.getItem(TOPBAR_COMPACT_STORAGE_KEY);
+      } catch (_e) {
+        stored = null;
+      }
+      applyTopbarCompact(stored === '1');
+
+      if (topbarCompactToggle) {
+        topbarCompactToggle.addEventListener('click', () => {
+          applyTopbarCompact(!topbarCompactEnabled);
+        });
+      }
+    }
+
+    function _fullscreenElement() {
+      return (
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.mozFullScreenElement ||
+        document.msFullscreenElement ||
+        null
+      );
+    }
+
+    function _isFullscreenSupported() {
+      const el = document.documentElement;
+      const req = el && (el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen);
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+      return Boolean(req && exit);
+    }
+
+    function _storeFullscreenPreference(enabled) {
+      fullscreenPreferred = Boolean(enabled);
+      try {
+        localStorage.setItem(FULLSCREEN_STORAGE_KEY, fullscreenPreferred ? '1' : '0');
+      } catch (_e) {
+        // no-op
+      }
+    }
+
+    function _setFullscreenUi(active) {
+      if (!fullscreenToggle) return;
+      const label = active ? 'Exit fullscreen' : 'Enter fullscreen';
+      fullscreenToggle.setAttribute('aria-label', label);
+      fullscreenToggle.setAttribute('title', label);
+      fullscreenToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+
+    async function _requestFullscreen() {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+      if (!req) {
+        throw new Error('Fullscreen not supported');
+      }
+      return req.call(el);
+    }
+
+    async function _exitFullscreen() {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+      if (!exit) {
+        return;
+      }
+      return exit.call(document);
+    }
+
+    async function toggleFullscreen() {
+      if (!_isFullscreenSupported()) {
+        showMessage('Fullscreen is not supported in this browser.');
+        return;
+      }
+
+      try {
+        const active = Boolean(_fullscreenElement());
+        _storeFullscreenPreference(!active);
+        if (active) {
+          await _exitFullscreen();
+        } else {
+          await _requestFullscreen();
+        }
+      } catch (e) {
+        _storeFullscreenPreference(false);
+        showMessage(`Unable to toggle fullscreen: ${e && e.message ? e.message : String(e)}`);
+      }
+    }
+
+    function maybeEnterFullscreenFromPreference() {
+      if (!fullscreenPreferred) return;
+      if (!_isFullscreenSupported()) return;
+      if (_fullscreenElement()) return;
+      _requestFullscreen().catch(() => {
+        _storeFullscreenPreference(false);
+      });
+    }
+
+    function initFullscreenControls() {
+      let stored = null;
+      try {
+        stored = localStorage.getItem(FULLSCREEN_STORAGE_KEY);
+      } catch (_e) {
+        stored = null;
+      }
+      fullscreenPreferred = stored === '1';
+
+      if (fullscreenToggle) {
+        if (!_isFullscreenSupported()) {
+          fullscreenToggle.disabled = true;
+          fullscreenToggle.setAttribute('title', 'Fullscreen not supported');
+        } else {
+          fullscreenToggle.addEventListener('click', () => {
+            toggleFullscreen();
+          });
+        }
+      }
+
+      let initialized = false;
+      const sync = () => {
+        const active = Boolean(_fullscreenElement());
+        _setFullscreenUi(active);
+        if (initialized) {
+          if (!active && fullscreenPreferred) {
+            _storeFullscreenPreference(false);
+          }
+          if (active && !fullscreenPreferred) {
+            _storeFullscreenPreference(true);
+          }
+        }
+      };
+      document.addEventListener('fullscreenchange', sync);
+      document.addEventListener('webkitfullscreenchange', sync);
+      document.addEventListener('mozfullscreenchange', sync);
+      document.addEventListener('MSFullscreenChange', sync);
+      sync();
+      initialized = true;
+    }
+
+    function initLayoutControls() {
+      let storedPx = null;
+      let storedHide = null;
+      try {
+        storedPx = localStorage.getItem(LAYOUT_FONT_STORAGE_KEY);
+        storedHide = localStorage.getItem(LAYOUT_HIDE_CZ_STORAGE_KEY);
+      } catch (_) {
+        // no-op
+      }
+
+      if (storedPx && fontSize) {
+        fontSize.value = storedPx;
+        applyFontSize(storedPx);
+      } else {
+        applyFontSize(fontSize ? fontSize.value : 14);
+      }
+
+      if (hideCz) {
+        hideCz.checked = storedHide === '1';
+        applyHideCz(hideCz.checked);
+      }
+
+      if (fontSize) {
+        fontSize.addEventListener('input', (e) => applyFontSize(e.target.value));
+      }
+
+      if (hideCz) {
+        hideCz.addEventListener('change', (e) => applyHideCz(e.target.checked));
+      }
+    }
+
+    function updateTranslationTitles() {
+      const srcLabel = translateSrc ? getTranslateLabel(translateSrc) : '';
+      if (czTitleEl) {
+        czTitleEl.textContent = srcLabel ? `Source (${srcLabel})` : 'Source';
+      }
+      if (recognizedContainer) {
+        recognizedContainer.setAttribute(
+          'aria-label',
+          srcLabel ? `Recognized text (Source: ${srcLabel})` : 'Recognized text'
+        );
+      }
+
+      if (statLangValue) {
+        const srcCode = String(translateSrc || '').trim();
+        const dests = getTranslateDests();
+        statLangValue.textContent = srcCode && dests.length ? `${srcCode} -> ${dests.join(', ')}` : '—';
+      }
+
+      const aLabel = translateDestA ? getTranslateLabel(translateDestA) : 'Target A';
+      enTitleEl.textContent = aLabel;
+      translationEnContainer.setAttribute('aria-label', aLabel ? `Translation: ${aLabel}` : 'Translation');
+
+      const bEnabled = Boolean(String(translateDestB || '').trim());
+      applyDestBVisibility();
+      if (bEnabled) {
+        const bLabel = getTranslateLabel(translateDestB);
+        ruTitleEl.textContent = bLabel;
+        translationRuContainer.setAttribute('aria-label', bLabel ? `Translation: ${bLabel}` : 'Translation');
+      } else {
+        ruTitleEl.textContent = 'Target B';
+        translationRuContainer.setAttribute('aria-label', 'Translation');
+      }
+    }
+
+    function populateSettingsLanguageLists() {
+      // Web Speech language list: there is no standard API to enumerate supported
+      // recognition languages, so we build a broad list from Intl + browser prefs.
+      const preferred = [];
+      try {
+        if (Array.isArray(navigator.languages)) {
+          preferred.push(...navigator.languages);
+        }
+        if (navigator.language) {
+          preferred.push(navigator.language);
+        }
+      } catch (_e) {
+        // no-op
+      }
+
+      let langSubtags = [];
+      try {
+        if (typeof Intl !== 'undefined' && typeof Intl.supportedValuesOf === 'function') {
+          langSubtags = Intl.supportedValuesOf('language') || [];
+        }
+      } catch (_e) {
+        // no-op
+      }
+
+      const displayNames =
+        typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function'
+          ? new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' })
+          : null;
+
+      const recoCodes = Array.from(
+        new Set([
+          ...preferred,
+          recognitionLang,
+          ...langSubtags,
+          // keep a few common region tags visible
+          'cs-CZ',
+          'en-US',
+          'en-GB',
+          'de-DE',
+          'fr-FR',
+          'es-ES',
+          'it-IT',
+          'pl-PL',
+          'uk-UA',
+          'ru-RU',
+        ])
+      )
+        .filter((c) => typeof c === 'string' && c.trim())
+        .map((c) => c.trim());
+
+      recoCodes.sort((a, b) => a.localeCompare(b));
+
+      recognitionLangInput.replaceChildren();
+      for (const code of recoCodes) {
+        const opt = document.createElement('option');
+        opt.value = code;
+        const base = code.split('-')[0];
+        const name = displayNames ? displayNames.of(base) : base;
+        opt.textContent = name ? `${name} (${code})` : code;
+        recognitionLangInput.appendChild(opt);
+      }
+
+      const tList = translateLangChoices || TRANSLATE_LANG_FALLBACK;
+      translateSrcInput.replaceChildren();
+      translateDestASelect.replaceChildren();
+      translateDestBSelect.replaceChildren();
+
+      const noneOpt = document.createElement('option');
+      noneOpt.value = '';
+      noneOpt.textContent = '(none)';
+      translateDestBSelect.appendChild(noneOpt);
+
+      for (const item of tList) {
+        const optSrc = document.createElement('option');
+        optSrc.value = item.code;
+        optSrc.textContent = `${item.name} (${item.code})`;
+        translateSrcInput.appendChild(optSrc);
+
+        const optA = document.createElement('option');
+        optA.value = item.code;
+        optA.textContent = `${item.name} (${item.code})`;
+        translateDestASelect.appendChild(optA);
+
+        const optB = document.createElement('option');
+        optB.value = item.code;
+        optB.textContent = `${item.name} (${item.code})`;
+        translateDestBSelect.appendChild(optB);
+      }
+
+      // Deepgram: model is fixed (nova-3), language list matches translation codes.
+      deepgramLanguageInput.replaceChildren();
+      for (const item of tList) {
+        const opt = document.createElement('option');
+        opt.value = item.code;
+        opt.textContent = `${item.name} (${item.code})`;
+        deepgramLanguageInput.appendChild(opt);
+      }
+
+      // ElevenLabs: auto-detect + language list.
+      elevenlabsLanguageInput.replaceChildren();
+      const autoOpt = document.createElement('option');
+      autoOpt.value = '';
+      autoOpt.textContent = '(auto-detect)';
+      elevenlabsLanguageInput.appendChild(autoOpt);
+      for (const item of tList) {
+        const opt = document.createElement('option');
+        opt.value = item.code;
+        opt.textContent = `${item.name} (${item.code})`;
+        elevenlabsLanguageInput.appendChild(opt);
+      }
+    }
+
+    function applySettingsToForm() {
+      if (themeSelect) {
+        themeSelect.value = getThemePreference();
+      }
+      if (debugLoggingCheckbox) {
+        debugLoggingCheckbox.checked = debugEnabled;
+      }
+
+      recognitionLangInput.value = recognitionLang;
+      translateSrcInput.value = translateSrc;
+      translateDestASelect.value = translateDestA;
+      translateDestBSelect.value = translateDestB;
+      continuousCheckbox.checked = recognitionContinuous;
+      interimResultsCheckbox.checked = recognitionInterimResults;
+      maxAlternativesInput.value = String(recognitionMaxAlternatives);
+      processLocallyCheckbox.checked = Boolean(recognitionProcessLocally);
+      phrasesTextarea.value = String(recognitionPhrasesText || '');
+      translateInterimCheckbox.checked = translateInterimEnabled;
+      interimIntervalInput.value = String(interimSendIntervalMs);
+
+      deepgramModelInput.value = deepgramModel;
+      deepgramLanguageInput.value = deepgramLanguage;
+      deepgramInterimResultsCheckbox.checked = deepgramInterimResults;
+      deepgramPunctuateCheckbox.checked = deepgramPunctuate;
+
+      elevenlabsModeInput.value = elevenlabsMode;
+      elevenlabsApiKeyInput.value = elevenlabsApiKey;
+      elevenlabsLanguageInput.value = elevenlabsLanguage;
+      elevenlabsCommitStrategyInput.value = elevenlabsCommitStrategy;
+    }
+
+    function loadSettings() {
+      try {
+        const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (!raw) {
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') {
+          return;
+        }
+        if (typeof parsed.recognitionLang === 'string') {
+          recognitionLang = parsed.recognitionLang;
+        }
+        if (typeof parsed.recognitionContinuous === 'boolean') {
+          recognitionContinuous = parsed.recognitionContinuous;
+        }
+        if (typeof parsed.recognitionInterimResults === 'boolean') {
+          recognitionInterimResults = parsed.recognitionInterimResults;
+        }
+        if (Number.isFinite(parsed.recognitionMaxAlternatives)) {
+          recognitionMaxAlternatives = clampInt(parsed.recognitionMaxAlternatives, 1, 5, 1);
+        }
+        if (typeof parsed.recognitionProcessLocally === 'boolean') {
+          recognitionProcessLocally = parsed.recognitionProcessLocally;
+        }
+        if (typeof parsed.recognitionPhrasesText === 'string') {
+          recognitionPhrasesText = parsed.recognitionPhrasesText;
+        }
+
+        if (typeof parsed.translateSrc === 'string') {
+          translateSrc = parsed.translateSrc;
+        }
+        if (typeof parsed.translateDestA === 'string') {
+          translateDestA = parsed.translateDestA;
+        }
+        if (typeof parsed.translateDestB === 'string') {
+          translateDestB = parsed.translateDestB;
+        }
+        if (typeof parsed.translateInterimEnabled === 'boolean') {
+          translateInterimEnabled = parsed.translateInterimEnabled;
+        }
+        if (Number.isFinite(parsed.interimSendIntervalMs)) {
+          interimSendIntervalMs = clampInt(parsed.interimSendIntervalMs, 500, 30000, 5000);
+        }
+
+        if (typeof parsed.engine === 'string') {
+          currentEngine = ['deepgram', 'elevenlabs'].includes(parsed.engine)
+            ? parsed.engine
+            : 'webspeech';
+        }
+
+        if (typeof parsed.deepgramLanguage === 'string' && parsed.deepgramLanguage.trim()) {
+          deepgramLanguage = parsed.deepgramLanguage.trim();
+        }
+        if (typeof parsed.deepgramInterimResults === 'boolean') {
+          deepgramInterimResults = parsed.deepgramInterimResults;
+        }
+        if (typeof parsed.deepgramPunctuate === 'boolean') {
+          deepgramPunctuate = parsed.deepgramPunctuate;
+        }
+
+        if (typeof parsed.elevenlabsMode === 'string') {
+          elevenlabsMode = parsed.elevenlabsMode === 'browser' ? 'browser' : 'server';
+        }
+        if (typeof parsed.elevenlabsApiKey === 'string') {
+          elevenlabsApiKey = parsed.elevenlabsApiKey;
+        }
+        if (typeof parsed.elevenlabsLanguage === 'string') {
+          elevenlabsLanguage = parsed.elevenlabsLanguage;
+        }
+        if (typeof parsed.elevenlabsCommitStrategy === 'string') {
+          elevenlabsCommitStrategy = parsed.elevenlabsCommitStrategy === 'manual' ? 'manual' : 'vad';
+        }
+      } catch (_e) {
+        // ignore invalid storage
+      }
+    }
+
+    function persistSettings() {
+      try {
+        localStorage.setItem(
+          SETTINGS_STORAGE_KEY,
+          JSON.stringify({
+            engine: currentEngine,
+            recognitionLang,
+            recognitionContinuous,
+            recognitionInterimResults,
+            recognitionMaxAlternatives,
+            recognitionProcessLocally,
+            recognitionPhrasesText,
+            translateSrc,
+            translateDestA,
+            translateDestB,
+            translateInterimEnabled,
+            interimSendIntervalMs,
+            deepgramModel,
+            deepgramLanguage,
+            deepgramInterimResults,
+            deepgramPunctuate,
+            elevenlabsMode,
+            elevenlabsApiKey,
+            elevenlabsLanguage,
+            elevenlabsCommitStrategy,
+          })
+        );
+      } catch (_e) {
+        // ignore quota / private mode
+      }
+    }
+
+    function openSettings() {
+      populateSettingsLanguageLists();
+      applySettingsToForm();
+      settingsModal.hidden = false;
+      recognitionLangInput.focus();
+    }
+
+    function closeSettings() {
+      settingsModal.hidden = true;
+      settingsButton.focus();
+    }
+
+    function saveSettingsFromForm() {
+      const prevA = translateDestA;
+      const prevB = translateDestB;
+
+      if (themeSelect) {
+        applyThemePreference(themeSelect.value);
+      }
+      if (debugLoggingCheckbox) {
+        setDebugPreference(debugLoggingCheckbox.checked);
+      }
+
+      recognitionLang = recognitionLangInput.value || 'cs-CZ';
+      translateSrc = translateSrcInput.value || 'cs';
+      translateDestA = translateDestASelect.value || 'en';
+      translateDestB = String(translateDestBSelect.value || '').trim();
+      if (translateDestB && translateDestA === translateDestB) {
+        translateDestB = '';
+      }
+
+      recognitionContinuous = Boolean(continuousCheckbox.checked);
+      recognitionInterimResults = Boolean(interimResultsCheckbox.checked);
+      recognitionMaxAlternatives = clampInt(maxAlternativesInput.value, 1, 5, 1);
+      recognitionProcessLocally = Boolean(processLocallyCheckbox.checked);
+      recognitionPhrasesText = String(phrasesTextarea.value || '');
+
+      translateInterimEnabled = Boolean(translateInterimCheckbox.checked);
+      interimSendIntervalMs = clampInt(interimIntervalInput.value, 500, 30000, 5000);
+
+      // Model is fixed (nova-3)
+      deepgramLanguage = deepgramLanguageInput.value || 'cs';
+      deepgramInterimResults = Boolean(deepgramInterimResultsCheckbox.checked);
+      deepgramPunctuate = Boolean(deepgramPunctuateCheckbox.checked);
+
+      // ElevenLabs
+      elevenlabsMode = elevenlabsModeInput.value === 'browser' ? 'browser' : 'server';
+      elevenlabsApiKey = (elevenlabsApiKeyInput.value || '').trim();
+      elevenlabsLanguage = elevenlabsLanguageInput.value || '';
+      elevenlabsCommitStrategy = elevenlabsCommitStrategyInput.value === 'manual' ? 'manual' : 'vad';
+
+      persistSettings();
+
+      populateSettingsLanguageLists();
+      applySettingsToForm();
+      applyRecognitionSettings();
+      updateTranslationTitles();
+
+      if (!String(translateDestB || '').trim()) {
+        translationRuContainer.replaceChildren();
+        ruSegmentCount = 0;
+      }
+
+      if (prevA !== translateDestA || prevB !== translateDestB) {
+        translationEnContainer.replaceChildren();
+        translationRuContainer.replaceChildren();
+        enSegmentCount = 0;
+        ruSegmentCount = 0;
+      }
+
+      updateStatsBar();
+
+      // Completing language selection means onboarding is no longer required.
+      if (typeof onboardingRequired === 'boolean') {
+        onboardingRequired = false;
+        if (startButton) {
+          startButton.disabled = false;
+        }
+      }
+
+      // If recording is active, stop it so new params apply on next start.
+      if (!stopButton.disabled) {
+        try {
+          stopRecording();
+        } catch (_e) {
+          // no-op
+        }
+      }
+    }
+
+    if (SpeechRecognition) {
+      recognition = new SpeechRecognition();
+      applyRecognitionSettings();
+
+      recognition.onstart = () => {
+        webSpeechLastFinalResultIndex = -1;
+        webSpeechLastFinalText = '';
+        webSpeechLastFinalAtMs = 0;
+        _sttSegmentStartPerf = null;
+        dbg('webspeech:start', {
+          lang: recognitionLang,
+          continuous: recognitionContinuous,
+          interimResults: recognitionInterimResults,
+          maxAlternatives: recognitionMaxAlternatives,
+          processLocally: recognitionProcessLocally,
+        });
+      };
+
+      recognition.onaudiostart = () => {
+        // Best-effort utterance timing.
+        if (_sttSegmentStartPerf == null) {
+          _sttSegmentStartPerf = performance.now();
+        }
+      };
+
+      recognition.onspeechstart = () => {
+        _sttSegmentStartPerf = performance.now();
+      };
+
+      recognition.onresult = (event) => {
+        dbg('webspeech:onresult', {
+          resultIndex: event.resultIndex,
+          resultsLength: event.results ? event.results.length : null,
+          lastFinalIndex: webSpeechLastFinalResultIndex,
+        });
+
+        if (_sttTtfbMs == null) {
+          _sttTtfbMs = performance.now() - _sessionStartPerf;
+          updateStatsBar();
+        }
+
+        const finalParts = [];
+        const interimParts = [];
+
+        // Start past already-processed final results to avoid re-logging / re-processing
+        // them on every subsequent onresult event (Chrome can fire dozens of events where
+        // the only change is in higher indices, but results[0..N] are still isFinal=true).
+        const loopStart = Math.max(0, webSpeechLastFinalResultIndex + 1);
+        for (let i = loopStart; i < event.results.length; i++) {
+          const result = event.results[i];
+          const text = result && result[0] ? result[0].transcript : '';
+          dbg('webspeech:result', { i, isFinal: Boolean(result && result.isFinal), text });
+          if (!text) {
+            continue;
+          }
+
+          if (result.isFinal) {
+            finalParts.push(text);
+            webSpeechLastFinalResultIndex = i;
+          } else {
+            interimParts.push(text);
+          }
+        }
+
+        // 1) Render interim + final in the Source column
+        //    - Final is added as a new segment (prepend)
+        //    - Interim is shown as a temporary (italic) element
+        
+        // Remove the previous interim element (if present)
+        removeInterimElement(recognizedContainer);
+
+        // Add final results as new segments
+        for (const part of finalParts) {
+          const finalTrimmed = String(part).trim();
+          if (!finalTrimmed) {
+            continue;
+          }
+
+          // Extra dedupe for Android Chrome where the same final may be emitted repeatedly.
+          // Window is kept short (400 ms) to avoid dropping legitimate repeated phrases.
+          const nowMs = Date.now();
+          if (finalTrimmed === webSpeechLastFinalText && nowMs - webSpeechLastFinalAtMs < 400) {
+            dbg('webspeech:dedupe-skip', { text: finalTrimmed, deltaMs: nowMs - webSpeechLastFinalAtMs });
+            continue;
+          }
+          webSpeechLastFinalText = finalTrimmed;
+          webSpeechLastFinalAtMs = nowMs;
+
+          czSegmentCount++;
+          addSegment(recognizedContainer, czSegmentCount, finalTrimmed);
+
+          if (_sttSegmentStartPerf != null) {
+            const sttMs = performance.now() - _sttSegmentStartPerf;
+            _sttLastFinalMs = sttMs;
+            _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+            _sttSegmentStartPerf = null;
+            updateStatsBar();
+          }
+
+          // Send final to translation
+          dbg('ws:/ws send', { type: 'final', text: finalTrimmed });
+          sendTranslateWsMessage('final', finalTrimmed);
+
+          // Reset interim throttle (new segment)
+          lastInterimSentText = '';
+          lastInterimSentAtMs = 0;
+        }
+
+        // Render interim text as a temporary element
+        const interimTrimmed = interimParts.join('').trim();
+        if (interimTrimmed) {
+          showInterim(recognizedContainer, interimTrimmed);
+
+          if (_sttSegmentStartPerf == null) {
+            _sttSegmentStartPerf = performance.now();
+          }
+
+          // Also (throttled) send it for more frequent translation updates.
+          const now = Date.now();
+          if (
+            socket &&
+            socket.readyState === WebSocket.OPEN &&
+            translateInterimEnabled &&
+            interimTrimmed !== lastInterimSentText &&
+            now - lastInterimSentAtMs >= interimSendIntervalMs
+          ) {
+            lastInterimSentText = interimTrimmed;
+            lastInterimSentAtMs = now;
+            dbg('ws:/ws send', { type: 'interim', text: interimTrimmed, intervalMs: interimSendIntervalMs });
+            sendTranslateWsMessage('interim', interimTrimmed);
+          }
+        }
+      };
+
+      recognition.onend = () => {
+        // Keep going unless the user stopped recording
+        if (stopButton.disabled) {
+          dbg('webspeech:end (user stopped, not restarting)');
+          return;
+        }
+
+        const now = Date.now();
+        // Reset rapid-restart counter if we've been stable for a while.
+        if (now - _wsLastRestartAtMs > _WS_RESTART_WINDOW_MS) {
+          _wsRestartCount = 0;
+        }
+        _wsRestartCount++;
+        _wsLastRestartAtMs = now;
+
+        dbg('webspeech:end → restart', { count: _wsRestartCount, max: _WS_RESTART_MAX_RAPID });
+
+        if (_wsRestartCount > _WS_RESTART_MAX_RAPID) {
+          // Back off to prevent flapping (rapid error→end→start loops).
+          dbg('webspeech:backoff', { delayMs: _WS_RESTART_BACKOFF_MS });
+          setTimeout(() => {
+            if (!stopButton.disabled) {
+              try { recognition.start(); } catch (_e) { /* already started */ }
+            }
+          }, _WS_RESTART_BACKOFF_MS);
+          return;
+        }
+
+        try {
+          recognition.start();
+        } catch (_e) {
+          // InvalidStateError if already started — safe to ignore.
+        }
+      };
+
+      recognition.onerror = (event) => {
+        dbg('webspeech:error', { error: event.error, message: event.message });
+
+        // Fatal errors — stop recording and notify user.
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          console.error('Speech recognition permission denied:', event.error);
+          showMessage('Permission to use microphone is denied. Allow microphone access and try again.');
+          stopRecording();
+          return;
+        }
+
+        // Transient/expected errors — Chrome fires these often in continuous mode.
+        // 'no-speech': silence for ~5 s → onend will fire and restart.
+        // 'network': temporary connectivity issue → onend restarts.
+        // 'aborted': browser internally reset the session → onend restarts.
+        // 'audio-capture': mic temporarily unavailable.
+        // We just log them; onend handles the restart.
+        if (event.error === 'no-speech') {
+          dbg('webspeech:no-speech (expected in continuous mode, will auto-restart)');
+          return;
+        }
+        if (event.error === 'network' || event.error === 'aborted') {
+          dbg('webspeech:transient-error', { error: event.error });
+          return;
+        }
+
+        // Unexpected errors — log prominently but still let onend restart.
+        console.error('Speech recognition error:', event.error);
+      };
+
+      recognition.onnomatch = (event) => {
+        // Fired when speech was detected but not recognized with sufficient confidence.
+        // This is normal for background noise, mumbling, etc.
+        // onend fires after this and will restart the session.
+        dbg('webspeech:nomatch (low confidence, will auto-restart)');
+      };
+    }
+
+    // Helpers
+    function removeInterimElement(container) {
+      const interimEl = container.querySelector('.interim');
+      if (interimEl) {
+        interimEl.remove();
+      }
+    }
+
+    function showInterim(container, text) {
+      // Insert <div class="interim">...</div> at the top (prepend).
+      const interimDiv = document.createElement('div');
+      interimDiv.classList.add('interim');
+      interimDiv.textContent = text;
+      container.prepend(interimDiv);
+    }
+
+    function addSegment(container, segmentIndex, text) {
+      const segmentDiv = document.createElement('div');
+      segmentDiv.classList.add('segment');
+      
+      // Alternating colors
+      if (segmentIndex % 2 === 0) {
+        segmentDiv.classList.add('segment-even');
+      } else {
+        segmentDiv.classList.add('segment-odd');
+      }
+
+      // Timestamp
+      const time = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+
+      // Safe text insertion (XSS protection)
+      const timestampSpan = document.createElement('span');
+      timestampSpan.classList.add('timestamp');
+      timestampSpan.textContent = time;
+      segmentDiv.appendChild(timestampSpan);
+      segmentDiv.appendChild(document.createTextNode(' ' + text));
+
+      container.prepend(segmentDiv);
+      updateStatsBar();
+    }
+
+    // Controls
+    startButton.addEventListener('click', startRecording);
+    stopButton.addEventListener('click', stopRecording);
+
+    function initEngineToggle() {
+      let stored = null;
+      try {
+        stored = localStorage.getItem('srlt_engine');
+      } catch (_) {
+        // no-op
+      }
+
+      const initial = (stored && enabledEngines.has(stored)) ? stored : currentEngine;
+      applyEngineUi(initial);
+
+      engineSelect.addEventListener('change', () => {
+        const next = engineSelect.value;
+        try {
+          stopRecording();
+        } catch (_) {
+          // no-op
+        }
+        applyEngineUi(next);
+      });
+    }
+
+    function resetSessionUi() {
+      recognizedContainer.replaceChildren();
+      translationEnContainer.replaceChildren();
+      translationRuContainer.replaceChildren();
+      czSegmentCount = 0;
+      enSegmentCount = 0;
+      ruSegmentCount = 0;
+      lastInterimSentText = '';
+      lastInterimSentAtMs = 0;
+      _resetStats();
+    }
+
+    function applySocketLifecycleHandlers() {
+      if (!socket) return;
+      socket.onopen = () => {
+        console.log('WebSocket connected');
+        setStatus('connected');
+      };
+      socket.onclose = () => {
+        console.log('WebSocket closed');
+        setStatus('disconnected');
+      };
+      socket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        setStatus('error');
+        showMessage('WebSocket error. Check your connection and try again.');
+      };
+    }
+
+    function handleTranslationMessage(data) {
+      // Update translation stats (server time + optional /ws RTT correlation).
+      const nowPerf = performance.now();
+      if (data && typeof data.client_id === 'number' && _trPending.has(data.client_id)) {
+        const sentPerf = _trPending.get(data.client_id);
+        _trPending.delete(data.client_id);
+        const rtt = nowPerf - sentPerf;
+        _trLastRttMs = rtt;
+        _trRttEmaMs = _ema(_trRttEmaMs, rtt, 0.25);
+      }
+
+      if (data && data.timing && typeof data.timing.translate_ms === 'number') {
+        const srv = data.timing.translate_ms;
+        _trLastServerMs = srv;
+        _trServerEmaMs = _ema(_trServerEmaMs, srv, 0.25);
+      }
+
+      const translations =
+        data && typeof data.translations === 'object' && data.translations
+          ? data.translations
+          : { en: data.en || '', ru: data.ru || '' };
+
+      const serverDests = data && Array.isArray(data.dests) ? data.dests : [];
+      const aCode = String(translateDestA || '').trim() || String(serverDests[0] || '').trim() || 'en';
+      const bCode = String(translateDestB || '').trim();
+
+      const aText =
+        (translations[aCode] || '') ||
+        (translations.en || '') ||
+        (serverDests[0] && translations[serverDests[0]] ? translations[serverDests[0]] : '');
+
+      const bText =
+        bCode
+          ? (translations[bCode] || '') ||
+            (translations.ru || '') ||
+            (serverDests[1] && translations[serverDests[1]] ? translations[serverDests[1]] : '')
+          : '';
+
+      const msgType = data.type || 'final';
+      if (msgType === 'interim') {
+        removeInterimElement(translationEnContainer);
+        removeInterimElement(translationRuContainer);
+
+        const aTrimmed = String(aText || '').trim();
+        const bTrimmed = String(bText || '').trim();
+
+        if (aTrimmed) {
+          showInterim(translationEnContainer, aTrimmed);
+        }
+        if (bCode && bTrimmed) {
+          showInterim(translationRuContainer, bTrimmed);
+        }
+        updateStatsBar();
+        return;
+      }
+
+      const aTrimmed = String(aText || '').trim();
+      const bTrimmed = String(bText || '').trim();
+
+      // Don't drop the interim translation if the final translation is empty (e.g. translator failure).
+      if (aTrimmed) {
+        removeInterimElement(translationEnContainer);
+        enSegmentCount++;
+        addSegment(translationEnContainer, enSegmentCount, aTrimmed);
+      }
+      if (bCode && bTrimmed) {
+        removeInterimElement(translationRuContainer);
+        ruSegmentCount++;
+        addSegment(translationRuContainer, ruSegmentCount, bTrimmed);
+      }
+
+      updateStatsBar();
+    }
+
+    function _prunePendingTranslate(nowPerf) {
+      // Best-effort cleanup for dropped interim translations.
+      if (_trPending.size <= 40) return;
+      for (const [id, sentPerf] of _trPending.entries()) {
+        if (nowPerf - sentPerf > 60000) {
+          _trPending.delete(id);
+        }
+      }
+      if (_trPending.size > 120) {
+        _trPending.clear();
+      }
+    }
+
+    function sendTranslateWsMessage(msgType, text) {
+      const t = String(text || '').trim();
+      if (!t) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const nowPerf = performance.now();
+      _prunePendingTranslate(nowPerf);
+      const clientId = _trNextClientId++;
+      _trPending.set(clientId, nowPerf);
+      try {
+        socket.send(JSON.stringify({ type: msgType, text: t, client_id: clientId, client_sent_ms: nowPerf }));
+      } catch (_e) {
+        _trPending.delete(clientId);
+      }
+    }
+
+    // --- WebSocket keepalive / reconnect helpers ---
+
+    function _wsUrl(path) {
+      const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return scheme + '//' + location.host + path;
+    }
+
+    function _stopWsTimers() {
+      if (_wsKeepAliveId != null) { clearInterval(_wsKeepAliveId); _wsKeepAliveId = null; }
+      if (_wsReconnectTimeoutId != null) { clearTimeout(_wsReconnectTimeoutId); _wsReconnectTimeoutId = null; }
+    }
+
+    function _startWsKeepAlive() {
+      _stopWsTimers();
+      _wsKeepAliveId = setInterval(() => {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          _wsPingSentPerf = performance.now();
+          try { socket.send(JSON.stringify({ type: 'ping' })); } catch (_e) { /* ignore */ }
+        }
+      }, _WS_KEEPALIVE_MS);
+    }
+
+    /**
+     * (Re-)create the /ws WebSocket used by the Web Speech path.
+     * Called on initial start and on automatic reconnect.
+     */
+    function _connectTranslateWs() {
+      // Make sure any previous socket is cleaned up.
+      if (socket) {
+        try { socket.onclose = null; socket.onerror = null; socket.close(); } catch (_e) { /* ignore */ }
+      }
+
+      socket = new WebSocket(_wsUrl('/ws'));
+
+      socket.onopen = () => {
+        console.log('WebSocket connected');
+        setStatus('connected');
+        _wsReconnectCount = 0;
+        _startWsKeepAlive();
+        try {
+          const dests = getTranslateDests();
+          dbg('ws:/ws send', { type: 'config', translate: { src: translateSrc, dests } });
+          socket.send(
+            JSON.stringify({
+              type: 'config',
+              translate: { src: translateSrc, dests },
+            })
+          );
+        } catch (_e) {
+          // no-op
+        }
+      };
+
+      socket.onclose = () => {
+        console.log('WebSocket closed');
+        _stopWsTimers();
+        // Auto-reconnect while the user hasn't pressed Stop.
+        if (!stopButton.disabled && _wsReconnectCount < _WS_RECONNECT_MAX) {
+          _wsReconnectCount++;
+          setStatus('connecting');
+          dbg('ws reconnect', { attempt: _wsReconnectCount, max: _WS_RECONNECT_MAX });
+          _wsReconnectTimeoutId = setTimeout(_connectTranslateWs, _WS_RECONNECT_DELAY_MS);
+        } else if (!stopButton.disabled) {
+          setStatus('error');
+          showMessage('WebSocket connection lost. Press Stop and Start to try again.');
+        }
+      };
+
+      socket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        // onclose fires after onerror and handles reconnect.
+      };
+
+      socket.onmessage = (event) => {
+        let data;
+        try { data = JSON.parse(event.data); } catch (_e) { return; }
+        if (data.type === 'pong') {
+          if (_wsPingSentPerf != null) {
+            const rtt = performance.now() - _wsPingSentPerf;
+            _wsLastRttMs = rtt;
+            _wsRttEmaMs = _ema(_wsRttEmaMs, rtt, 0.25);
+            updateStatsBar();
+          }
+          return;
+        }
+        dbg('ws:/ws recv', data);
+        if (data.error) {
+          showMessage(String(data.error));
+        }
+        handleTranslationMessage(data);
+      };
+    }
+
+
+    function startWebSpeechRecording() {
+      if (!webSpeechSupported || !recognition) {
+        showMessage('Your browser does not support the Web Speech API. Switch to Deepgram.');
+        return;
+      }
+
+      applyRecognitionSettings();
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+      webSpeechLastFinalResultIndex = -1;
+      webSpeechLastFinalText = '';
+      webSpeechLastFinalAtMs = 0;
+      _wsRestartCount = 0;
+      _wsLastRestartAtMs = 0;
+
+      _wsReconnectCount = 0;
+      _connectTranslateWs();
+
+      recognition.start();
+      console.log('Recording started');
+    }
+
+    async function startDeepgramRecording() {
+      applyEngineUi('deepgram');
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+
+      socket = new WebSocket(
+        _wsUrl('/ws/deepgram')
+      );
+
+      applySocketLifecycleHandlers();
+      socket.onclose = () => {
+        console.log('WebSocket closed');
+        stopRecording();
+      };
+      socket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        setStatus('error');
+        showMessage('WebSocket error. Check your connection and try again.');
+        stopRecording();
+      };
+
+      socket.onopen = async () => {
+        setStatus('connected');
+
+        // Send session config before audio frames.
+        try {
+          dbg('ws:/ws/deepgram send', {
+            type: 'config',
+            deepgram: {
+              model: 'nova-3',
+              language: deepgramLanguage,
+              interim_results: Boolean(deepgramInterimResults),
+              punctuate: Boolean(deepgramPunctuate),
+            },
+            translate: { src: translateSrc, dests: getTranslateDests() },
+            translate_interim: Boolean(translateInterimEnabled),
+          });
+          socket.send(
+            JSON.stringify({
+              type: 'config',
+              deepgram: {
+                model: 'nova-3',
+                language: deepgramLanguage,
+                interim_results: Boolean(deepgramInterimResults),
+                punctuate: Boolean(deepgramPunctuate),
+              },
+              translate: { src: translateSrc, dests: getTranslateDests() },
+              translate_interim: Boolean(translateInterimEnabled),
+            })
+          );
+        } catch (_e) {
+          // no-op
+        }
+
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: DEEPGRAM_SAMPLE_RATE,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          });
+
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: DEEPGRAM_SAMPLE_RATE,
+          });
+
+          const source = audioContext.createMediaStreamSource(mediaStream);
+
+          // Prefer AudioWorklet (ScriptProcessor is deprecated).
+          if (audioContext.audioWorklet && window.AudioWorkletNode) {
+            const workletCode = `
+class Int16PCMProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (output && output[0]) {
+      output[0].fill(0);
+    }
+
+    if (!input || !input[0]) return true;
+    const channel = input[0];
+    if (!channel || channel.length === 0) return true;
+
+    const int16Data = new Int16Array(channel.length);
+    for (let i = 0; i < channel.length; i++) {
+      const s = Math.max(-1, Math.min(1, channel[i]));
+      int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    this.port.postMessage(int16Data.buffer, [int16Data.buffer]);
+    return true;
+  }
+}
+registerProcessor('int16-pcm-processor', Int16PCMProcessor);
+`;
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const moduleUrl = URL.createObjectURL(blob);
+            try {
+              await audioContext.audioWorklet.addModule(moduleUrl);
+            } finally {
+              URL.revokeObjectURL(moduleUrl);
+            }
+
+            processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor', {
+              numberOfInputs: 1,
+              numberOfOutputs: 1,
+              outputChannelCount: [1],
+              channelCount: 1,
+            });
+
+            processor.port.onmessage = (event) => {
+              if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(event.data);
+              }
+            };
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+          } else {
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+              if (socket && socket.readyState === WebSocket.OPEN) {
+                const inputData = e.inputBuffer.getChannelData(0);
+                const int16Data = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                  const s = Math.max(-1, Math.min(1, inputData[i]));
+                  int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                socket.send(int16Data.buffer);
+              }
+            };
+          }
+        } catch (err) {
+          console.error('Error accessing microphone:', err);
+          setStatus('error');
+          showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
+          stopRecording();
+        }
+      };
+
+      socket.onmessage = (event) => {
+        let data;
+        try { data = JSON.parse(event.data); } catch (_e) { return; }
+        dbg('ws:/ws/deepgram recv', data);
+        if (data.error) {
+          setStatus('error');
+          showMessage('Server error: ' + data.error);
+          return;
+        }
+
+        const nowPerf = performance.now();
+        if (_sttTtfbMs == null) {
+          _sttTtfbMs = nowPerf - _sessionStartPerf;
+        }
+
+        if (data.type === 'interim') {
+          if (_sttSegmentStartPerf == null) {
+            _sttSegmentStartPerf = nowPerf;
+          }
+          removeInterimElement(recognizedContainer);
+          if (data.original) {
+            showInterim(recognizedContainer, data.original);
+          }
+          handleTranslationMessage(data);
+          updateStatsBar();
+          return;
+        }
+
+        if (data.type === 'final') {
+          if (_sttSegmentStartPerf != null) {
+            const sttMs = nowPerf - _sttSegmentStartPerf;
+            _sttLastFinalMs = sttMs;
+            _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+            _sttSegmentStartPerf = null;
+          }
+          removeInterimElement(recognizedContainer);
+          if (data.original) {
+            czSegmentCount++;
+            addSegment(recognizedContainer, czSegmentCount, data.original);
+          }
+          handleTranslationMessage(data);
+          updateStatsBar();
+        }
+      };
+    }
+
+    async function startElevenLabsRecording() {
+      if (elevenlabsMode === 'browser') {
+        return startElevenLabsBrowserRecording();
+      }
+      return startElevenLabsServerRecording();
+    }
+
+    // --- ElevenLabs: browser-side mode (audio → ElevenLabs direct, /ws for translation) ---
+    async function startElevenLabsBrowserRecording() {
+      applyEngineUi('elevenlabs');
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+
+      // 1. Obtain a single-use token from our server.
+      let token = '';
+      try {
+        const body = {};
+        if (elevenlabsApiKey) {
+          body.api_key = elevenlabsApiKey;
+        }
+        const resp = await fetch('/api/elevenlabs/token', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        token = data.token;
+        if (!token) {
+          throw new Error('Empty token received');
+        }
+      } catch (err) {
+        console.error('Failed to obtain ElevenLabs token:', err);
+        showMessage('Failed to obtain ElevenLabs token: ' + (err && err.message ? err.message : String(err)));
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        setStatus('disconnected');
+        return;
+      }
+
+      // 2. Connect to /ws for translation (reuse keepalive/reconnect logic).
+      _wsReconnectCount = 0;
+      _connectTranslateWs();
+
+      // 3. Build ElevenLabs WS URL with token auth.
+      let elUrl = 'wss://api.elevenlabs.io/v1/speech-to-text/realtime'
+        + '?token=' + encodeURIComponent(token)
+        + '&model_id=scribe_v2_realtime'
+        + '&audio_format=pcm_16000'
+        + '&sample_rate=16000'
+        + '&commit_strategy=' + encodeURIComponent(elevenlabsCommitStrategy);
+      if (elevenlabsLanguage) {
+        elUrl += '&language_code=' + encodeURIComponent(elevenlabsLanguage);
+      }
+      if (elevenlabsCommitStrategy === 'vad') {
+        elUrl += '&vad_silence_threshold_secs=1.5';
+      }
+
+      try {
+        _elBrowserWs = new WebSocket(elUrl);
+      } catch (err) {
+        console.error('Failed to connect to ElevenLabs WS:', err);
+        showMessage('Failed to connect to ElevenLabs: ' + (err && err.message ? err.message : String(err)));
+        stopRecording();
+        return;
+      }
+
+      _elBrowserWs.onclose = () => {
+        dbg('elevenlabs-browser: WS closed');
+        // If user hasn't pressed stop, treat as error.
+        if (!stopButton.disabled) {
+          showMessage('ElevenLabs connection closed unexpectedly.');
+          stopRecording();
+        }
+      };
+
+      _elBrowserWs.onerror = (error) => {
+        console.error('ElevenLabs WS error:', error);
+      };
+
+      _elBrowserWs.onmessage = (event) => {
+        let ev;
+        try {
+          ev = JSON.parse(event.data);
+        } catch (_e) {
+          return;
+        }
+        dbg('elevenlabs-browser recv', ev);
+
+        const msgType = ev.message_type || '';
+
+        if (msgType === 'session_started') {
+          dbg('elevenlabs-browser: session started', ev.session_id);
+          return;
+        }
+
+        if (msgType === 'partial_transcript') {
+          const text = (ev.text || '').trim();
+          if (!text) return;
+
+           const nowPerf = performance.now();
+           if (_sttTtfbMs == null) {
+             _sttTtfbMs = nowPerf - _sessionStartPerf;
+           }
+           if (_sttSegmentStartPerf == null) {
+             _sttSegmentStartPerf = nowPerf;
+           }
+
+          removeInterimElement(recognizedContainer);
+          showInterim(recognizedContainer, text);
+
+          // Send to /ws for interim translation (throttled).
+          const now = Date.now();
+           if (
+             socket && socket.readyState === WebSocket.OPEN &&
+             translateInterimEnabled &&
+             text !== lastInterimSentText &&
+             now - lastInterimSentAtMs >= interimSendIntervalMs
+           ) {
+             lastInterimSentText = text;
+             lastInterimSentAtMs = now;
+             dbg('ws:/ws send (el-browser interim)', { type: 'interim', text });
+             sendTranslateWsMessage('interim', text);
+           }
+           return;
+         }
+
+        if (msgType === 'committed_transcript' || msgType === 'committed_transcript_with_timestamps') {
+          const text = (ev.text || '').trim();
+          if (!text) return;
+
+           const nowPerf = performance.now();
+           if (_sttTtfbMs == null) {
+             _sttTtfbMs = nowPerf - _sessionStartPerf;
+           }
+           if (_sttSegmentStartPerf != null) {
+             const sttMs = nowPerf - _sttSegmentStartPerf;
+             _sttLastFinalMs = sttMs;
+             _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+             _sttSegmentStartPerf = null;
+           }
+
+          removeInterimElement(recognizedContainer);
+          czSegmentCount++;
+          addSegment(recognizedContainer, czSegmentCount, text);
+
+           // Send to /ws for final translation.
+           dbg('ws:/ws send (el-browser final)', { type: 'final', text });
+           sendTranslateWsMessage('final', text);
+
+          lastInterimSentText = '';
+          lastInterimSentAtMs = 0;
+          updateStatsBar();
+          return;
+        }
+
+        // Error events from ElevenLabs.
+        if (['input_error', 'error', 'auth_error', 'transcriber_error', 'quota_exceeded'].includes(msgType)) {
+          const errorMsg = ev.error || ev.message || JSON.stringify(ev);
+          console.error('ElevenLabs error:', errorMsg);
+          showMessage('ElevenLabs error: ' + errorMsg);
+          setStatus('error');
+          return;
+        }
+      };
+
+      // 4. Once ElevenLabs WS is open, start audio capture.
+      _elBrowserWs.onopen = async () => {
+        dbg('elevenlabs-browser: WS connected');
+        setStatus('connected');
+
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: DEEPGRAM_SAMPLE_RATE,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          });
+
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: DEEPGRAM_SAMPLE_RATE,
+          });
+
+          const source = audioContext.createMediaStreamSource(mediaStream);
+
+          // Helper: convert Int16Array buffer to base64 string.
+          function int16BufferToBase64(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i++) {
+              binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+          }
+
+          if (audioContext.audioWorklet && window.AudioWorkletNode) {
+            const workletCode = `
+class Int16PCMProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (output && output[0]) { output[0].fill(0); }
+    if (!input || !input[0]) return true;
+    const channel = input[0];
+    if (!channel || channel.length === 0) return true;
+    const int16Data = new Int16Array(channel.length);
+    for (let i = 0; i < channel.length; i++) {
+      const s = Math.max(-1, Math.min(1, channel[i]));
+      int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    this.port.postMessage(int16Data.buffer, [int16Data.buffer]);
+    return true;
+  }
+}
+registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
+`;
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const moduleUrl = URL.createObjectURL(blob);
+            try {
+              await audioContext.audioWorklet.addModule(moduleUrl);
+            } finally {
+              URL.revokeObjectURL(moduleUrl);
+            }
+
+            processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el-browser', {
+              numberOfInputs: 1,
+              numberOfOutputs: 1,
+              outputChannelCount: [1],
+              channelCount: 1,
+            });
+
+            processor.port.onmessage = (event) => {
+              if (_elBrowserWs && _elBrowserWs.readyState === WebSocket.OPEN) {
+                const audio_b64 = int16BufferToBase64(event.data);
+                _elBrowserWs.send(JSON.stringify({
+                  message_type: 'input_audio_chunk',
+                  audio_base_64: audio_b64,
+                  commit: false,
+                  sample_rate: 16000,
+                }));
+              }
+            };
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+          } else {
+            // Fallback: ScriptProcessorNode
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+              if (_elBrowserWs && _elBrowserWs.readyState === WebSocket.OPEN) {
+                const inputData = e.inputBuffer.getChannelData(0);
+                const int16Data = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                  const s = Math.max(-1, Math.min(1, inputData[i]));
+                  int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                const audio_b64 = int16BufferToBase64(int16Data.buffer);
+                _elBrowserWs.send(JSON.stringify({
+                  message_type: 'input_audio_chunk',
+                  audio_base_64: audio_b64,
+                  commit: false,
+                  sample_rate: 16000,
+                }));
+              }
+            };
+          }
+        } catch (err) {
+          console.error('Error accessing microphone:', err);
+          setStatus('error');
+          showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
+          stopRecording();
+        }
+      };
+    }
+
+    // --- ElevenLabs: server-side mode (audio → our server → ElevenLabs API) ---
+    async function startElevenLabsServerRecording() {
+      applyEngineUi('elevenlabs');
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+
+      socket = new WebSocket(_wsUrl('/ws/elevenlabs'));
+
+      socket.onclose = () => {
+        console.log('WebSocket closed');
+        _stopWsTimers();
+        if (!stopButton.disabled && _wsReconnectCount < _WS_RECONNECT_MAX) {
+          _wsReconnectCount++;
+          setStatus('connecting');
+          dbg('ws reconnect (elevenlabs)', { attempt: _wsReconnectCount });
+          _wsReconnectTimeoutId = setTimeout(() => startElevenLabsRecording(), _WS_RECONNECT_DELAY_MS);
+        } else if (!stopButton.disabled) {
+          setStatus('error');
+          showMessage('WebSocket connection lost. Press Stop and Start to try again.');
+        }
+      };
+      socket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+      };
+
+      socket.onopen = async () => {
+        setStatus('connected');
+        _wsReconnectCount = 0;
+        _startWsKeepAlive();
+
+        // Send session config.
+        try {
+          const config = {
+            type: 'config',
+            elevenlabs: {
+              language_code: elevenlabsLanguage || '',
+              commit_strategy: elevenlabsCommitStrategy,
+            },
+            translate: { src: translateSrc, dests: getTranslateDests() },
+            translate_interim: Boolean(translateInterimEnabled),
+          };
+          dbg('ws:/ws/elevenlabs send', config);
+          socket.send(JSON.stringify(config));
+        } catch (_e) {
+          // no-op
+        }
+
+        // Capture microphone and pipe PCM16 to server (same pipeline as Deepgram).
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: DEEPGRAM_SAMPLE_RATE,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          });
+
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: DEEPGRAM_SAMPLE_RATE,
+          });
+
+          const source = audioContext.createMediaStreamSource(mediaStream);
+
+          if (audioContext.audioWorklet && window.AudioWorkletNode) {
+            const workletCode = `
+class Int16PCMProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (output && output[0]) { output[0].fill(0); }
+    if (!input || !input[0]) return true;
+    const channel = input[0];
+    if (!channel || channel.length === 0) return true;
+    const int16Data = new Int16Array(channel.length);
+    for (let i = 0; i < channel.length; i++) {
+      const s = Math.max(-1, Math.min(1, channel[i]));
+      int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    this.port.postMessage(int16Data.buffer, [int16Data.buffer]);
+    return true;
+  }
+}
+registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
+`;
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const moduleUrl = URL.createObjectURL(blob);
+            try {
+              await audioContext.audioWorklet.addModule(moduleUrl);
+            } finally {
+              URL.revokeObjectURL(moduleUrl);
+            }
+
+            processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el', {
+              numberOfInputs: 1,
+              numberOfOutputs: 1,
+              outputChannelCount: [1],
+              channelCount: 1,
+            });
+
+            processor.port.onmessage = (event) => {
+              if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(event.data);
+              }
+            };
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+          } else {
+            // Fallback: ScriptProcessorNode
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 0;
+
+            source.connect(processor);
+            processor.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+              if (socket && socket.readyState === WebSocket.OPEN) {
+                const inputData = e.inputBuffer.getChannelData(0);
+                const int16Data = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                  const s = Math.max(-1, Math.min(1, inputData[i]));
+                  int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                socket.send(int16Data.buffer);
+              }
+            };
+          }
+        } catch (err) {
+          console.error('Error accessing microphone:', err);
+          setStatus('error');
+          showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
+          stopRecording();
+        }
+      };
+
+      socket.onmessage = (event) => {
+        let data;
+        try { data = JSON.parse(event.data); } catch (_e) { return; }
+        if (data.type === 'pong') {
+          if (_wsPingSentPerf != null) {
+            const rtt = performance.now() - _wsPingSentPerf;
+            _wsLastRttMs = rtt;
+            _wsRttEmaMs = _ema(_wsRttEmaMs, rtt, 0.25);
+            updateStatsBar();
+          }
+          return;
+        }
+        dbg('ws:/ws/elevenlabs recv', data);
+        if (data.error) {
+          setStatus('error');
+          showMessage('Server error: ' + data.error);
+          return;
+        }
+
+        const nowPerf = performance.now();
+        if (_sttTtfbMs == null) {
+          _sttTtfbMs = nowPerf - _sessionStartPerf;
+        }
+
+        if (data.type === 'interim') {
+          if (_sttSegmentStartPerf == null) {
+            _sttSegmentStartPerf = nowPerf;
+          }
+          removeInterimElement(recognizedContainer);
+          if (data.original) {
+            showInterim(recognizedContainer, data.original);
+          }
+          handleTranslationMessage(data);
+          updateStatsBar();
+          return;
+        }
+
+        if (data.type === 'final') {
+          if (_sttSegmentStartPerf != null) {
+            const sttMs = nowPerf - _sttSegmentStartPerf;
+            _sttLastFinalMs = sttMs;
+            _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+            _sttSegmentStartPerf = null;
+          }
+          removeInterimElement(recognizedContainer);
+          if (data.original) {
+            czSegmentCount++;
+            addSegment(recognizedContainer, czSegmentCount, data.original);
+          }
+          handleTranslationMessage(data);
+          updateStatsBar();
+        }
+      };
+    }
+
+    function stopDeepgramPipeline() {
+      if (processor) {
+        if (processor.port) {
+          processor.port.onmessage = null;
+        }
+        try {
+          processor.disconnect();
+        } catch (_e) {
+          // no-op
+        }
+        processor = null;
+      }
+
+      if (gainNode) {
+        try {
+          gainNode.disconnect();
+        } catch (_e) {
+          // no-op
+        }
+        gainNode = null;
+      }
+
+      if (audioContext) {
+        try {
+          audioContext.close();
+        } catch (_e) {
+          // no-op
+        }
+        audioContext = null;
+      }
+
+      if (mediaStream) {
+        try {
+          mediaStream.getTracks().forEach((track) => track.stop());
+        } catch (_e) {
+          // no-op
+        }
+        mediaStream = null;
+      }
+    }
+
+    function startRecording() {
+      if (onboardingRequired) {
+        openOnboarding();
+        return;
+      }
+      if (!enabledEngines.has(currentEngine)) {
+        showMessage('Engine "' + currentEngine + '" is not enabled. Enable it via ENABLED_ENGINES on the server.');
+        return;
+      }
+
+      maybeEnterFullscreenFromPreference();
+
+      if (currentEngine === 'deepgram') {
+        startDeepgramRecording();
+        return;
+      }
+      if (currentEngine === 'elevenlabs') {
+        startElevenLabsRecording();
+        return;
+      }
+      startWebSpeechRecording();
+    }
+
+    function stopRecording() {
+      // Stop keepalive pings and pending reconnect attempts first,
+      // so the onclose handler won't schedule another reconnect.
+      _stopWsTimers();
+
+      if (recognition) {
+        try {
+          recognition.stop();
+        } catch (_e) {
+          // no-op
+        }
+      }
+
+      stopDeepgramPipeline();
+
+      // Close direct ElevenLabs WS (browser mode).
+      if (_elBrowserWs) {
+        try { _elBrowserWs.onclose = null; } catch (_e) { /* ignore */ }
+        try { _elBrowserWs.close(); } catch (_e) { /* ignore */ }
+        _elBrowserWs = null;
+      }
+
+      if (socket) {
+        try { socket.onclose = null; } catch (_e) { /* ignore */ }
+      }
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.close();
+        } catch (_e) {
+          // no-op
+        }
+      }
+      socket = null;
+
+      lastInterimSentText = '';
+      lastInterimSentAtMs = 0;
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      setStatus('disconnected');
+      dbg('stopRecording', { engine: currentEngine });
+      console.log('Recording stopped');
+    }
+
+    // Settings wiring
+    settingsButton.addEventListener('click', openSettings);
+    settingsClose.addEventListener('click', closeSettings);
+    settingsCancel.addEventListener('click', closeSettings);
+    settingsModal.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target && target.dataset && target.dataset.close === 'true') {
+        closeSettings();
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (!onboardingModal.hidden && e.key === 'Escape') {
+        closeOnboarding();
+        return;
+      }
+      if (!settingsModal.hidden && e.key === 'Escape') {
+        closeSettings();
+      }
+    });
+    settingsForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveSettingsFromForm();
+      closeSettings();
+    });
+
+    // Onboarding wiring
+    onboardingClose.addEventListener('click', closeOnboarding);
+    onboardingCancel.addEventListener('click', closeOnboarding);
+    onboardingModal.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target && target.dataset && target.dataset.close === 'true') {
+        closeOnboarding();
+      }
+    });
+    onboardingForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveOnboardingFromForm();
+      closeOnboarding();
+      clearMessage();
+    });
+
+    function setWebSpeechLangStatus(text) {
+      if (!webSpeechLangStatus) return;
+      webSpeechLangStatus.textContent = text || '';
+    }
+
+    async function checkWebSpeechAvailability() {
+      if (!SpeechRecognition || typeof SpeechRecognition.available !== 'function') {
+        setWebSpeechLangStatus('SpeechRecognition.available() not supported in this browser.');
+        return;
+      }
+      const lang = recognitionLangInput.value || recognitionLang;
+      try {
+        const result = await SpeechRecognition.available({
+          langs: [lang],
+          processLocally: Boolean(processLocallyCheckbox.checked),
+        });
+        setWebSpeechLangStatus(`Availability for ${lang}: ${result}`);
+      } catch (e) {
+        setWebSpeechLangStatus(`Availability check failed: ${e && e.message ? e.message : String(e)}`);
+      }
+    }
+
+    if (checkWebSpeechLangButton) {
+      checkWebSpeechLangButton.addEventListener('click', () => {
+        checkWebSpeechAvailability();
+      });
+    }
+
+    async function loadRemoteLists() {
+      // Translation languages
+      try {
+        const r = await fetch('/api/translate/languages', { credentials: 'same-origin' });
+        if (r.ok) {
+          const data = await r.json();
+          if (data && Array.isArray(data.languages) && data.languages.length) {
+            translateLangChoices = data.languages
+              .filter((x) => x && typeof x.code === 'string' && typeof x.name === 'string')
+              .map((x) => ({ code: x.code, name: x.name }));
+          }
+        }
+      } catch (_e) {
+        // no-op
+      }
+
+      populateSettingsLanguageLists();
+      applySettingsToForm();
+      updateTranslationTitles();
+
+      if (onboardingModal && !onboardingModal.hidden) {
+        populateOnboardingLanguageLists();
+      }
+    }
+
+    loadDebugPreference();
+    loadSettings();
+    // Apply theme early (base.html already does, this keeps the select in sync).
+    applyThemePreference(getThemePreference());
+    populateSettingsLanguageLists();
+    applySettingsToForm();
+    applyRecognitionSettings();
+    updateTranslationTitles();
+
+    onboardingRequired = !hasSavedLanguageSettings();
+    if (onboardingRequired) {
+      if (startButton) {
+        startButton.disabled = true;
+      }
+      openOnboarding();
+    }
+
+    initTopbarCompact();
+    initFullscreenControls();
+    initThemeToggle();
+
+    initLayoutControls();
+
+    initEngineToggle();
+
+    loadRemoteLists();
+  </script>
+{% endblock %}

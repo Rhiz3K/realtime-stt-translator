@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest an idea or improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest an improvement.
+
+  - type: checkboxes
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues to avoid duplicates
+          required: true
+
+  - type: textarea
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+      placeholder: |
+        As a ..., I want ... so that ...
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Proposed solution
+      description: What would you like to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or features you considered.
+
+  - type: dropdown
+    attributes:
+      label: Area
+      options:
+        - UI / UX
+        - Web Speech API engine
+        - Deepgram engine
+        - ElevenLabs engine
+        - Translation
+        - Auth / security
+        - Docs
+        - Other
+
+  - type: checkboxes
+    attributes:
+      label: Willingness to contribute
+      options:
+        - label: I can help implement this
+          required: false
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Links, screenshots, or references.

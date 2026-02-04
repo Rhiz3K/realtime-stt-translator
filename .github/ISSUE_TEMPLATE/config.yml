@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerabilities
+    url: ../../security/policy
+    about: Please report security issues privately.
+  - name: Support / questions
+    url: ../../blob/main/SUPPORT.md
+    about: Where to get help and what to include.
+  - name: Contributing guide
+    url: ../../blob/main/CONTRIBUTING.md
+    about: Setup instructions, style, and PR workflow.
+  - name: Documentation
+    url: ../../#readme
+    about: Project overview and configuration.

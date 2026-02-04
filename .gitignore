@@ -1,0 +1,29 @@
+# Virtuální prostředí
+.venv/
+env/
+venv/
+
+# Environmentální proměnné
+.env
+
+# Credentials / secrets
+credentials/*.json
+
+# Další nepotřebné soubory
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Test / coverage artifacts
+.coverage
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/

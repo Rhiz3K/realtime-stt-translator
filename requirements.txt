@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+googletrans
+jinja2
+python-dotenv
+python-multipart
+anyio>=3.0.0
+deepgram-sdk>=3.0.0
+websockets>=12.0
+httpx>=0.24.0
