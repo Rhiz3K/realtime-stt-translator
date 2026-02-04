@@ -9,7 +9,7 @@ Real-time speech-to-text and translation web application. Speak into a microphon
 
 Built with [FastAPI](https://fastapi.tiangolo.com/), powered by three interchangeable STT engines, and designed to run anywhere -- locally, in Docker, or behind a reverse proxy.
 
-![UI screenshot](https://github.com/user-attachments/assets/decc7103-55b0-47a3-8982-e19eaca54e90)
+![UI screenshot](https://github.com/user-attachments/assets/4f4323e9-7cea-4cd3-a8c9-ad8b4d896147)
 
 ---
 
