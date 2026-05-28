@@ -5,8 +5,14 @@
 import { env, pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';
 
 env.allowLocalModels = false;
+// Load the ONNX Runtime wasm from the SAME transformers.js build so the JS glue
+// and the wasm binaries are ABI-compatible. transformers.js@3.4.0 pins a specific
+// ORT dev build (1.22.0-dev.*); pointing wasmPaths at the standalone
+// onnxruntime-web@1.22.0 release ships mismatched binaries and throws
+// "s._OrtGetInputName is not a function" at session creation. Keep this version
+// in sync with the import URL above.
 env.backends.onnx.wasm.wasmPaths =
-  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/dist/';
 
 /** @type {Record<string, { id: string, label: string, multilingual: boolean }>} */
 export const WHISPER_MODELS = {
