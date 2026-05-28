@@ -21,6 +21,16 @@ const SAMPLE_RATE = 16000;
 const SILENCE_FRAMES_END = 28; // ~900 ms @ 32 ms/frame
 const MIN_SPEECH_FRAMES = 13; // ~400 ms
 const MAX_SPEECH_FRAMES = 470; // ~15 s cap per utterance
+// Cap the transcription backlog. On slow CPUs (mobile WASM) inference can be
+// slower than real time; without a cap the queue — and thus latency — grows
+// without bound. We keep only the most recent utterances and drop the oldest.
+const MAX_PENDING_UTTERANCES = 3;
+
+// dtype per backend. WASM uses int8 (small download, matches the advertised
+// model sizes); WebGPU uses fp16 (GPU-friendly and much faster) with a graceful
+// fallback to WASM when no GPU adapter or fp16 model is available.
+const WASM_DTYPE = 'q8';
+const WEBGPU_DTYPE = 'fp16';
 
 /** ISO 639-1 → Whisper language token (multilingual models). */
 const ISO_TO_WHISPER = {
@@ -63,6 +73,19 @@ function rmsInt16(chunk) {
   return Math.sqrt(sum / chunk.length);
 }
 
+/** Best-effort WebGPU capability probe (requires a real adapter, not just the API). */
+async function isWebGpuAvailable() {
+  try {
+    if (typeof navigator === 'undefined' || !('gpu' in navigator) || !navigator.gpu) {
+      return false;
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    return Boolean(adapter);
+  } catch (_e) {
+    return false;
+  }
+}
+
 export class WhisperLocalEngine {
   /**
    * @param {object} options
@@ -75,12 +98,17 @@ export class WhisperLocalEngine {
   constructor(options = {}) {
     this.modelKey = options.modelKey || 'tiny';
     this.language = options.language || 'cs';
+    // 'auto' picks WebGPU when a GPU adapter is available, else WASM.
+    // 'webgpu'/'wasm' force a specific backend.
+    this.device = options.device === 'webgpu' || options.device === 'wasm' ? options.device : 'auto';
     this.vadThreshold = typeof options.vadThreshold === 'number' ? options.vadThreshold : 0.012;
     this.onStatus = options.onStatus || (() => {});
     this.onTranscript = options.onTranscript || (() => {});
 
     /** @type {import('@huggingface/transformers').AutomaticSpeechRecognitionPipeline | null} */
     this._transcriber = null;
+    /** Backend the model actually loaded on ('webgpu' | 'wasm' | null). */
+    this._device = null;
     this._audioContext = null;
     this._processor = null;
     this._mediaStream = null;
@@ -100,13 +128,41 @@ export class WhisperLocalEngine {
     return WHISPER_MODELS[this.modelKey] || WHISPER_MODELS.tiny;
   }
 
+  async _wantsWebGpu() {
+    if (this.device === 'wasm') return false;
+    if (this.device === 'webgpu') return true;
+    return isWebGpuAvailable();
+  }
+
   async load() {
     const spec = this._modelSpec();
-    this.onStatus(`Loading Whisper model ${spec.label}…`);
+
+    if (await this._wantsWebGpu()) {
+      try {
+        this.onStatus(`Loading Whisper ${spec.label} on GPU (WebGPU)…`);
+        this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
+          device: 'webgpu',
+          dtype: WEBGPU_DTYPE,
+        });
+        this._device = 'webgpu';
+        this.onStatus('Whisper model ready (WebGPU)');
+        return;
+      } catch (err) {
+        // No GPU adapter, missing fp16 model, or a driver/runtime issue — fall
+        // back to CPU so the engine still works (just slower).
+        console.warn('WebGPU Whisper unavailable, falling back to CPU/WASM:', err);
+        this.onStatus('WebGPU unavailable — loading on CPU (WASM)…');
+        this._transcriber = null;
+      }
+    }
+
+    this.onStatus(`Loading Whisper ${spec.label} on CPU (WASM)…`);
     this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
-      dtype: 'q8',
+      device: 'wasm',
+      dtype: WASM_DTYPE,
     });
-    this.onStatus('Whisper model ready');
+    this._device = 'wasm';
+    this.onStatus('Whisper model ready (CPU/WASM)');
   }
 
   async start(mediaStream) {
@@ -228,6 +284,13 @@ export class WhisperLocalEngine {
     this._resetVad();
     if (frames.length < MIN_SPEECH_FRAMES) return;
     this._pendingUtterances.push(frames);
+    // Stay live on slow devices: bound the backlog by dropping the oldest
+    // utterances instead of letting latency grow without limit.
+    if (this._pendingUtterances.length > MAX_PENDING_UTTERANCES) {
+      const dropped = this._pendingUtterances.length - MAX_PENDING_UTTERANCES;
+      this._pendingUtterances.splice(0, dropped);
+      this.onStatus(`Whisper can't keep up — dropped ${dropped} buffered segment${dropped > 1 ? 's' : ''}`);
+    }
     this._processQueue();
   }
 

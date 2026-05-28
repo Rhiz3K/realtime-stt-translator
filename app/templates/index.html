@@ -381,7 +381,16 @@
                 <option value="tiny.en">tiny.en (English only)</option>
                 <option value="base">base (multilingual, ~145 MB)</option>
               </select>
-              <p class="hint">Downloaded once from Hugging Face; runs fully in your browser (like whisper_android)</p>
+              <p class="hint">Downloaded once (~75–145 MB) and cached; runs fully on-device. Wi‑Fi recommended for the first run.</p>
+            </div>
+            <div class="field">
+              <label for="whisperDevice">Compute backend</label>
+              <select id="whisperDevice">
+                <option value="auto">Auto (WebGPU if available)</option>
+                <option value="webgpu">WebGPU (GPU)</option>
+                <option value="wasm">CPU (WASM)</option>
+              </select>
+              <p class="hint">WebGPU is much faster on phones (Android Chrome 121+); Auto falls back to CPU.</p>
             </div>
           </div>
 
@@ -605,6 +614,7 @@
 
     const recognitionLangInput = document.getElementById('recognitionLang');
     const whisperModelInput = document.getElementById('whisperModel');
+    const whisperDeviceInput = document.getElementById('whisperDevice');
     const translateSrcInput = document.getElementById('translateSrc');
     const translateDestASelect = document.getElementById('translateDestA');
     const translateDestBSelect = document.getElementById('translateDestB');
@@ -712,6 +722,7 @@
 
     // Whisper local (browser ONNX via Transformers.js)
     let whisperModel = 'tiny';
+    let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
     let whisperMediaStream = null;
 
@@ -1582,6 +1593,9 @@
       if (whisperModelInput) {
         whisperModelInput.value = whisperModel;
       }
+      if (whisperDeviceInput) {
+        whisperDeviceInput.value = whisperDevice;
+      }
     }
 
     function loadSettings() {
@@ -1660,6 +1674,9 @@
         if (typeof parsed.whisperModel === 'string' && ['tiny', 'tiny.en', 'base'].includes(parsed.whisperModel)) {
           whisperModel = parsed.whisperModel;
         }
+        if (typeof parsed.whisperDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.whisperDevice)) {
+          whisperDevice = parsed.whisperDevice;
+        }
       } catch (_e) {
         // ignore invalid storage
       }
@@ -1691,6 +1708,7 @@
             elevenlabsLanguage,
             elevenlabsCommitStrategy,
             whisperModel,
+            whisperDevice,
           })
         );
       } catch (_e) {
@@ -1752,6 +1770,10 @@
       if (whisperModelInput) {
         const wm = whisperModelInput.value;
         whisperModel = ['tiny', 'tiny.en', 'base'].includes(wm) ? wm : 'tiny';
+      }
+      if (whisperDeviceInput) {
+        const wd = whisperDeviceInput.value;
+        whisperDevice = ['auto', 'webgpu', 'wasm'].includes(wd) ? wd : 'auto';
       }
 
       persistSettings();
@@ -2325,6 +2347,19 @@
       console.log('Recording started');
     }
 
+    function _whisperDataWarning() {
+      // Hint about cellular data before the large first-run model download.
+      try {
+        const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (c && (c.saveData === true || /(^|\b)(slow-2g|2g|3g)$/.test(String(c.effectiveType || '')))) {
+          return ' (Wi‑Fi recommended — large download on mobile data.)';
+        }
+      } catch (_e) {
+        // no-op
+      }
+      return '';
+    }
+
     function stopWhisperPipeline() {
       if (whisperLocalEngine) {
         try {
@@ -2362,27 +2397,44 @@
       resetSessionUi();
 
       try {
-        showMessage('Loading Whisper model (first run downloads from Hugging Face)…');
+        showMessage('Loading Whisper model (first run downloads ~75–145 MB from Hugging Face)…' + _whisperDataWarning());
         const mod = await import('/static/whisper/whisper-engine.mjs');
         whisperLocalEngine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
+          device: whisperDevice,
           language: translateSrc || 'cs',
           onStatus: (msg) => {
             if (msg) showMessage(msg);
           },
           onTranscript: ({ text, isFinal }) => {
+            // Stats: time-to-first-transcript and per-utterance inference latency.
+            const nowPerf = performance.now();
+            if (_sttTtfbMs == null) {
+              _sttTtfbMs = nowPerf - _sessionStartPerf;
+            }
             if (!isFinal) {
-              if (text) {
-                showInterim(recognizedContainer, text);
-              } else {
-                showInterim(recognizedContainer, '…');
+              if (_sttSegmentStartPerf == null) {
+                _sttSegmentStartPerf = nowPerf;
               }
+              removeInterimElement(recognizedContainer);
+              showInterim(recognizedContainer, text || '…');
+              updateStatsBar();
               return;
             }
+            if (_sttSegmentStartPerf != null) {
+              const sttMs = nowPerf - _sttSegmentStartPerf;
+              _sttLastFinalMs = sttMs;
+              _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+              _sttSegmentStartPerf = null;
+            }
             removeInterimElement(recognizedContainer);
-            if (!text) return;
+            if (!text) {
+              updateStatsBar();
+              return;
+            }
             addSegment(recognizedContainer, czSegmentCount++, text);
             sendTranslateWsMessage('final', text);
+            updateStatsBar();
           },
         });
 

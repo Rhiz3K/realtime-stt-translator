@@ -171,6 +171,10 @@ def test_ws_deepgram_init_failure_sends_error(client, monkeypatch):
     client.post("/login", data={"password": "test-password", "next": "/deepgram"}, follow_redirects=False)
 
     with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
+        # The endpoint blocks on the first client message (config or audio) before
+        # it constructs DeepgramClient, so send a config to trigger the failing init.
+        # Without this the server never reaches the boom and both sides deadlock.
+        ws.send_json({"type": "config", "deepgram": {"language": "cs"}})
         payload = ws.receive_json()
 
     assert payload == {"error": "boom"}
@@ -454,6 +458,22 @@ def test_static_whisper_worklet_served(client):
     resp = client.get("/static/whisper/pcm-worklet.js")
     assert resp.status_code == 200
     assert "Int16PCMProcessor" in resp.text
+
+
+def test_static_whisper_engine_served(client):
+    resp = client.get("/static/whisper/whisper-engine.mjs")
+    assert resp.status_code == 200
+    assert "WhisperLocalEngine" in resp.text
+
+
+def test_csp_allows_whisper_runtime_sources(client):
+    # The local Whisper engine needs WASM execution plus Transformers.js/ONNX from
+    # jsdelivr and the model weights from Hugging Face. The CSP must permit these.
+    resp = client.get("/health")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "'wasm-unsafe-eval'" in csp
+    assert "https://cdn.jsdelivr.net" in csp
+    assert "https://huggingface.co" in csp
 
 
 def test_enabled_engines_default_webspeech_only(monkeypatch):

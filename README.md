@@ -48,7 +48,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|
   | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
-  | **Whisper (local)** | Browser | None | ONNX in-tab via Transformers.js; ~75–145 MB model download; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
+  | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); ~75–145 MB one-time model download; runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
 
@@ -86,7 +86,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 **Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT locally; recognized text is sent to `/ws` for translation only.
 
-**Whisper (local)** -- The browser downloads a quantized Whisper model (Xenova ONNX) and runs speech recognition on-device with simple VAD segmentation. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Requires a modern desktop browser (WebAssembly; Chrome/Edge recommended).
+**Whisper (local)** -- The browser downloads a Whisper model (Xenova ONNX) and runs speech recognition on-device with simple VAD segmentation. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and falls back to **CPU/WASM** otherwise; the backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. The approach is similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android) project, but runs entirely in the browser (so CPU/WASM is noticeably slower than native — prefer WebGPU on mobile).
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
