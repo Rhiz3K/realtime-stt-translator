@@ -177,6 +177,66 @@
     .layout-compact-topbar #topbarCompactToggle .icon {
       transform: rotate(180deg);
     }
+
+    /* --- Tablets & narrow windows ---
+       The runtime-controls row used overflow-x + flex-end. Once its content is
+       wider than the row (which happens well before phone widths), the flexbox
+       items overflow the START edge and Start/Stop/Settings get clipped with no
+       way to scroll to them. Let the row wrap so every control stays reachable. */
+    @media (max-width: 980px) {
+      .topbar-statsrow {
+        flex-wrap: wrap;
+        row-gap: var(--space-1);
+      }
+
+      .topbar-stats-right {
+        overflow-x: visible;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        width: 100%;
+      }
+
+      /* Stats are the least critical; give them their own scrollable line so
+         they never push the buttons off-screen. */
+      .topbar-stats-right .stats {
+        order: 5;
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+    }
+
+    /* --- Phones: big tappable primary actions, full-width controls. --- */
+    @media (max-width: 700px) {
+      #startButton,
+      #stopButton {
+        flex: 1 1 120px;
+      }
+
+      .controls {
+        justify-content: flex-start;
+        width: 100%;
+      }
+
+      .control {
+        flex: 1 1 auto;
+      }
+
+      #engineSelect {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      input[type="range"] {
+        width: 100%;
+        flex: 1 1 auto;
+      }
+
+      /* Reclaim a little vertical space for transcripts. */
+      .card {
+        min-height: 180px;
+      }
+    }
   </style>
 {% endblock %}
 
