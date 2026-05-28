@@ -11,7 +11,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
-    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "deepgram", "elevenlabs"})
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "deepgram", "elevenlabs"})
     return TestClient(main.app)
 
 
@@ -432,6 +432,26 @@ def test_enabled_engines_passed_to_template(monkeypatch):
     assert 'value="deepgram" ' in resp.text    # not disabled
     # elevenlabs should be disabled
     assert 'value="elevenlabs" disabled' in resp.text
+
+
+def test_enabled_engines_includes_whisper_in_template(monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
+    monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"whisper"})
+
+    c = TestClient(main.app)
+    c.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = c.get("/")
+    assert resp.status_code == 200
+    assert 'value="whisper" ' in resp.text
+    assert "/static/whisper/whisper-engine.mjs" not in resp.text  # loaded on demand
+
+
+def test_static_whisper_worklet_served(client):
+    resp = client.get("/static/whisper/pcm-worklet.js")
+    assert resp.status_code == 200
+    assert "Int16PCMProcessor" in resp.text
 
 
 def test_enabled_engines_default_webspeech_only(monkeypatch):

@@ -18,6 +18,7 @@ import websockets as ws_lib
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from googletrans import Translator
 from starlette.websockets import WebSocketDisconnect
@@ -50,6 +51,7 @@ load_dotenv()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 # --- Security middleware: Content-Security-Policy ---
@@ -64,10 +66,12 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         # ElevenLabs WS for browser mode.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' blob:; "
+            "script-src 'self' 'unsafe-inline' blob: https://cdn.jsdelivr.net; "
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
-            "connect-src 'self' wss://api.elevenlabs.io; "
+            "connect-src 'self' wss://api.elevenlabs.io "
+            "https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co "
+            "https://cas-bridge.xethub.hf.co; "
             "img-src 'self' data:; "
             "frame-ancestors 'none'"
         )
@@ -160,7 +164,7 @@ ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 # Which STT engines are available to users.  Comma-separated list.
 # Valid values: webspeech, deepgram, elevenlabs.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "deepgram", "elevenlabs"}
+_ALL_ENGINES = {"webspeech", "whisper", "deepgram", "elevenlabs"}
 _raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
 ENABLED_ENGINES: set[str] = {
     e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES

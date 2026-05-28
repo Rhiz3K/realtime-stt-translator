@@ -193,6 +193,7 @@
             <label for="engineSelect">Engine</label>
             <select id="engineSelect" aria-label="Speech engine">
               <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="whisper" {% if 'whisper' not in enabled_engines %}disabled{% endif %}>Whisper (local){% if 'whisper' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
             </select>
@@ -368,6 +369,19 @@
             <div class="field">
               <button class="btn" id="checkWebSpeechLang" type="button">Check language availability</button>
               <p class="hint" id="webSpeechLangStatus">&nbsp;</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Whisper (local, browser)</div>
+          <div class="form-grid" role="group" aria-label="Whisper local">
+            <div class="field">
+              <label for="whisperModel">Whisper model</label>
+              <select id="whisperModel">
+                <option value="tiny">tiny (multilingual, ~75 MB)</option>
+                <option value="tiny.en">tiny.en (English only)</option>
+                <option value="base">base (multilingual, ~145 MB)</option>
+              </select>
+              <p class="hint">Downloaded once from Hugging Face; runs fully in your browser (like whisper_android)</p>
             </div>
           </div>
 
@@ -590,6 +604,7 @@
     const debugLoggingCheckbox = document.getElementById('debugLogging');
 
     const recognitionLangInput = document.getElementById('recognitionLang');
+    const whisperModelInput = document.getElementById('whisperModel');
     const translateSrcInput = document.getElementById('translateSrc');
     const translateDestASelect = document.getElementById('translateDestA');
     const translateDestBSelect = document.getElementById('translateDestB');
@@ -694,6 +709,11 @@
     let elevenlabsLanguage = '';
     let elevenlabsCommitStrategy = 'vad';
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
+
+    // Whisper local (browser ONNX via Transformers.js)
+    let whisperModel = 'tiny';
+    let whisperLocalEngine = null;
+    let whisperMediaStream = null;
 
     // Remote-provided language list for translation.
     let translateLangChoices = null;
@@ -1014,17 +1034,23 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
+          : enabledEngines.has('whisper') ? 'whisper'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
           : 'webspeech';
       }
       currentEngine = e;
       engineSelect.value = e;
-      const labels = { webspeech: 'Web Speech', deepgram: 'Deepgram Nova-3', elevenlabs: 'ElevenLabs Scribe' };
+      const labels = {
+        webspeech: 'Web Speech',
+        whisper: 'Whisper (local)',
+        deepgram: 'Deepgram Nova-3',
+        elevenlabs: 'ElevenLabs Scribe',
+      };
       engineBadge.textContent = labels[e] || e;
       document.title = `Live Translator (${engineBadge.textContent})`;
       try {
@@ -1033,9 +1059,9 @@
         // no-op
       }
 
-      // Web Speech uses the browser recognizer; the connection badge is mostly noise.
+      // Local STT engines do not use a server audio stream; hide the WS status badge.
       if (statusIndicator) {
-        statusIndicator.hidden = e === 'webspeech';
+        statusIndicator.hidden = e === 'webspeech' || e === 'whisper';
       }
     }
 
@@ -1552,6 +1578,10 @@
       elevenlabsApiKeyInput.value = elevenlabsApiKey;
       elevenlabsLanguageInput.value = elevenlabsLanguage;
       elevenlabsCommitStrategyInput.value = elevenlabsCommitStrategy;
+
+      if (whisperModelInput) {
+        whisperModelInput.value = whisperModel;
+      }
     }
 
     function loadSettings() {
@@ -1600,7 +1630,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -1626,6 +1656,9 @@
         }
         if (typeof parsed.elevenlabsCommitStrategy === 'string') {
           elevenlabsCommitStrategy = parsed.elevenlabsCommitStrategy === 'manual' ? 'manual' : 'vad';
+        }
+        if (typeof parsed.whisperModel === 'string' && ['tiny', 'tiny.en', 'base'].includes(parsed.whisperModel)) {
+          whisperModel = parsed.whisperModel;
         }
       } catch (_e) {
         // ignore invalid storage
@@ -1657,6 +1690,7 @@
             elevenlabsApiKey,
             elevenlabsLanguage,
             elevenlabsCommitStrategy,
+            whisperModel,
           })
         );
       } catch (_e) {
@@ -1714,6 +1748,11 @@
       elevenlabsApiKey = (elevenlabsApiKeyInput.value || '').trim();
       elevenlabsLanguage = elevenlabsLanguageInput.value || '';
       elevenlabsCommitStrategy = elevenlabsCommitStrategyInput.value === 'manual' ? 'manual' : 'vad';
+
+      if (whisperModelInput) {
+        const wm = whisperModelInput.value;
+        whisperModel = ['tiny', 'tiny.en', 'base'].includes(wm) ? wm : 'tiny';
+      }
 
       persistSettings();
 
@@ -2284,6 +2323,94 @@
 
       recognition.start();
       console.log('Recording started');
+    }
+
+    function stopWhisperPipeline() {
+      if (whisperLocalEngine) {
+        try {
+          whisperLocalEngine.stop();
+        } catch (_e) {
+          // no-op
+        }
+        whisperLocalEngine = null;
+      }
+      if (whisperMediaStream) {
+        try {
+          whisperMediaStream.getTracks().forEach((track) => track.stop());
+        } catch (_e) {
+          // no-op
+        }
+        whisperMediaStream = null;
+      }
+    }
+
+    async function startWhisperRecording() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showMessage('Microphone access is not available in this browser.');
+        return;
+      }
+
+      applyEngineUi('whisper');
+      applyRecognitionSettings();
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+      _wsReconnectCount = 0;
+      _connectTranslateWs();
+
+      try {
+        showMessage('Loading Whisper model (first run downloads from Hugging Face)…');
+        const mod = await import('/static/whisper/whisper-engine.mjs');
+        whisperLocalEngine = new mod.WhisperLocalEngine({
+          modelKey: whisperModel,
+          language: translateSrc || 'cs',
+          onStatus: (msg) => {
+            if (msg) showMessage(msg);
+          },
+          onTranscript: ({ text, isFinal }) => {
+            if (!isFinal) {
+              if (text) {
+                showInterim(recognizedContainer, text);
+              } else {
+                showInterim(recognizedContainer, '…');
+              }
+              return;
+            }
+            removeInterimElement(recognizedContainer);
+            if (!text) return;
+            addSegment(recognizedContainer, czSegmentCount++, text);
+            sendTranslateWsMessage('final', text);
+          },
+        });
+
+        whisperMediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+          video: false,
+        });
+
+        await whisperLocalEngine.start(whisperMediaStream);
+        setStatus('connected');
+        clearMessage();
+        console.log('Whisper local recording started');
+      } catch (err) {
+        console.error('Whisper start failed:', err);
+        stopWhisperPipeline();
+        setStatus('error');
+        showMessage(
+          'Whisper failed to start: ' + (err && err.message ? err.message : String(err))
+        );
+        startButton.disabled = false;
+        stopButton.disabled = true;
+      }
     }
 
     async function startDeepgramRecording() {
@@ -3055,6 +3182,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         startElevenLabsRecording();
         return;
       }
+      if (currentEngine === 'whisper') {
+        startWhisperRecording();
+        return;
+      }
       startWebSpeechRecording();
     }
 
@@ -3072,6 +3203,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
 
       stopDeepgramPipeline();
+      stopWhisperPipeline();
 
       // Close direct ElevenLabs WS (browser mode).
       if (_elBrowserWs) {

@@ -48,6 +48,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by three interchang
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|
   | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
+  | **Whisper (local)** | Browser | None | ONNX in-tab via Transformers.js; ~75–145 MB model download; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
 
@@ -84,6 +85,8 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by three interchang
 ```
 
 **Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT locally; recognized text is sent to `/ws` for translation only.
+
+**Whisper (local)** -- The browser downloads a quantized Whisper model (Xenova ONNX) and runs speech recognition on-device with simple VAD segmentation. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Requires a modern desktop browser (WebAssembly; Chrome/Edge recommended).
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
@@ -168,7 +171,7 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. |
+| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |
 | `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Internal queue size for Deepgram transcription results. |
 | `ELEVENLABS_API_KEY` | For ElevenLabs | -- | API key from [elevenlabs.io](https://elevenlabs.io/app/settings/api-keys) |
