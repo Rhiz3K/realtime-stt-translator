@@ -16,7 +16,8 @@ export const WHISPER_MODELS = {
 };
 
 const SAMPLE_RATE = 16000;
-const FRAME_SAMPLES = 512;
+// pcm-worklet.js buffers each render quantum into FRAME_SAMPLES (512) before
+// posting, so each frame the engine sees is ~32 ms at 16 kHz.
 const SILENCE_FRAMES_END = 28; // ~900 ms @ 32 ms/frame
 const MIN_SPEECH_FRAMES = 13; // ~400 ms
 const MAX_SPEECH_FRAMES = 470; // ~15 s cap per utterance
@@ -86,6 +87,9 @@ export class WhisperLocalEngine {
     this._running = false;
     this._busy = false;
 
+    /** Queue of utterances waiting to be transcribed (each is an array of Int16 chunks). */
+    this._pendingUtterances = [];
+
     this._speechFrames = [];
     this._inSpeech = false;
     this._silenceRun = 0;
@@ -106,38 +110,62 @@ export class WhisperLocalEngine {
   }
 
   async start(mediaStream) {
-    if (!this._transcriber) {
-      await this.load();
-    }
-    this._mediaStream = mediaStream;
+    // Set _running early so a Stop pressed during load()/addModule() can signal abort.
     this._running = true;
+    this._mediaStream = mediaStream;
     this._resetVad();
+    this._pendingUtterances = [];
 
-    this._audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-    const workletUrl = new URL('/static/whisper/pcm-worklet.js', window.location.origin).href;
-    await this._audioContext.audioWorklet.addModule(workletUrl);
+    try {
+      if (!this._transcriber) {
+        await this.load();
+      }
+      if (!this._running) return;
 
-    const source = this._audioContext.createMediaStreamSource(mediaStream);
-    this._processor = new AudioWorkletNode(this._audioContext, 'int16-pcm-processor', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [1],
-      channelCount: 1,
-    });
+      this._audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+      const workletUrl = new URL('/static/whisper/pcm-worklet.js', window.location.origin).href;
+      await this._audioContext.audioWorklet.addModule(workletUrl);
 
-    this._processor.port.onmessage = (event) => {
-      if (!this._running || this._busy) return;
-      const int16 = new Int16Array(event.data);
-      this._feedFrame(int16);
-    };
+      if (!this._running) {
+        try { await this._audioContext.close(); } catch (_e) { /* ignore */ }
+        this._audioContext = null;
+        return;
+      }
 
-    source.connect(this._processor);
-    this._processor.connect(this._audioContext.destination);
-    this.onStatus('Listening (local Whisper)…');
+      const source = this._audioContext.createMediaStreamSource(mediaStream);
+      this._processor = new AudioWorkletNode(this._audioContext, 'int16-pcm-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: 1,
+      });
+
+      this._processor.port.onmessage = (event) => {
+        if (!this._running) return;
+        const int16 = new Int16Array(event.data);
+        this._feedFrame(int16);
+      };
+
+      source.connect(this._processor);
+      this._processor.connect(this._audioContext.destination);
+      this.onStatus('Listening (local Whisper)…');
+    } catch (err) {
+      this._running = false;
+      if (this._processor) {
+        try { this._processor.disconnect(); } catch (_e) { /* ignore */ }
+        this._processor = null;
+      }
+      if (this._audioContext) {
+        try { await this._audioContext.close(); } catch (_e) { /* ignore */ }
+        this._audioContext = null;
+      }
+      throw err;
+    }
   }
 
   stop() {
     this._running = false;
+    this._pendingUtterances = [];
     if (this._processor) {
       try {
         this._processor.disconnect();
@@ -179,7 +207,7 @@ export class WhisperLocalEngine {
       this._silenceRun = 0;
 
       if (this._speechFrameCount >= MAX_SPEECH_FRAMES) {
-        this._finalizeUtterance();
+        this._enqueueUtterance();
       }
       return;
     }
@@ -191,19 +219,38 @@ export class WhisperLocalEngine {
     this._silenceRun++;
 
     if (this._silenceRun >= SILENCE_FRAMES_END) {
-      this._finalizeUtterance();
+      this._enqueueUtterance();
     }
   }
 
-  async _finalizeUtterance() {
+  _enqueueUtterance() {
     const frames = this._speechFrames;
     this._resetVad();
-
     if (frames.length < MIN_SPEECH_FRAMES) return;
-    if (this._busy) return;
+    this._pendingUtterances.push(frames);
+    this._processQueue();
+  }
 
+  async _processQueue() {
+    if (this._busy) return;
     this._busy = true;
-    this.onTranscript({ text: '', isFinal: false });
+    try {
+      while (this._running && this._pendingUtterances.length > 0) {
+        const frames = this._pendingUtterances.shift();
+        await this._transcribeUtterance(frames);
+      }
+    } finally {
+      this._busy = false;
+    }
+  }
+
+  async _transcribeUtterance(frames) {
+    // Skip the opening interim if the engine has already been stopped — otherwise
+    // the UI would show a '…' placeholder that never gets closed.
+    const openedInterim = this._running;
+    if (openedInterim) {
+      this.onTranscript({ text: '', isFinal: false });
+    }
 
     try {
       const audio = int16ChunksToFloat32(frames);
@@ -216,15 +263,17 @@ export class WhisperLocalEngine {
       }
 
       const result = await this._transcriber(audio, opts);
+      if (!this._running) return;
       const text = String(result?.text || '').trim();
-      if (text) {
-        this.onTranscript({ text, isFinal: true });
-      }
+      // Always dispatch a final so the UI can clear the '…' interim, even when
+      // Whisper returns blank text (silence / non-speech / [BLANK_AUDIO]).
+      this.onTranscript({ text, isFinal: true });
     } catch (err) {
       console.error('Whisper transcription failed:', err);
       this.onStatus(`Whisper error: ${err?.message || err}`);
-    } finally {
-      this._busy = false;
+      if (this._running && openedInterim) {
+        this.onTranscript({ text: '', isFinal: true });
+      }
     }
   }
 }

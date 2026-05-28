@@ -66,7 +66,7 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         # ElevenLabs WS for browser mode.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' blob: https://cdn.jsdelivr.net; "
+            "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net; "
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
             "connect-src 'self' wss://api.elevenlabs.io "

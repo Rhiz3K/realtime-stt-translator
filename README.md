@@ -7,7 +7,7 @@
 
 Real-time speech-to-text and translation web application. Speak into a microphone, see transcription appear instantly, and get live translations into two target languages simultaneously.
 
-Built with [FastAPI](https://fastapi.tiangolo.com/), powered by three interchangeable STT engines, and designed to run anywhere -- locally, in Docker, or behind a reverse proxy.
+Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchangeable STT engines, and designed to run anywhere -- locally, in Docker, or behind a reverse proxy.
 
 ![UI screenshot](https://github.com/user-attachments/assets/4f4323e9-7cea-4cd3-a8c9-ad8b4d896147)
 
@@ -43,7 +43,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by three interchang
 
 ## Features
 
-- **Three STT engines** -- switchable in the UI at any time:
+- **Four STT engines** -- switchable in the UI at any time:
 
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|

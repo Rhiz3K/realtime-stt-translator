@@ -445,7 +445,9 @@ def test_enabled_engines_includes_whisper_in_template(monkeypatch):
     resp = c.get("/")
     assert resp.status_code == 200
     assert 'value="whisper" ' in resp.text
-    assert "/static/whisper/whisper-engine.mjs" not in resp.text  # loaded on demand
+    # Engine module is loaded on demand via dynamic import(); ensure there is no
+    # eager <script src="..."> tag pulling it during initial page load.
+    assert '<script src="/static/whisper/whisper-engine.mjs"' not in resp.text
 
 
 def test_static_whisper_worklet_served(client):

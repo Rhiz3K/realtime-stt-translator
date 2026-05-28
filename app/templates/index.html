@@ -2360,8 +2360,6 @@
       setStatus('connecting');
 
       resetSessionUi();
-      _wsReconnectCount = 0;
-      _connectTranslateWs();
 
       try {
         showMessage('Loading Whisper model (first run downloads from Hugging Face)…');
@@ -2398,6 +2396,13 @@
         });
 
         await whisperLocalEngine.start(whisperMediaStream);
+
+        // Open the translate WS only after engine startup succeeded — otherwise
+        // a failure in import()/getUserMedia/model-load would leak the socket
+        // (Stop is disabled in the catch block, so the user can't close it).
+        _wsReconnectCount = 0;
+        _connectTranslateWs();
+
         setStatus('connected');
         clearMessage();
         console.log('Whisper local recording started');
