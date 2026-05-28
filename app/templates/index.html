@@ -2458,7 +2458,11 @@
 
       try {
         showMessage('Loading Whisper model (first run downloads ~75–145 MB from Hugging Face)…' + _whisperDataWarning());
-        const mod = await import('/static/whisper/whisper-engine.mjs');
+        // The ?v= token cache-busts the engine module: browsers may treat a
+        // no-Cache-Control static response as heuristically fresh and keep
+        // serving an old copy across reloads. Bump it whenever the engine or its
+        // pinned ORT/transformers versions change.
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=2');
         whisperLocalEngine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
           device: whisperDevice,

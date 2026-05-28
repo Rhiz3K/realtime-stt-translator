@@ -77,6 +77,10 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
+        # Always revalidate the local Whisper engine/worklet so a browser can't
+        # pin a stale (and possibly broken) cached copy across reloads.
+        if request.url.path.startswith("/static/whisper/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
 
