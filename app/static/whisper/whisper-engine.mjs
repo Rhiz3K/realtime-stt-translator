@@ -14,11 +14,49 @@ env.allowLocalModels = false;
 env.backends.onnx.wasm.wasmPaths =
   'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/dist/';
 
-/** @type {Record<string, { id: string, label: string, multilingual: boolean }>} */
+/**
+ * Available models. `webgpu`/`wasm` hold the dtype used on each backend.
+ * Whisper's encoder is quantization-sensitive, so on WebGPU we keep the encoder
+ * at fp16 and only 4-bit-quantize the decoder (q4) for speed/size; on CPU/WASM
+ * we use int8 (q8) for everything to keep the download small.
+ * @type {Record<string, { id: string, label: string, multilingual: boolean, webgpu: any, wasm: any }>}
+ */
 export const WHISPER_MODELS = {
-  tiny: { id: 'Xenova/whisper-tiny', label: 'tiny (~75 MB)', multilingual: true },
-  'tiny.en': { id: 'Xenova/whisper-tiny.en', label: 'tiny.en (~75 MB)', multilingual: false },
-  base: { id: 'Xenova/whisper-base', label: 'base (~145 MB)', multilingual: true },
+  tiny: {
+    id: 'onnx-community/whisper-tiny',
+    label: 'tiny (fastest, weak Czech)',
+    multilingual: true,
+    webgpu: 'fp16',
+    wasm: 'q8',
+  },
+  base: {
+    id: 'onnx-community/whisper-base',
+    label: 'base (multilingual)',
+    multilingual: true,
+    webgpu: 'fp16',
+    wasm: 'q8',
+  },
+  small: {
+    id: 'onnx-community/whisper-small',
+    label: 'small (better Czech)',
+    multilingual: true,
+    webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
+    wasm: 'q8',
+  },
+  'large-v3-turbo': {
+    id: 'onnx-community/whisper-large-v3-turbo',
+    label: 'large-v3-turbo (best Czech)',
+    multilingual: true,
+    webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
+    wasm: 'q8',
+  },
+  'tiny.en': {
+    id: 'onnx-community/whisper-tiny.en',
+    label: 'tiny.en (English only)',
+    multilingual: false,
+    webgpu: 'fp16',
+    wasm: 'q8',
+  },
 };
 
 const SAMPLE_RATE = 16000;
@@ -148,7 +186,7 @@ export class WhisperLocalEngine {
         this.onStatus(`Loading Whisper ${spec.label} on GPU (WebGPU)…`);
         this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
           device: 'webgpu',
-          dtype: WEBGPU_DTYPE,
+          dtype: spec.webgpu || WEBGPU_DTYPE,
         });
         this._device = 'webgpu';
         this.onStatus('Whisper model ready (WebGPU)');
@@ -165,7 +203,7 @@ export class WhisperLocalEngine {
     this.onStatus(`Loading Whisper ${spec.label} on CPU (WASM)…`);
     this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
       device: 'wasm',
-      dtype: WASM_DTYPE,
+      dtype: spec.wasm || WASM_DTYPE,
     });
     this._device = 'wasm';
     this.onStatus('Whisper model ready (CPU/WASM)');

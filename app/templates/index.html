@@ -437,11 +437,13 @@
             <div class="field">
               <label for="whisperModel">Whisper model</label>
               <select id="whisperModel">
-                <option value="tiny">tiny (multilingual, ~75 MB)</option>
-                <option value="tiny.en">tiny.en (English only)</option>
-                <option value="base">base (multilingual, ~145 MB)</option>
+                <option value="tiny">tiny — fastest, weak Czech (~75 MB)</option>
+                <option value="base">base — ok Czech (~145 MB)</option>
+                <option value="small">small — good Czech, recommended (~250 MB)</option>
+                <option value="large-v3-turbo">large-v3-turbo — best Czech, needs strong GPU (~800 MB)</option>
+                <option value="tiny.en">tiny.en — English only (~75 MB)</option>
               </select>
-              <p class="hint">Downloaded once (~75–145 MB) and cached; runs fully on-device. Wi‑Fi recommended for the first run.</p>
+              <p class="hint">Bigger = better Czech but slower &amp; larger download (cached after first run). On phones, “small” on WebGPU is the sweet spot. Wi‑Fi recommended.</p>
             </div>
             <div class="field">
               <label for="whisperDevice">Compute backend</label>
@@ -781,6 +783,8 @@
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
 
     // Whisper local (browser ONNX via Transformers.js)
+    // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
+    const WHISPER_MODEL_KEYS = ['tiny', 'base', 'small', 'large-v3-turbo', 'tiny.en'];
     let whisperModel = 'tiny';
     let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
@@ -1731,7 +1735,7 @@
         if (typeof parsed.elevenlabsCommitStrategy === 'string') {
           elevenlabsCommitStrategy = parsed.elevenlabsCommitStrategy === 'manual' ? 'manual' : 'vad';
         }
-        if (typeof parsed.whisperModel === 'string' && ['tiny', 'tiny.en', 'base'].includes(parsed.whisperModel)) {
+        if (typeof parsed.whisperModel === 'string' && WHISPER_MODEL_KEYS.includes(parsed.whisperModel)) {
           whisperModel = parsed.whisperModel;
         }
         if (typeof parsed.whisperDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.whisperDevice)) {
@@ -1829,7 +1833,7 @@
 
       if (whisperModelInput) {
         const wm = whisperModelInput.value;
-        whisperModel = ['tiny', 'tiny.en', 'base'].includes(wm) ? wm : 'tiny';
+        whisperModel = WHISPER_MODEL_KEYS.includes(wm) ? wm : 'tiny';
       }
       if (whisperDeviceInput) {
         const wd = whisperDeviceInput.value;
@@ -2457,12 +2461,12 @@
       resetSessionUi();
 
       try {
-        showMessage('Loading Whisper model (first run downloads ~75–145 MB from Hugging Face)…' + _whisperDataWarning());
+        showMessage('Loading Whisper model (first run downloads it from Hugging Face — ~75 MB to ~800 MB depending on model)…' + _whisperDataWarning());
         // The ?v= token cache-busts the engine module: browsers may treat a
         // no-Cache-Control static response as heuristically fresh and keep
         // serving an old copy across reloads. Bump it whenever the engine or its
         // pinned ORT/transformers versions change.
-        const mod = await import('/static/whisper/whisper-engine.mjs?v=2');
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=3');
         whisperLocalEngine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
           device: whisperDevice,

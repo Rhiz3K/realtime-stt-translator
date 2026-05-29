@@ -48,7 +48,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|
   | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
-  | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); ~75–145 MB one-time model download; runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
+  | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); selectable models tiny…large-v3-turbo (~75 MB–800 MB, cached); runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
 
