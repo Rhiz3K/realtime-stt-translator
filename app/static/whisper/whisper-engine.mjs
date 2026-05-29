@@ -367,7 +367,16 @@ export class WhisperLocalEngine {
     try {
       const audio = int16ChunksToFloat32(frames);
       const spec = this._modelSpec();
-      const opts = { task: 'transcribe', return_timestamps: false };
+      // no_repeat_ngram_size breaks Whisper's runaway repetition loops (e.g.
+      // "ještě, že ještě, že …" on silence/uncertain audio), which otherwise
+      // generate the full 448-token budget — a huge latency spike on CPU.
+      // temperature 0 = deterministic greedy decoding (fastest).
+      const opts = {
+        task: 'transcribe',
+        return_timestamps: false,
+        no_repeat_ngram_size: 3,
+        temperature: 0,
+      };
 
       if (spec.multilingual && this.language) {
         const whisperLang = ISO_TO_WHISPER[this.language] || this.language;
