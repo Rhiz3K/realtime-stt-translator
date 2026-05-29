@@ -2465,7 +2465,7 @@
         // no-Cache-Control static response as heuristically fresh and keep
         // serving an old copy across reloads. Bump it whenever the engine or its
         // pinned ORT/transformers versions change.
-        const mod = await import('/static/whisper/whisper-engine.mjs?v=7');
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=8');
         whisperLocalEngine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
           device: whisperDevice,

@@ -135,6 +135,64 @@ async function isWebGpuAvailable() {
   }
 }
 
+// Silero VAD: a tiny (~2 MB) ONNX speech/non-speech classifier that runs in the
+// browser. It replaces the crude RMS gate so the engine segments on actual
+// speech (not just loudness), cutting false segments and Whisper hallucinations
+// on noise/music. It runs on a standalone onnxruntime-web instance pointed at
+// the wasm already cached for transformers.js (no extra wasm download).
+const SILERO_ORT_URL =
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/+esm';
+const SILERO_MODEL_URL = '/static/whisper/silero-vad.onnx';
+const SILERO_SPEECH_THRESHOLD = 0.5; // speech probability gate (0..1)
+
+class SileroVad {
+  constructor() {
+    this._ort = null;
+    this._session = null;
+    this._state = null; // recurrent state, carried across frames
+    this._sr = null; // sample-rate tensor (int64 16000)
+    this._f32 = new Float32Array(512); // reusable input buffer (32 ms @ 16 kHz)
+  }
+
+  async load() {
+    const ort = await import(SILERO_ORT_URL);
+    // Reuse the wasm already fetched for transformers.js (same dev build); a
+    // single thread is plenty for this tiny model.
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/dist/';
+    ort.env.wasm.numThreads = 1;
+    this._ort = ort;
+    this._session = await ort.InferenceSession.create(SILERO_MODEL_URL);
+    this._state = new Float32Array(2 * 1 * 128);
+    this._sr = new ort.Tensor('int64', new BigInt64Array([16000n]), []);
+  }
+
+  /**
+   * @param {Int16Array} int16 - 512-sample frame @ 16 kHz
+   * @returns {Promise<number>} speech probability 0..1
+   */
+  async process(int16) {
+    const ort = this._ort;
+    const f32 = this._f32;
+    const n = Math.min(int16.length, f32.length);
+    for (let i = 0; i < n; i++) f32[i] = int16[i] / 32768;
+    for (let i = n; i < f32.length; i++) f32[i] = 0;
+    const input = new ort.Tensor('float32', f32, [1, f32.length]);
+    const state = new ort.Tensor('float32', this._state, [2, 1, 128]);
+    const out = await this._session.run({ input, state, sr: this._sr });
+    this._state = out.stateN.data; // carry the updated recurrent state
+    return out.output.data[0];
+  }
+
+  dispose() {
+    try {
+      if (this._session && this._session.release) this._session.release();
+    } catch (_e) {
+      /* ignore */
+    }
+    this._session = null;
+  }
+}
+
 export class WhisperLocalEngine {
   /**
    * @param {object} options
@@ -151,8 +209,16 @@ export class WhisperLocalEngine {
     // 'webgpu'/'wasm' force a specific backend.
     this.device = options.device === 'webgpu' || options.device === 'wasm' ? options.device : 'auto';
     this.vadThreshold = typeof options.vadThreshold === 'number' ? options.vadThreshold : 0.012;
+    this.vadSpeechThreshold =
+      typeof options.vadSpeechThreshold === 'number' ? options.vadSpeechThreshold : SILERO_SPEECH_THRESHOLD;
     this.onStatus = options.onStatus || (() => {});
     this.onTranscript = options.onTranscript || (() => {});
+
+    /** Silero VAD (null until loaded; null also means fall back to the RMS gate). */
+    this._vad = null;
+    /** Frames awaiting VAD classification (VAD inference is async). */
+    this._vadQueue = [];
+    this._vadBusy = false;
 
     /** @type {import('@huggingface/transformers').AutomaticSpeechRecognitionPipeline | null} */
     this._transcriber = null;
@@ -195,6 +261,7 @@ export class WhisperLocalEngine {
         });
         this._device = 'webgpu';
         this.onStatus('Whisper model ready (WebGPU)');
+        await this._loadVad();
         return;
       } catch (err) {
         // No GPU adapter, missing fp16 model, or a driver/runtime issue — fall
@@ -212,6 +279,21 @@ export class WhisperLocalEngine {
     });
     this._device = 'wasm';
     this.onStatus('Whisper model ready (CPU/WASM)');
+    await this._loadVad();
+  }
+
+  /** Load Silero VAD; on any failure leave this._vad null so the RMS gate is used. */
+  async _loadVad() {
+    if (this._vad) return;
+    try {
+      this.onStatus('Loading voice detection…');
+      const vad = new SileroVad();
+      await vad.load();
+      this._vad = vad;
+    } catch (err) {
+      console.warn('Silero VAD unavailable, falling back to energy gate:', err);
+      this._vad = null;
+    }
   }
 
   async start(mediaStream) {
@@ -248,7 +330,10 @@ export class WhisperLocalEngine {
       this._processor.port.onmessage = (event) => {
         if (!this._running) return;
         const int16 = new Int16Array(event.data);
-        this._feedFrame(int16);
+        this._vadQueue.push(int16);
+        // Safety cap (~2 s) in case VAD inference ever falls behind frame arrival.
+        if (this._vadQueue.length > 64) this._vadQueue.shift();
+        this._pumpVad();
       };
 
       source.connect(this._processor);
@@ -271,6 +356,12 @@ export class WhisperLocalEngine {
   stop() {
     this._running = false;
     this._pendingUtterances = [];
+    this._vadQueue = [];
+    this._vadBusy = false;
+    if (this._vad) {
+      try { this._vad.dispose(); } catch (_e) { /* ignore */ }
+      this._vad = null;
+    }
     if (this._processor) {
       try {
         this._processor.disconnect();
@@ -297,10 +388,32 @@ export class WhisperLocalEngine {
     this._speechFrameCount = 0;
   }
 
-  _feedFrame(int16) {
-    const level = rmsInt16(int16);
-    const loud = level >= this.vadThreshold;
+  /** Serially classify queued frames (Silero if available, else RMS) and drive the VAD machine. */
+  async _pumpVad() {
+    if (this._vadBusy) return;
+    this._vadBusy = true;
+    try {
+      while (this._running && this._vadQueue.length > 0) {
+        const int16 = this._vadQueue.shift();
+        let loud;
+        if (this._vad) {
+          try {
+            loud = (await this._vad.process(int16)) >= this.vadSpeechThreshold;
+          } catch (_e) {
+            loud = rmsInt16(int16) >= this.vadThreshold; // fall back if a run fails
+          }
+        } else {
+          loud = rmsInt16(int16) >= this.vadThreshold;
+        }
+        if (!this._running) break;
+        this._feedFrame(int16, loud);
+      }
+    } finally {
+      this._vadBusy = false;
+    }
+  }
 
+  _feedFrame(int16, loud) {
     if (loud) {
       if (!this._inSpeech) {
         this._inSpeech = true;
