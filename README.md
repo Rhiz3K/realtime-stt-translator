@@ -71,6 +71,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 │   Browser   │◄─────►│        FastAPI Server         │
 │             │  WS   │                               │
 │  Web Speech ├──────►│  /ws          (text → translate)│
+│  Whisper    ├──────►│  /ws          (text → translate)│
 │  Deepgram   ├──────►│  /ws/deepgram (audio → STT → tr.)│
 │  ElevenLabs ├──────►│  /ws/elevenlabs (audio → STT → tr.)│
 │             │       │                               │
@@ -86,7 +87,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 **Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT locally; recognized text is sent to `/ws` for translation only.
 
-**Whisper (local)** -- The browser downloads a Whisper model (Xenova ONNX) and runs speech recognition on-device with simple VAD segmentation. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and falls back to **CPU/WASM** otherwise; the backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. The approach is similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android) project, but runs entirely in the browser (so CPU/WASM is noticeably slower than native — prefer WebGPU on mobile).
+**Whisper (local)** -- The browser downloads a Whisper model ([onnx-community](https://huggingface.co/onnx-community) ONNX) and runs it on-device via Transformers.js, with [Silero VAD](https://github.com/snakers4/silero-vad) (also in-browser ONNX) segmenting speech from silence. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and otherwise runs on **CPU/WASM** -- multi-threaded when the page is cross-origin isolated (the app sends the required COOP/COEP headers). The backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android), but runs entirely in the browser.
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
@@ -188,13 +189,13 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 Engines are enabled via the `ENABLED_ENGINES` environment variable:
 
 ```bash
-# Web Speech only (default — no API keys needed)
-ENABLED_ENGINES=webspeech
+# Browser-only, no API keys (Web Speech + local Whisper)
+ENABLED_ENGINES=webspeech,whisper
 
 # All engines
-ENABLED_ENGINES=webspeech,deepgram,elevenlabs
+ENABLED_ENGINES=webspeech,whisper,deepgram,elevenlabs
 
-# Deepgram + ElevenLabs (no Web Speech)
+# Deepgram + ElevenLabs only
 ENABLED_ENGINES=deepgram,elevenlabs
 ```
 
@@ -219,7 +220,7 @@ Disabled engines appear in the UI dropdown but are grayed out and cannot be sele
 
 | Path | Input | Description |
 |---|---|---|
-| `/ws` | JSON text messages | Translates text (Web Speech + ElevenLabs browser mode). |
+| `/ws` | JSON text messages | Translates text (Web Speech, local Whisper, and ElevenLabs browser mode). |
 | `/ws/deepgram` | Binary PCM audio | Streams audio to Deepgram for STT + translation. |
 | `/ws/elevenlabs` | Binary PCM audio | Streams audio to ElevenLabs for STT + translation. |
 
@@ -334,6 +335,7 @@ When running behind nginx, Caddy, or similar:
 2. Set `ALLOWED_ORIGINS=https://your-domain.com` to restrict WebSocket origins.
 3. Ensure the proxy forwards `Host`, `Origin`, and `X-Forwarded-For` headers.
 4. Enable WebSocket proxying for `/ws`, `/ws/deepgram`, and `/ws/elevenlabs`.
+5. For local Whisper: serve over HTTPS (microphone and WebGPU require a secure context) and pass the app's `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers through unmodified. If the proxy strips them, Whisper still works but loses the faster multi-threaded CPU path.
 
 Example nginx location block:
 
@@ -363,6 +365,7 @@ location ~ ^/ws {
 - **Login rate limiting** -- 10 attempts per 60 seconds per IP (in-memory).
 - **CSRF protection** -- Origin/Referer validation on login form submissions.
 - **Content Security Policy** -- Restricts script sources, frame ancestors, and connect targets.
+- **Cross-origin isolation** -- `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers (also enable multi-threaded WASM for local Whisper).
 - **WebSocket origin check** -- Validates `Origin` header against `Host` or `ALLOWED_ORIGINS`.
 - **Safe redirects** -- `sanitize_next_path` prevents open redirects after login.
 - **No secrets in logs** -- Passwords and API keys are never logged.
@@ -407,5 +410,7 @@ See [SUPPORT.md](SUPPORT.md).
 This project is licensed under the [MIT License](LICENSE).
 
 ---
+
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 Made with care by [Rhiz3K](https://github.com/Rhiz3K)
