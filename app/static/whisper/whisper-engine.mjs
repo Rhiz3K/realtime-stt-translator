@@ -14,6 +14,15 @@ env.allowLocalModels = false;
 env.backends.onnx.wasm.wasmPaths =
   'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/dist/';
 
+// When the page is cross-origin isolated (COOP+COEP headers from the server),
+// SharedArrayBuffer is available and ORT Web can run the WASM/CPU path
+// multi-threaded — a large speedup on multi-core devices. Without isolation it
+// stays single-threaded. Cap threads so we don't peg every core on a phone.
+if (typeof self !== 'undefined' && self.crossOriginIsolated) {
+  const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+  env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(cores, 8));
+}
+
 /**
  * Available models. `webgpu`/`wasm` hold the dtype used on each backend.
  * Whisper's encoder is quantization-sensitive, so on WebGPU we keep the encoder
@@ -21,40 +30,36 @@ env.backends.onnx.wasm.wasmPaths =
  * we use int8 (q8) for everything to keep the download small.
  * @type {Record<string, { id: string, label: string, multilingual: boolean, webgpu: any, wasm: any }>}
  */
+// Lineup tuned for the CPU/WASM browser path: small multilingual models that
+// stay responsive on a phone CPU (multi-threaded when cross-origin isolated).
+// large-v3-turbo is kept for devices with WebGPU but is slow on CPU.
 export const WHISPER_MODELS = {
   tiny: {
     id: 'onnx-community/whisper-tiny',
-    label: 'tiny (fastest, weak Czech)',
+    label: 'tiny (fastest, multilingual)',
     multilingual: true,
     webgpu: 'fp16',
     wasm: 'q8',
   },
   base: {
     id: 'onnx-community/whisper-base',
-    label: 'base (multilingual)',
+    label: 'base (fast, multilingual)',
     multilingual: true,
     webgpu: 'fp16',
     wasm: 'q8',
   },
   small: {
     id: 'onnx-community/whisper-small',
-    label: 'small (better Czech)',
+    label: 'small (best multilingual quality)',
     multilingual: true,
     webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
     wasm: 'q8',
   },
   'large-v3-turbo': {
     id: 'onnx-community/whisper-large-v3-turbo',
-    label: 'large-v3-turbo (best Czech)',
+    label: 'large-v3-turbo (top quality, WebGPU only)',
     multilingual: true,
     webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
-    wasm: 'q8',
-  },
-  'tiny.en': {
-    id: 'onnx-community/whisper-tiny.en',
-    label: 'tiny.en (English only)',
-    multilingual: false,
-    webgpu: 'fp16',
     wasm: 'q8',
   },
 };

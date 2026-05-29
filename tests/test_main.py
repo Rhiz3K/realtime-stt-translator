@@ -476,6 +476,14 @@ def test_csp_allows_whisper_runtime_sources(client):
     assert "https://huggingface.co" in csp
 
 
+def test_cross_origin_isolation_headers(client):
+    # COOP+COEP make the page cross-origin isolated, which enables SharedArrayBuffer
+    # and lets ONNX Runtime Web run the Whisper WASM/CPU path multi-threaded.
+    resp = client.get("/health")
+    assert resp.headers.get("Cross-Origin-Opener-Policy") == "same-origin"
+    assert resp.headers.get("Cross-Origin-Embedder-Policy") == "credentialless"
+
+
 def test_enabled_engines_default_webspeech_only(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")

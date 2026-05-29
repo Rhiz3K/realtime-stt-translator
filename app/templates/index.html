@@ -437,13 +437,12 @@
             <div class="field">
               <label for="whisperModel">Whisper model</label>
               <select id="whisperModel">
-                <option value="tiny">tiny — fastest, weak Czech (~75 MB)</option>
-                <option value="base">base — ok Czech (~145 MB)</option>
-                <option value="small">small — good Czech, recommended (~250 MB)</option>
-                <option value="large-v3-turbo">large-v3-turbo — best Czech, needs strong GPU (~800 MB)</option>
-                <option value="tiny.en">tiny.en — English only (~75 MB)</option>
+                <option value="tiny">tiny — fastest, multilingual (~75 MB)</option>
+                <option value="base">base — fast, multilingual (~145 MB)</option>
+                <option value="small">small — best multilingual quality (~250 MB, heavier on CPU)</option>
+                <option value="large-v3-turbo">large-v3-turbo — top quality, WebGPU only (~800 MB)</option>
               </select>
-              <p class="hint">Bigger = better Czech but slower &amp; larger download (cached after first run). On phones, “small” on WebGPU is the sweet spot. Wi‑Fi recommended.</p>
+              <p class="hint">Runs on-device (multilingual incl. Czech). tiny/base/small work on CPU — faster now via multi-threading; large-v3-turbo needs WebGPU. Models are cached after the first download.</p>
             </div>
             <div class="field">
               <label for="whisperDevice">Compute backend</label>
@@ -784,8 +783,8 @@
 
     // Whisper local (browser ONNX via Transformers.js)
     // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
-    const WHISPER_MODEL_KEYS = ['tiny', 'base', 'small', 'large-v3-turbo', 'tiny.en'];
-    let whisperModel = 'tiny';
+    const WHISPER_MODEL_KEYS = ['tiny', 'base', 'small', 'large-v3-turbo'];
+    let whisperModel = 'base';
     let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
     let whisperMediaStream = null;
@@ -2466,7 +2465,7 @@
         // no-Cache-Control static response as heuristically fresh and keep
         // serving an old copy across reloads. Bump it whenever the engine or its
         // pinned ORT/transformers versions change.
-        const mod = await import('/static/whisper/whisper-engine.mjs?v=3');
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=6');
         whisperLocalEngine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
           device: whisperDevice,

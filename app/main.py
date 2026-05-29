@@ -77,6 +77,13 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
+        # Cross-origin isolation enables SharedArrayBuffer, which lets ONNX Runtime
+        # Web run the local Whisper model multi-threaded on the CPU (much faster on
+        # multi-core devices). COEP 'credentialless' still allows the cross-origin
+        # CDN/Hugging Face fetches (transformers.js, ORT wasm, model weights) since
+        # those send CORS headers.
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         # Always revalidate the local Whisper engine/worklet so a browser can't
         # pin a stale (and possibly broken) cached copy across reloads.
         if request.url.path.startswith("/static/whisper/"):
