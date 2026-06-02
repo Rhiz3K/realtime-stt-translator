@@ -64,13 +64,22 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         response: StarletteResponse = await call_next(request)
         # Inline scripts/styles are used throughout; connect-src must allow
         # ElevenLabs WS for browser mode.
+        # jsDelivr is scoped to the two pinned packages we actually load
+        # (Transformers.js and the ONNX Runtime build used by it and the VAD)
+        # rather than the whole CDN. The bare-version entry covers the initial
+        # import; the trailing-slash entries cover its /+esm and /dist/* sub-paths.
+        jsdelivr = (
+            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0 "
+            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/ "
+            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/"
+        )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net; "
+            f"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: {jsdelivr}; "
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
-            "connect-src 'self' wss://api.elevenlabs.io "
-            "https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co "
+            f"connect-src 'self' wss://api.elevenlabs.io {jsdelivr} "
+            "https://huggingface.co https://cdn-lfs.huggingface.co "
             "https://cas-bridge.xethub.hf.co; "
             "img-src 'self' data:; "
             "frame-ancestors 'none'"

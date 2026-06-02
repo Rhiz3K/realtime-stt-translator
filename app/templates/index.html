@@ -2516,9 +2516,8 @@
 
         await whisperLocalEngine.start(whisperMediaStream);
 
-        // Open the translate WS only after engine startup succeeded — otherwise
-        // a failure in import()/getUserMedia/model-load would leak the socket
-        // (Stop is disabled in the catch block, so the user can't close it).
+        // Open the translate WS only after engine startup succeeded, so a failure
+        // in import()/getUserMedia/model-load can't leave a socket open.
         _wsReconnectCount = 0;
         _connectTranslateWs();
 
@@ -2527,13 +2526,13 @@
         console.log('Whisper local recording started');
       } catch (err) {
         console.error('Whisper start failed:', err);
-        stopWhisperPipeline();
+        // Full teardown (engine, mic, translate WS, keepalive timers, buttons) —
+        // not just the Whisper pipeline — so nothing leaks if the WS was opened.
+        stopRecording();
         setStatus('error');
         showMessage(
           'Whisper failed to start: ' + (err && err.message ? err.message : String(err))
         );
-        startButton.disabled = false;
-        stopButton.disabled = true;
       }
     }
 
