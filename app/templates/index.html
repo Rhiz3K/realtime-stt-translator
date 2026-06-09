@@ -177,6 +177,66 @@
     .layout-compact-topbar #topbarCompactToggle .icon {
       transform: rotate(180deg);
     }
+
+    /* --- Tablets & narrow windows ---
+       The runtime-controls row used overflow-x + flex-end. Once its content is
+       wider than the row (which happens well before phone widths), the flexbox
+       items overflow the START edge and Start/Stop/Settings get clipped with no
+       way to scroll to them. Let the row wrap so every control stays reachable. */
+    @media (max-width: 980px) {
+      .topbar-statsrow {
+        flex-wrap: wrap;
+        row-gap: var(--space-1);
+      }
+
+      .topbar-stats-right {
+        overflow-x: visible;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        width: 100%;
+      }
+
+      /* Stats are the least critical; give them their own scrollable line so
+         they never push the buttons off-screen. */
+      .topbar-stats-right .stats {
+        order: 5;
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+    }
+
+    /* --- Phones: big tappable primary actions, full-width controls. --- */
+    @media (max-width: 700px) {
+      #startButton,
+      #stopButton {
+        flex: 1 1 120px;
+      }
+
+      .controls {
+        justify-content: flex-start;
+        width: 100%;
+      }
+
+      .control {
+        flex: 1 1 auto;
+      }
+
+      #engineSelect {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      input[type="range"] {
+        width: 100%;
+        flex: 1 1 auto;
+      }
+
+      /* Reclaim a little vertical space for transcripts. */
+      .card {
+        min-height: 180px;
+      }
+    }
   </style>
 {% endblock %}
 
@@ -193,6 +253,7 @@
             <label for="engineSelect">Engine</label>
             <select id="engineSelect" aria-label="Speech engine">
               <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="whisper" {% if 'whisper' not in enabled_engines %}disabled{% endif %}>Whisper (local){% if 'whisper' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
             </select>
@@ -368,6 +429,29 @@
             <div class="field">
               <button class="btn" id="checkWebSpeechLang" type="button">Check language availability</button>
               <p class="hint" id="webSpeechLangStatus">&nbsp;</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Whisper (local, browser)</div>
+          <div class="form-grid" role="group" aria-label="Whisper local">
+            <div class="field">
+              <label for="whisperModel">Whisper model</label>
+              <select id="whisperModel">
+                <option value="tiny">tiny — fastest, multilingual (~75 MB)</option>
+                <option value="base">base — fast, multilingual (~145 MB)</option>
+                <option value="small">small — best multilingual quality (~250 MB, heavier on CPU)</option>
+                <option value="large-v3-turbo">large-v3-turbo — top quality, WebGPU only (~800 MB)</option>
+              </select>
+              <p class="hint">Runs on-device (multilingual incl. Czech). tiny/base/small work on CPU — faster now via multi-threading; large-v3-turbo needs WebGPU. Models are cached after the first download.</p>
+            </div>
+            <div class="field">
+              <label for="whisperDevice">Compute backend</label>
+              <select id="whisperDevice">
+                <option value="auto">Auto (WebGPU if available)</option>
+                <option value="webgpu">WebGPU (GPU)</option>
+                <option value="wasm">CPU (WASM)</option>
+              </select>
+              <p class="hint">WebGPU (GPU) is much faster than CPU — on desktop and Android Chrome 121+. Auto falls back to CPU/WASM.</p>
             </div>
           </div>
 
@@ -590,6 +674,8 @@
     const debugLoggingCheckbox = document.getElementById('debugLogging');
 
     const recognitionLangInput = document.getElementById('recognitionLang');
+    const whisperModelInput = document.getElementById('whisperModel');
+    const whisperDeviceInput = document.getElementById('whisperDevice');
     const translateSrcInput = document.getElementById('translateSrc');
     const translateDestASelect = document.getElementById('translateDestA');
     const translateDestBSelect = document.getElementById('translateDestB');
@@ -695,6 +781,14 @@
     let elevenlabsCommitStrategy = 'vad';
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
 
+    // Whisper local (browser ONNX via Transformers.js)
+    // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
+    const WHISPER_MODEL_KEYS = ['tiny', 'base', 'small', 'large-v3-turbo'];
+    let whisperModel = 'base';
+    let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
+    let whisperLocalEngine = null;
+    let whisperMediaStream = null;
+
     // Remote-provided language list for translation.
     let translateLangChoices = null;
 
@@ -729,6 +823,12 @@
 
     let _trNextClientId = 1;
     const _trPending = new Map(); // client_id -> perfNow
+
+    // Final transcripts produced while /ws is still connecting (or reconnecting)
+    // are buffered here and flushed on open, so committed text isn't lost.
+    // Interims are ephemeral and not worth replaying.
+    const _PENDING_FINALS_MAX = 20;
+    let _pendingFinalTexts = [];
 
     function _ema(prev, next, alpha) {
       const a = Number.isFinite(alpha) ? alpha : 0.25;
@@ -1014,17 +1114,23 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
+          : enabledEngines.has('whisper') ? 'whisper'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
           : 'webspeech';
       }
       currentEngine = e;
       engineSelect.value = e;
-      const labels = { webspeech: 'Web Speech', deepgram: 'Deepgram Nova-3', elevenlabs: 'ElevenLabs Scribe' };
+      const labels = {
+        webspeech: 'Web Speech',
+        whisper: 'Whisper (local)',
+        deepgram: 'Deepgram Nova-3',
+        elevenlabs: 'ElevenLabs Scribe',
+      };
       engineBadge.textContent = labels[e] || e;
       document.title = `Live Translator (${engineBadge.textContent})`;
       try {
@@ -1033,9 +1139,9 @@
         // no-op
       }
 
-      // Web Speech uses the browser recognizer; the connection badge is mostly noise.
+      // Local STT engines do not use a server audio stream; hide the WS status badge.
       if (statusIndicator) {
-        statusIndicator.hidden = e === 'webspeech';
+        statusIndicator.hidden = e === 'webspeech' || e === 'whisper';
       }
     }
 
@@ -1552,6 +1658,13 @@
       elevenlabsApiKeyInput.value = elevenlabsApiKey;
       elevenlabsLanguageInput.value = elevenlabsLanguage;
       elevenlabsCommitStrategyInput.value = elevenlabsCommitStrategy;
+
+      if (whisperModelInput) {
+        whisperModelInput.value = whisperModel;
+      }
+      if (whisperDeviceInput) {
+        whisperDeviceInput.value = whisperDevice;
+      }
     }
 
     function loadSettings() {
@@ -1600,7 +1713,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -1626,6 +1739,12 @@
         }
         if (typeof parsed.elevenlabsCommitStrategy === 'string') {
           elevenlabsCommitStrategy = parsed.elevenlabsCommitStrategy === 'manual' ? 'manual' : 'vad';
+        }
+        if (typeof parsed.whisperModel === 'string' && WHISPER_MODEL_KEYS.includes(parsed.whisperModel)) {
+          whisperModel = parsed.whisperModel;
+        }
+        if (typeof parsed.whisperDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.whisperDevice)) {
+          whisperDevice = parsed.whisperDevice;
         }
       } catch (_e) {
         // ignore invalid storage
@@ -1657,6 +1776,8 @@
             elevenlabsApiKey,
             elevenlabsLanguage,
             elevenlabsCommitStrategy,
+            whisperModel,
+            whisperDevice,
           })
         );
       } catch (_e) {
@@ -1714,6 +1835,15 @@
       elevenlabsApiKey = (elevenlabsApiKeyInput.value || '').trim();
       elevenlabsLanguage = elevenlabsLanguageInput.value || '';
       elevenlabsCommitStrategy = elevenlabsCommitStrategyInput.value === 'manual' ? 'manual' : 'vad';
+
+      if (whisperModelInput) {
+        const wm = whisperModelInput.value;
+        whisperModel = WHISPER_MODEL_KEYS.includes(wm) ? wm : 'base';
+      }
+      if (whisperDeviceInput) {
+        const wd = whisperDeviceInput.value;
+        whisperDevice = ['auto', 'webgpu', 'wasm'].includes(wd) ? wd : 'auto';
+      }
 
       persistSettings();
 
@@ -2152,7 +2282,13 @@
     function sendTranslateWsMessage(msgType, text) {
       const t = String(text || '').trim();
       if (!t) return;
-      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        if (msgType === 'final') {
+          _pendingFinalTexts.push(t);
+          if (_pendingFinalTexts.length > _PENDING_FINALS_MAX) _pendingFinalTexts.shift();
+        }
+        return;
+      }
       const nowPerf = performance.now();
       _prunePendingTranslate(nowPerf);
       const clientId = _trNextClientId++;
@@ -2162,6 +2298,13 @@
       } catch (_e) {
         _trPending.delete(clientId);
       }
+    }
+
+    function _flushPendingFinals() {
+      if (!_pendingFinalTexts.length) return;
+      const pending = _pendingFinalTexts;
+      _pendingFinalTexts = [];
+      for (const t of pending) sendTranslateWsMessage('final', t);
     }
 
     // --- WebSocket keepalive / reconnect helpers ---
@@ -2215,6 +2358,7 @@
         } catch (_e) {
           // no-op
         }
+        _flushPendingFinals();
       };
 
       socket.onclose = () => {
@@ -2284,6 +2428,157 @@
 
       recognition.start();
       console.log('Recording started');
+    }
+
+    function _whisperDataWarning() {
+      // Hint about cellular data before the large first-run model download.
+      try {
+        const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (c && (c.saveData === true || /(^|\b)(slow-2g|2g|3g)$/.test(String(c.effectiveType || '')))) {
+          return ' (Wi‑Fi recommended — large download on mobile data.)';
+        }
+      } catch (_e) {
+        // no-op
+      }
+      return '';
+    }
+
+    function stopWhisperPipeline() {
+      if (whisperLocalEngine) {
+        try {
+          whisperLocalEngine.stop();
+        } catch (_e) {
+          // no-op
+        }
+        whisperLocalEngine = null;
+      }
+      if (whisperMediaStream) {
+        try {
+          whisperMediaStream.getTracks().forEach((track) => track.stop());
+        } catch (_e) {
+          // no-op
+        }
+        whisperMediaStream = null;
+      }
+      // A transcription in flight when Stop is pressed never emits its closing
+      // final, so drop any dangling '…' interim placeholder (no-op otherwise).
+      removeInterimElement(recognizedContainer);
+    }
+
+    async function startWhisperRecording() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showMessage('Microphone access is not available in this browser.');
+        return;
+      }
+
+      applyEngineUi('whisper');
+      applyRecognitionSettings();
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+
+      // Local handle for this start attempt: every `await` below is a window in
+      // which Stop (or Stop + a new Start) can run; afterwards we only proceed
+      // if `whisperLocalEngine` still points at THIS engine.
+      let engine = null;
+      try {
+        showMessage('Loading Whisper model (first run downloads it from Hugging Face — ~75 MB to ~800 MB depending on model)…' + _whisperDataWarning());
+        // The ?v= token cache-busts the engine module: browsers may treat a
+        // no-Cache-Control static response as heuristically fresh and keep
+        // serving an old copy across reloads. Bump it whenever the engine or its
+        // pinned ORT/transformers versions change.
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=9');
+        engine = new mod.WhisperLocalEngine({
+          modelKey: whisperModel,
+          device: whisperDevice,
+          language: translateSrc || 'cs',
+          onStatus: (msg) => {
+            if (msg) showMessage(msg);
+          },
+          onTranscript: ({ text, isFinal }) => {
+            // Stats: time-to-first-transcript and per-utterance inference latency.
+            const nowPerf = performance.now();
+            if (_sttTtfbMs == null) {
+              _sttTtfbMs = nowPerf - _sessionStartPerf;
+            }
+            if (!isFinal) {
+              if (_sttSegmentStartPerf == null) {
+                _sttSegmentStartPerf = nowPerf;
+              }
+              removeInterimElement(recognizedContainer);
+              showInterim(recognizedContainer, text || '…');
+              updateStatsBar();
+              return;
+            }
+            if (_sttSegmentStartPerf != null) {
+              const sttMs = nowPerf - _sttSegmentStartPerf;
+              _sttLastFinalMs = sttMs;
+              _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+              _sttSegmentStartPerf = null;
+            }
+            removeInterimElement(recognizedContainer);
+            if (!text) {
+              updateStatsBar();
+              return;
+            }
+            addSegment(recognizedContainer, czSegmentCount++, text);
+            sendTranslateWsMessage('final', text);
+            updateStatsBar();
+          },
+        });
+        whisperLocalEngine = engine;
+
+        // Download/initialize the model BEFORE asking for the microphone, so the
+        // mic indicator isn't lit for minutes during a first-run model download.
+        await engine.load();
+        if (whisperLocalEngine !== engine) return; // Stop pressed during load
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+          video: false,
+        });
+        if (whisperLocalEngine !== engine) {
+          // Stopped while the permission prompt was open — release the fresh mic.
+          try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
+          return;
+        }
+        whisperMediaStream = stream;
+
+        await engine.start(stream);
+        if (whisperLocalEngine !== engine) return; // Stop pressed during start
+
+        // Open the translate WS only after engine startup succeeded, so a failure
+        // in import()/model-load/getUserMedia can't leave a socket open — and only
+        // while this start attempt is still the active one (guards above), so a
+        // Stop during startup can't resurrect a zombie socket + 'connected' badge.
+        _wsReconnectCount = 0;
+        _connectTranslateWs();
+
+        setStatus('connected');
+        clearMessage();
+        console.log('Whisper local recording started');
+      } catch (err) {
+        // Stop already tore everything down and the user moved on — don't
+        // resurrect an error UI for an aborted start attempt.
+        if (engine && whisperLocalEngine !== engine) return;
+        console.error('Whisper start failed:', err);
+        // Full teardown (engine, mic, translate WS, keepalive timers, buttons) —
+        // not just the Whisper pipeline — so nothing leaks if the WS was opened.
+        stopRecording();
+        setStatus('error');
+        showMessage(
+          'Whisper failed to start: ' + (err && err.message ? err.message : String(err))
+        );
+      }
     }
 
     async function startDeepgramRecording() {
@@ -3055,6 +3350,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         startElevenLabsRecording();
         return;
       }
+      if (currentEngine === 'whisper') {
+        startWhisperRecording();
+        return;
+      }
       startWebSpeechRecording();
     }
 
@@ -3072,6 +3371,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
 
       stopDeepgramPipeline();
+      stopWhisperPipeline();
 
       // Close direct ElevenLabs WS (browser mode).
       if (_elBrowserWs) {
@@ -3094,6 +3394,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       lastInterimSentText = '';
       lastInterimSentAtMs = 0;
+      _pendingFinalTexts = [];
 
       startButton.disabled = false;
       stopButton.disabled = true;

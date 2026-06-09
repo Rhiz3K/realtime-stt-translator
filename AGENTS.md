@@ -1,7 +1,8 @@
 # Agent Notes (sr_live-translator)
 
-This repository is a small FastAPI app that serves a password-protected UI with three STT engines:
+This repository is a small FastAPI app that serves a password-protected UI with four STT engines:
 - **Web Speech** – browser Web Speech API, sends recognized text to `/ws` for translation.
+- **Whisper (local)** – browser Transformers.js + ONNX, WebGPU with CPU/WASM fallback (browser analogue of whisper_android); audio stays on device, text to `/ws`.
 - **Deepgram** – streams audio to `/ws/deepgram` for Deepgram Nova-3 transcription + translation.
 - **ElevenLabs** – streams audio to `/ws/elevenlabs`, server proxies to ElevenLabs Scribe v2 Realtime WS API.
 

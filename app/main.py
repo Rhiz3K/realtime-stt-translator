@@ -18,6 +18,7 @@ import websockets as ws_lib
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from googletrans import Translator
 from starlette.websockets import WebSocketDisconnect
@@ -50,6 +51,7 @@ load_dotenv()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 # --- Security middleware: Content-Security-Policy ---
@@ -62,17 +64,39 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         response: StarletteResponse = await call_next(request)
         # Inline scripts/styles are used throughout; connect-src must allow
         # ElevenLabs WS for browser mode.
+        # jsDelivr is scoped to the two pinned packages we actually load
+        # (Transformers.js and the ONNX Runtime build used by it and the VAD)
+        # rather than the whole CDN. The bare-version entry covers the initial
+        # import; the trailing-slash entries cover its /+esm and /dist/* sub-paths.
+        jsdelivr = (
+            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0 "
+            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/ "
+            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/"
+        )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' blob:; "
+            f"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: {jsdelivr}; "
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
-            "connect-src 'self' wss://api.elevenlabs.io; "
+            f"connect-src 'self' wss://api.elevenlabs.io {jsdelivr} "
+            "https://huggingface.co https://cdn-lfs.huggingface.co "
+            "https://cas-bridge.xethub.hf.co; "
             "img-src 'self' data:; "
             "frame-ancestors 'none'"
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
+        # Cross-origin isolation enables SharedArrayBuffer, which lets ONNX Runtime
+        # Web run the local Whisper model multi-threaded on the CPU (much faster on
+        # multi-core devices). COEP 'credentialless' still allows the cross-origin
+        # CDN/Hugging Face fetches (transformers.js, ORT wasm, model weights) since
+        # those send CORS headers.
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+        # Always revalidate the local Whisper engine/worklet so a browser can't
+        # pin a stale (and possibly broken) cached copy across reloads.
+        if request.url.path.startswith("/static/whisper/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
 
@@ -160,7 +184,7 @@ ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 # Which STT engines are available to users.  Comma-separated list.
 # Valid values: webspeech, deepgram, elevenlabs.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "deepgram", "elevenlabs"}
+_ALL_ENGINES = {"webspeech", "whisper", "deepgram", "elevenlabs"}
 _raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
 ENABLED_ENGINES: set[str] = {
     e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES

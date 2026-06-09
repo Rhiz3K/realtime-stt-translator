@@ -11,7 +11,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
-    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "deepgram", "elevenlabs"})
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "deepgram", "elevenlabs"})
     return TestClient(main.app)
 
 
@@ -171,6 +171,10 @@ def test_ws_deepgram_init_failure_sends_error(client, monkeypatch):
     client.post("/login", data={"password": "test-password", "next": "/deepgram"}, follow_redirects=False)
 
     with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
+        # The endpoint blocks on the first client message (config or audio) before
+        # it constructs DeepgramClient, so send a config to trigger the failing init.
+        # Without this the server never reaches the boom and both sides deadlock.
+        ws.send_json({"type": "config", "deepgram": {"language": "cs"}})
         payload = ws.receive_json()
 
     assert payload == {"error": "boom"}
@@ -432,6 +436,56 @@ def test_enabled_engines_passed_to_template(monkeypatch):
     assert 'value="deepgram" ' in resp.text    # not disabled
     # elevenlabs should be disabled
     assert 'value="elevenlabs" disabled' in resp.text
+
+
+def test_enabled_engines_includes_whisper_in_template(monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
+    monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"whisper"})
+
+    c = TestClient(main.app)
+    c.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = c.get("/")
+    assert resp.status_code == 200
+    assert 'value="whisper" ' in resp.text
+    # Engine module is loaded on demand via dynamic import(); ensure there is no
+    # eager <script src="..."> tag pulling it during initial page load.
+    assert '<script src="/static/whisper/whisper-engine.mjs"' not in resp.text
+
+
+def test_static_whisper_worklet_served(client):
+    resp = client.get("/static/whisper/pcm-worklet.js")
+    assert resp.status_code == 200
+    assert "Int16PCMProcessor" in resp.text
+    # /static/whisper/* must always revalidate so browsers can't pin a stale
+    # (possibly ABI-incompatible) engine copy across deploys.
+    assert resp.headers.get("cache-control") == "no-cache"
+
+
+def test_static_whisper_engine_served(client):
+    resp = client.get("/static/whisper/whisper-engine.mjs")
+    assert resp.status_code == 200
+    assert "WhisperLocalEngine" in resp.text
+    assert resp.headers.get("cache-control") == "no-cache"
+
+
+def test_csp_allows_whisper_runtime_sources(client):
+    # The local Whisper engine needs WASM execution plus Transformers.js/ONNX from
+    # jsdelivr and the model weights from Hugging Face. The CSP must permit these.
+    resp = client.get("/health")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "'wasm-unsafe-eval'" in csp
+    assert "https://cdn.jsdelivr.net" in csp
+    assert "https://huggingface.co" in csp
+
+
+def test_cross_origin_isolation_headers(client):
+    # COOP+COEP make the page cross-origin isolated, which enables SharedArrayBuffer
+    # and lets ONNX Runtime Web run the Whisper WASM/CPU path multi-threaded.
+    resp = client.get("/health")
+    assert resp.headers.get("Cross-Origin-Opener-Policy") == "same-origin"
+    assert resp.headers.get("Cross-Origin-Embedder-Policy") == "credentialless"
 
 
 def test_enabled_engines_default_webspeech_only(monkeypatch):
