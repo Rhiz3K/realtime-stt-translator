@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-09
+
 ### Added
 
 - **Browser-local Whisper STT engine** (`whisper`) — a fourth STT engine that runs
@@ -26,6 +28,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     without limit on slow devices.
 - `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless`
   response headers (required to enable multi-threaded WASM).
+- GitHub Actions CI workflow — the test suite runs on pushes and pull requests to `main`.
 
 ### Changed
 
