@@ -824,6 +824,12 @@
     let _trNextClientId = 1;
     const _trPending = new Map(); // client_id -> perfNow
 
+    // Final transcripts produced while /ws is still connecting (or reconnecting)
+    // are buffered here and flushed on open, so committed text isn't lost.
+    // Interims are ephemeral and not worth replaying.
+    const _PENDING_FINALS_MAX = 20;
+    let _pendingFinalTexts = [];
+
     function _ema(prev, next, alpha) {
       const a = Number.isFinite(alpha) ? alpha : 0.25;
       if (prev == null) return next;
@@ -1832,7 +1838,7 @@
 
       if (whisperModelInput) {
         const wm = whisperModelInput.value;
-        whisperModel = WHISPER_MODEL_KEYS.includes(wm) ? wm : 'tiny';
+        whisperModel = WHISPER_MODEL_KEYS.includes(wm) ? wm : 'base';
       }
       if (whisperDeviceInput) {
         const wd = whisperDeviceInput.value;
@@ -2276,7 +2282,13 @@
     function sendTranslateWsMessage(msgType, text) {
       const t = String(text || '').trim();
       if (!t) return;
-      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        if (msgType === 'final') {
+          _pendingFinalTexts.push(t);
+          if (_pendingFinalTexts.length > _PENDING_FINALS_MAX) _pendingFinalTexts.shift();
+        }
+        return;
+      }
       const nowPerf = performance.now();
       _prunePendingTranslate(nowPerf);
       const clientId = _trNextClientId++;
@@ -2286,6 +2298,13 @@
       } catch (_e) {
         _trPending.delete(clientId);
       }
+    }
+
+    function _flushPendingFinals() {
+      if (!_pendingFinalTexts.length) return;
+      const pending = _pendingFinalTexts;
+      _pendingFinalTexts = [];
+      for (const t of pending) sendTranslateWsMessage('final', t);
     }
 
     // --- WebSocket keepalive / reconnect helpers ---
@@ -2339,6 +2358,7 @@
         } catch (_e) {
           // no-op
         }
+        _flushPendingFinals();
       };
 
       socket.onclose = () => {
@@ -2440,6 +2460,9 @@
         }
         whisperMediaStream = null;
       }
+      // A transcription in flight when Stop is pressed never emits its closing
+      // final, so drop any dangling '…' interim placeholder (no-op otherwise).
+      removeInterimElement(recognizedContainer);
     }
 
     async function startWhisperRecording() {
@@ -2459,14 +2482,18 @@
 
       resetSessionUi();
 
+      // Local handle for this start attempt: every `await` below is a window in
+      // which Stop (or Stop + a new Start) can run; afterwards we only proceed
+      // if `whisperLocalEngine` still points at THIS engine.
+      let engine = null;
       try {
         showMessage('Loading Whisper model (first run downloads it from Hugging Face — ~75 MB to ~800 MB depending on model)…' + _whisperDataWarning());
         // The ?v= token cache-busts the engine module: browsers may treat a
         // no-Cache-Control static response as heuristically fresh and keep
         // serving an old copy across reloads. Bump it whenever the engine or its
         // pinned ORT/transformers versions change.
-        const mod = await import('/static/whisper/whisper-engine.mjs?v=8');
-        whisperLocalEngine = new mod.WhisperLocalEngine({
+        const mod = await import('/static/whisper/whisper-engine.mjs?v=9');
+        engine = new mod.WhisperLocalEngine({
           modelKey: whisperModel,
           device: whisperDevice,
           language: translateSrc || 'cs',
@@ -2504,8 +2531,14 @@
             updateStatsBar();
           },
         });
+        whisperLocalEngine = engine;
 
-        whisperMediaStream = await navigator.mediaDevices.getUserMedia({
+        // Download/initialize the model BEFORE asking for the microphone, so the
+        // mic indicator isn't lit for minutes during a first-run model download.
+        await engine.load();
+        if (whisperLocalEngine !== engine) return; // Stop pressed during load
+
+        const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
             echoCancellation: true,
@@ -2513,11 +2546,20 @@
           },
           video: false,
         });
+        if (whisperLocalEngine !== engine) {
+          // Stopped while the permission prompt was open — release the fresh mic.
+          try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
+          return;
+        }
+        whisperMediaStream = stream;
 
-        await whisperLocalEngine.start(whisperMediaStream);
+        await engine.start(stream);
+        if (whisperLocalEngine !== engine) return; // Stop pressed during start
 
         // Open the translate WS only after engine startup succeeded, so a failure
-        // in import()/getUserMedia/model-load can't leave a socket open.
+        // in import()/model-load/getUserMedia can't leave a socket open — and only
+        // while this start attempt is still the active one (guards above), so a
+        // Stop during startup can't resurrect a zombie socket + 'connected' badge.
         _wsReconnectCount = 0;
         _connectTranslateWs();
 
@@ -2525,6 +2567,9 @@
         clearMessage();
         console.log('Whisper local recording started');
       } catch (err) {
+        // Stop already tore everything down and the user moved on — don't
+        // resurrect an error UI for an aborted start attempt.
+        if (engine && whisperLocalEngine !== engine) return;
         console.error('Whisper start failed:', err);
         // Full teardown (engine, mic, translate WS, keepalive timers, buttons) —
         // not just the Whisper pipeline — so nothing leaks if the WS was opened.
@@ -3349,6 +3394,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       lastInterimSentText = '';
       lastInterimSentAtMs = 0;
+      _pendingFinalTexts = [];
 
       startButton.disabled = false;
       stopButton.disabled = true;

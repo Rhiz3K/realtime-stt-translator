@@ -68,8 +68,11 @@ const SAMPLE_RATE = 16000;
 // pcm-worklet.js buffers each render quantum into FRAME_SAMPLES (512) before
 // posting, so each frame the engine sees is ~32 ms at 16 kHz.
 const SILENCE_FRAMES_END = 28; // ~900 ms @ 32 ms/frame
-const MIN_SPEECH_FRAMES = 13; // ~400 ms
+const MIN_SPEECH_FRAMES = 13; // ~400 ms of actual speech (loud frames, not the silence tail)
 const MAX_SPEECH_FRAMES = 470; // ~15 s cap per utterance
+// Lead-in kept from just before VAD onset so the first syllable isn't clipped
+// (the VAD needs a frame or two to trigger).
+const PRE_ROLL_FRAMES = 8; // ~256 ms
 // Cap the transcription backlog. On slow CPUs (mobile WASM) inference can be
 // slower than real time; without a cap the queue — and thus latency — grows
 // without bound. We keep only the most recent utterances and drop the oldest.
@@ -81,23 +84,37 @@ const MAX_PENDING_UTTERANCES = 3;
 const WASM_DTYPE = 'q8';
 const WEBGPU_DTYPE = 'fp16';
 
-/** ISO 639-1 → Whisper language token (multilingual models). */
-const ISO_TO_WHISPER = {
-  cs: 'czech',
-  en: 'english',
-  ru: 'russian',
-  de: 'german',
-  fr: 'french',
-  es: 'spanish',
-  pl: 'polish',
-  sk: 'slovak',
-  uk: 'ukrainian',
-  it: 'italian',
-  pt: 'portuguese',
-  nl: 'dutch',
-  ja: 'japanese',
-  zh: 'chinese',
-};
+// Language codes Whisper's multilingual tokenizer accepts (the openai/whisper
+// set, which transformers.js validates against). The UI passes googletrans
+// codes; an unknown code (eo, ceb, …) or region variant (zh-cn, zh-tw) would
+// make transformers.js throw on EVERY utterance, so anything outside this set
+// falls back to Whisper auto-detect instead.
+const WHISPER_LANG_CODES = new Set([
+  'en', 'zh', 'de', 'es', 'ru', 'ko', 'fr', 'ja', 'pt', 'tr', 'pl', 'ca', 'nl',
+  'ar', 'sv', 'it', 'id', 'hi', 'fi', 'vi', 'he', 'uk', 'el', 'ms', 'cs', 'ro',
+  'da', 'hu', 'ta', 'no', 'th', 'ur', 'hr', 'bg', 'lt', 'la', 'mi', 'ml', 'cy',
+  'sk', 'te', 'fa', 'lv', 'bn', 'sr', 'az', 'sl', 'kn', 'et', 'mk', 'br', 'eu',
+  'is', 'hy', 'ne', 'mn', 'bs', 'kk', 'sq', 'sw', 'gl', 'mr', 'pa', 'si', 'km',
+  'sn', 'yo', 'so', 'af', 'oc', 'ka', 'be', 'tg', 'sd', 'gu', 'am', 'yi', 'lo',
+  'uz', 'fo', 'ht', 'ps', 'tk', 'nn', 'mt', 'sa', 'lb', 'my', 'bo', 'tl', 'mg',
+  'as', 'tt', 'haw', 'ln', 'ha', 'ba', 'jw', 'su',
+]);
+
+// Codes googletrans spells differently from Whisper.
+const WHISPER_LANG_ALIASES = { iw: 'he', fil: 'tl', jv: 'jw' };
+
+/** Map a (googletrans) language code to a Whisper code, or null → auto-detect. */
+function toWhisperLanguage(code) {
+  if (typeof code !== 'string') return null;
+  let c = code.trim().toLowerCase();
+  if (!c) return null;
+  c = WHISPER_LANG_ALIASES[c] || c;
+  if (WHISPER_LANG_CODES.has(c)) return c;
+  // Region variants: zh-cn → zh, pt-br → pt, …
+  const base = c.split(/[-_]/)[0];
+  const aliased = WHISPER_LANG_ALIASES[base] || base;
+  return WHISPER_LANG_CODES.has(aliased) ? aliased : null;
+}
 
 function int16ChunksToFloat32(chunks) {
   let total = 0;
@@ -237,6 +254,9 @@ export class WhisperLocalEngine {
     this._inSpeech = false;
     this._silenceRun = 0;
     this._speechFrameCount = 0;
+    this._loudFrameCount = 0;
+    /** Ring of the most recent non-speech frames, prepended to each utterance. */
+    this._preRollFrames = [];
   }
 
   _modelSpec() {
@@ -386,6 +406,8 @@ export class WhisperLocalEngine {
     this._inSpeech = false;
     this._silenceRun = 0;
     this._speechFrameCount = 0;
+    this._loudFrameCount = 0;
+    this._preRollFrames = [];
   }
 
   /** Serially classify queued frames (Silero if available, else RMS) and drive the VAD machine. */
@@ -417,11 +439,16 @@ export class WhisperLocalEngine {
     if (loud) {
       if (!this._inSpeech) {
         this._inSpeech = true;
-        this._speechFrames = [];
-        this._speechFrameCount = 0;
+        // Seed with the pre-roll so the utterance keeps the lead-in audio from
+        // just before the VAD triggered.
+        this._speechFrames = this._preRollFrames;
+        this._preRollFrames = [];
+        this._speechFrameCount = this._speechFrames.length;
+        this._loudFrameCount = 0;
       }
       this._speechFrames.push(int16);
       this._speechFrameCount++;
+      this._loudFrameCount++;
       this._silenceRun = 0;
 
       if (this._speechFrameCount >= MAX_SPEECH_FRAMES) {
@@ -430,7 +457,11 @@ export class WhisperLocalEngine {
       return;
     }
 
-    if (!this._inSpeech) return;
+    if (!this._inSpeech) {
+      this._preRollFrames.push(int16);
+      if (this._preRollFrames.length > PRE_ROLL_FRAMES) this._preRollFrames.shift();
+      return;
+    }
 
     this._speechFrames.push(int16);
     this._speechFrameCount++;
@@ -443,8 +474,12 @@ export class WhisperLocalEngine {
 
   _enqueueUtterance() {
     const frames = this._speechFrames;
+    const loudFrames = this._loudFrameCount;
     this._resetVad();
-    if (frames.length < MIN_SPEECH_FRAMES) return;
+    // Gate on frames the VAD actually classified as speech — `frames` also
+    // holds the pre-roll and the ~900 ms silence tail, so its length alone
+    // would let a single noise blip through to a full Whisper inference.
+    if (loudFrames < MIN_SPEECH_FRAMES) return;
     this._pendingUtterances.push(frames);
     // Stay live on slow devices: bound the backlog by dropping the oldest
     // utterances instead of letting latency grow without limit.
@@ -491,8 +526,10 @@ export class WhisperLocalEngine {
         temperature: 0,
       };
 
-      if (spec.multilingual && this.language) {
-        const whisperLang = ISO_TO_WHISPER[this.language] || this.language;
+      // Unsupported/unknown codes stay unset → Whisper auto-detects, instead of
+      // transformers.js throwing on every utterance.
+      const whisperLang = spec.multilingual ? toWhisperLanguage(this.language) : null;
+      if (whisperLang) {
         opts.language = whisperLang;
       }
 

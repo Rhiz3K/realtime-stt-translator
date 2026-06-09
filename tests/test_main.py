@@ -458,12 +458,16 @@ def test_static_whisper_worklet_served(client):
     resp = client.get("/static/whisper/pcm-worklet.js")
     assert resp.status_code == 200
     assert "Int16PCMProcessor" in resp.text
+    # /static/whisper/* must always revalidate so browsers can't pin a stale
+    # (possibly ABI-incompatible) engine copy across deploys.
+    assert resp.headers.get("cache-control") == "no-cache"
 
 
 def test_static_whisper_engine_served(client):
     resp = client.get("/static/whisper/whisper-engine.mjs")
     assert resp.status_code == 200
     assert "WhisperLocalEngine" in resp.text
+    assert resp.headers.get("cache-control") == "no-cache"
 
 
 def test_csp_allows_whisper_runtime_sources(client):
