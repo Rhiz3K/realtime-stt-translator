@@ -11,7 +11,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
-    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "deepgram", "elevenlabs"})
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs"})
     return TestClient(main.app)
 
 
@@ -486,6 +486,42 @@ def test_cross_origin_isolation_headers(client):
     resp = client.get("/health")
     assert resp.headers.get("Cross-Origin-Opener-Policy") == "same-origin"
     assert resp.headers.get("Cross-Origin-Embedder-Policy") == "credentialless"
+
+
+def test_enabled_engines_includes_nemotron_in_template(monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
+    monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"nemotron"})
+
+    c = TestClient(main.app)
+    c.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = c.get("/")
+    assert resp.status_code == 200
+    assert 'value="nemotron" ' in resp.text
+
+
+def test_static_nemotron_engine_served(client):
+    resp = client.get("/static/nemotron/nemotron-engine.mjs")
+    assert resp.status_code == 200
+    assert "NemotronLocalEngine" in resp.text
+    # Engine code revalidates like Whisper's so a stale copy can't be pinned.
+    assert resp.headers.get("cache-control") == "no-cache"
+
+
+def test_nemotron_model_assets_cached_immutably(client):
+    # The ~1.2 GB fp16 weights are content-stable and must be cached hard. The
+    # header is path-based, so it applies even before the model files are built.
+    resp = client.get("/static/nemotron/models/config.json")
+    assert resp.headers.get("cache-control") == "public, max-age=31536000, immutable"
+
+
+def test_csp_allows_nemotron_onnxruntime(client):
+    # The local Nemotron engine loads onnxruntime-web 1.20.1 (encoder on WebGPU,
+    # decoder on WASM); the CSP must permit that pinned build.
+    resp = client.get("/health")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "onnxruntime-web@1.20.1" in csp
 
 
 def test_enabled_engines_default_webspeech_only(monkeypatch):

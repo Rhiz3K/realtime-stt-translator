@@ -254,6 +254,7 @@
             <select id="engineSelect" aria-label="Speech engine">
               <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="whisper" {% if 'whisper' not in enabled_engines %}disabled{% endif %}>Whisper (local){% if 'whisper' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="nemotron" {% if 'nemotron' not in enabled_engines %}disabled{% endif %}>Nemotron (local){% if 'nemotron' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
             </select>
@@ -788,6 +789,9 @@
     let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
     let whisperMediaStream = null;
+    let nemotronDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
+    let nemotronLocalEngine = null;
+    let nemotronMediaStream = null;
 
     // Remote-provided language list for translation.
     let translateLangChoices = null;
@@ -1114,11 +1118,12 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs', 'whisper'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
           : enabledEngines.has('whisper') ? 'whisper'
+          : enabledEngines.has('nemotron') ? 'nemotron'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
           : 'webspeech';
@@ -1128,6 +1133,7 @@
       const labels = {
         webspeech: 'Web Speech',
         whisper: 'Whisper (local)',
+        nemotron: 'Nemotron (local)',
         deepgram: 'Deepgram Nova-3',
         elevenlabs: 'ElevenLabs Scribe',
       };
@@ -1141,7 +1147,7 @@
 
       // Local STT engines do not use a server audio stream; hide the WS status badge.
       if (statusIndicator) {
-        statusIndicator.hidden = e === 'webspeech' || e === 'whisper';
+        statusIndicator.hidden = e === 'webspeech' || e === 'whisper' || e === 'nemotron';
       }
     }
 
@@ -1713,7 +1719,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs', 'whisper'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -2465,6 +2471,18 @@
       removeInterimElement(recognizedContainer);
     }
 
+    function stopNemotronPipeline() {
+      if (nemotronLocalEngine) {
+        try { nemotronLocalEngine.stop(); } catch (_e) { /* no-op */ }
+        nemotronLocalEngine = null;
+      }
+      if (nemotronMediaStream) {
+        try { nemotronMediaStream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
+        nemotronMediaStream = null;
+      }
+      removeInterimElement(recognizedContainer);
+    }
+
     async function startWhisperRecording() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         showMessage('Microphone access is not available in this browser.');
@@ -2578,6 +2596,110 @@
         showMessage(
           'Whisper failed to start: ' + (err && err.message ? err.message : String(err))
         );
+      }
+    }
+
+    async function startNemotronRecording() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showMessage('Microphone access is not available in this browser.');
+        return;
+      }
+
+      applyEngineUi('nemotron');
+      applyRecognitionSettings();
+      updateTranslationTitles();
+
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+
+      resetSessionUi();
+
+      let engine = null;
+      try {
+        showMessage('Loading Nemotron model (first run downloads ~1.2 GB; WebGPU recommended)…' + _whisperDataWarning());
+        // ?v= cache-busts the engine module — bump when the engine or its pinned
+        // onnxruntime-web version changes (kept in sync with the CSP in main.py).
+        const mod = await import('/static/nemotron/nemotron-engine.mjs?v=1');
+        engine = new mod.NemotronLocalEngine({
+          device: nemotronDevice,
+          language: translateSrc || 'cs',
+          normalize: 'none',
+          onStatus: (msg) => {
+            if (msg) showMessage(msg);
+          },
+          onTranscript: ({ text, isFinal }) => {
+            const nowPerf = performance.now();
+            if (_sttTtfbMs == null) {
+              _sttTtfbMs = nowPerf - _sessionStartPerf;
+            }
+            if (!isFinal) {
+              if (_sttSegmentStartPerf == null) {
+                _sttSegmentStartPerf = nowPerf;
+              }
+              // Streaming model: the interim is real, growing text — show it and
+              // translate it live (throttled), exactly like the Web Speech path.
+              removeInterimElement(recognizedContainer);
+              showInterim(recognizedContainer, text || '…');
+              const now = Date.now();
+              if (text && text !== lastInterimSentText && now - lastInterimSentAtMs >= interimSendIntervalMs) {
+                lastInterimSentText = text;
+                lastInterimSentAtMs = now;
+                sendTranslateWsMessage('interim', text);
+              }
+              updateStatsBar();
+              return;
+            }
+            if (_sttSegmentStartPerf != null) {
+              const sttMs = nowPerf - _sttSegmentStartPerf;
+              _sttLastFinalMs = sttMs;
+              _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+              _sttSegmentStartPerf = null;
+            }
+            removeInterimElement(recognizedContainer);
+            lastInterimSentText = '';
+            lastInterimSentAtMs = 0;
+            if (!text) {
+              updateStatsBar();
+              return;
+            }
+            addSegment(recognizedContainer, czSegmentCount++, text);
+            sendTranslateWsMessage('final', text);
+            updateStatsBar();
+          },
+        });
+        nemotronLocalEngine = engine;
+
+        // Download/initialize the model BEFORE asking for the microphone.
+        await engine.load();
+        if (nemotronLocalEngine !== engine) return; // Stop pressed during load
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+          video: false,
+        });
+        if (nemotronLocalEngine !== engine) {
+          try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
+          return;
+        }
+        nemotronMediaStream = stream;
+
+        await engine.start(stream);
+        if (nemotronLocalEngine !== engine) return; // Stop pressed during start
+
+        _wsReconnectCount = 0;
+        _connectTranslateWs();
+
+        setStatus('connected');
+        clearMessage();
+        console.log('Nemotron local recording started');
+      } catch (err) {
+        if (engine && nemotronLocalEngine !== engine) return;
+        console.error('Nemotron start failed:', err);
+        stopRecording();
+        setStatus('error');
+        showMessage('Nemotron failed to start: ' + (err && err.message ? err.message : String(err)));
       }
     }
 
@@ -3354,6 +3476,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         startWhisperRecording();
         return;
       }
+      if (currentEngine === 'nemotron') {
+        startNemotronRecording();
+        return;
+      }
       startWebSpeechRecording();
     }
 
@@ -3372,6 +3498,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       stopDeepgramPipeline();
       stopWhisperPipeline();
+      stopNemotronPipeline();
 
       // Close direct ElevenLabs WS (browser mode).
       if (_elBrowserWs) {

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nemotron-3.5-ASR browser PoC</title>
+  <style>
+    body { font: 13px/1.5 ui-monospace, monospace; margin: 1rem; background: #111; color: #ddd; }
+    h1 { font-size: 15px; }
+    #log { white-space: pre-wrap; }
+    .ok { color: #6f6; } .err { color: #f66; } .t { color: #6cf; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Nemotron-3.5-ASR browser PoC (onnxruntime-web + WebGPU)</h1>
+  <div>query params: <code>?normalize=none|per_feature&amp;device=auto|webgpu|wasm&amp;lang=en</code></div>
+  <pre id="log"></pre>
+
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const NORMALIZE = params.get("normalize") || "none";
+    const DEVICE = params.get("device") || "auto";
+    const LANG = params.get("lang") || "en";
+    const SECONDS = parseFloat(params.get("seconds") || "0"); // 0 = full clip
+    const ORT_VER = "1.20.1";
+
+    const logEl = document.getElementById("log");
+    const log = (cls, ...a) => {
+      const s = a.join(" ");
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = s + "\n";
+      logEl.appendChild(span);
+      console.log("[poc]", s);
+    };
+    window.__pocDone = false;
+    window.__pocResult = null;
+
+    // Parse 16-bit PCM mono WAV -> Float32Array in [-1, 1] (matches read_wav in Python).
+    function parseWav(buf) {
+      const dv = new DataView(buf);
+      let off = 12;
+      while (off + 8 <= dv.byteLength) {
+        const id = String.fromCharCode(dv.getUint8(off), dv.getUint8(off + 1), dv.getUint8(off + 2), dv.getUint8(off + 3));
+        const sz = dv.getUint32(off + 4, true);
+        if (id === "data") {
+          const n = sz >> 1;
+          const out = new Float32Array(n);
+          for (let i = 0; i < n; i++) out[i] = dv.getInt16(off + 8 + i * 2, true) / 32768;
+          return out;
+        }
+        off += 8 + sz + (sz & 1);
+      }
+      throw new Error("no data chunk in WAV");
+    }
+
+    (async () => {
+      try {
+        log("", `config: normalize=${NORMALIZE} device=${DEVICE} lang=${LANG} ort=${ORT_VER}`);
+        log("", "navigator.gpu present: " + ("gpu" in navigator));
+        if ("gpu" in navigator) {
+          try {
+            const adapter = await navigator.gpu.requestAdapter();
+            log(adapter ? "ok" : "err", "WebGPU adapter: " + (adapter ? "available" : "null"));
+            if (adapter) {
+              const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+              log("", "  adapter info: " + JSON.stringify({ vendor: info.vendor, architecture: info.architecture, device: info.device }));
+            }
+          } catch (e) { log("err", "adapter error: " + e.message); }
+        }
+
+        const ort = await import(`https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/ort.webgpu.min.mjs`);
+        ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+        ort.env.wasm.numThreads = 1;
+        log("", "onnxruntime-web imported");
+
+        const { NemotronModel } = await import("/app/static/nemotron/nemotron-engine.mjs");
+
+        const t0 = performance.now();
+        log("", "loading model (first run fetches ~1.2 GB)…");
+        const model = await NemotronModel.load(ort, {
+          dir: "/app/static/nemotron/models",
+          device: DEVICE,
+          normalize: NORMALIZE,
+          onStatus: (m) => log("", "  status: " + m),
+        });
+        log("ok", `model loaded in ${Math.round(performance.now() - t0)} ms`);
+
+        let wav = parseWav(await (await fetch("/scripts/sample_16k.wav")).arrayBuffer());
+        if (SECONDS > 0) wav = wav.slice(0, Math.round(SECONDS * 16000));
+        log("", `audio: ${wav.length} samples (${(wav.length / 16000).toFixed(2)} s)`);
+
+        const t1 = performance.now();
+        const { ids, text } = await model.transcribe(wav, LANG);
+        const dt = performance.now() - t1;
+        log("", `decoded ${ids.length} tokens in ${Math.round(dt)} ms (RTF ${(dt / 1000 / (wav.length / 16000)).toFixed(3)})`);
+        log("t", "TRANSCRIPT: " + JSON.stringify(text));
+        window.__pocResult = { text, tokens: ids.length, ms: Math.round(dt) };
+      } catch (e) {
+        log("err", "ERROR: " + (e && e.stack ? e.stack : e));
+        window.__pocResult = { error: String(e && e.message ? e.message : e) };
+      } finally {
+        window.__pocDone = true;
+        log("", "__DONE__");
+      }
+    })();
+  </script>
+</body>
+</html>
