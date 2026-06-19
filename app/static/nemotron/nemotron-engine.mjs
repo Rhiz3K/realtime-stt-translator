@@ -208,9 +208,12 @@ export class NemotronLocalEngine {
     this.onStatus("Loading Nemotron (first run fetches ~1.2 GB)…");
     const ort = await import("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs");
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+    // Multi-threaded WASM needs cross-origin isolation (SharedArrayBuffer); cap at
+    // 8 threads and fall back to single-threaded when not isolated.
+    const hardwareConcurrency = (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 4;
     ort.env.wasm.numThreads =
       typeof self !== "undefined" && self.crossOriginIsolated
-        ? Math.max(1, Math.min((typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 4, 8))
+        ? Math.max(1, Math.min(hardwareConcurrency, 8))
         : 1;
     this._model = await NemotronModel.load(ort, { device: this.device, normalize: this.normalize, onStatus: this.onStatus });
     this._promptIndex = this._model.promptIndex(this.language);
