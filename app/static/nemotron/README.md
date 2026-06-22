@@ -38,7 +38,8 @@ In Docker/Coolify, `python -m app.nemotron_assets` runs before Uvicorn. When
 `ENABLED_ENGINES` contains `nemotron`, it creates `models/` and runs the same
 preparation script if any required file is missing. Set
 `NEMOTRON_AUTO_PREPARE=false` to disable this and fail fast when prebuilt assets
-are not mounted.
+are not mounted. `NEMOTRON_PREPARE_TIMEOUT_SECONDS` controls the preparation
+subprocess timeout (default 1800 seconds; `0` disables it).
 
 ## Requirements & performance
 

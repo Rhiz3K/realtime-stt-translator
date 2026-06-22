@@ -21,6 +21,15 @@ REQUIRED_MODEL_FILES = (
 )
 
 
+def _prepare_timeout_seconds() -> float | None:
+    raw = os.getenv("NEMOTRON_PREPARE_TIMEOUT_SECONDS", "1800").strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError("NEMOTRON_PREPARE_TIMEOUT_SECONDS must be a number.") from exc
+    return value if value > 0 else None
+
+
 def _split_engines(enabled_engines: str | Iterable[str] | None) -> list[str]:
     if enabled_engines is None:
         enabled_engines = os.getenv("ENABLED_ENGINES", "webspeech")
@@ -46,7 +55,20 @@ def missing_model_files(model_dir: Path = DEFAULT_MODEL_DIR) -> list[str]:
 
 
 def _run_prepare_script() -> None:
-    subprocess.run([sys.executable, str(PREPARE_SCRIPT)], cwd=str(ROOT), check=True)
+    timeout = _prepare_timeout_seconds()
+    try:
+        subprocess.run(
+            [sys.executable, str(PREPARE_SCRIPT)],
+            cwd=str(ROOT),
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Nemotron model preparation exceeded timeout "
+            f"({timeout:g}s). Set NEMOTRON_PREPARE_TIMEOUT_SECONDS to a larger "
+            "value, or 0 to disable the timeout."
+        ) from exc
 
 
 def ensure_nemotron_assets(
@@ -70,7 +92,7 @@ def ensure_nemotron_assets(
         raise RuntimeError(
             "Nemotron model assets are missing in "
             f"{model_dir}: {', '.join(missing)}. "
-            "Set NEMOTRON_AUTO_PREPARE=true or mount/generated the model files."
+            "Set NEMOTRON_AUTO_PREPARE=true or mount or generate the model files."
         )
 
     logging.warning(
@@ -94,8 +116,11 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
         ensure_nemotron_assets()
-    except Exception as exc:
+    except RuntimeError as exc:
         logging.error("%s", exc)
+        return 1
+    except Exception as exc:
+        logging.exception("Nemotron asset preparation failed")
         return 1
     return 0
 
