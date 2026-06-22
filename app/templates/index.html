@@ -2089,6 +2089,13 @@
       };
 
       recognition.onerror = (event) => {
+        // Drop errors from a stopped/switched-away session: a stale not-allowed/
+        // service-not-allowed would otherwise call stopRecording() below and tear
+        // down whatever engine is running now.
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+          dbg('webspeech:error (stale session, ignored)', { error: event.error });
+          return;
+        }
         dbg('webspeech:error', { error: event.error, message: event.message });
 
         // Fatal errors — stop recording and notify user.
@@ -2119,6 +2126,7 @@
       };
 
       recognition.onnomatch = (event) => {
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
         // Fired when speech was detected but not recognized with sufficient confidence.
         // This is normal for background noise, mumbling, etc.
         // onend fires after this and will restart the session.
@@ -3564,9 +3572,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       if (socket) {
         _detachSocket(socket);
-        if (socket.readyState === WebSocket.OPEN) {
-          try { socket.close(); } catch (_e) { /* no-op */ }
-        }
+        // Close unconditionally (not just when OPEN): a CONNECTING socket would
+        // otherwise finish its handshake handler-less and leave the server — and any
+        // upstream vendor connection for the audio-proxy engines — holding it open.
+        try { socket.close(); } catch (_e) { /* no-op */ }
       }
       socket = null;
 
