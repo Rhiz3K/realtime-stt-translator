@@ -1,7 +1,7 @@
-# Dev-only deps for building the Nemotron browser-engine model assets via
-# scripts/prepare_nemotron_onnx.py. NOT needed at runtime (the app serves the
-# generated ONNX/JSON statically). Use a Python 3.12 venv — onnxruntime wheels
-# may lag on the newest interpreters.
+# Deps for building the Nemotron browser-engine model assets via
+# scripts/prepare_nemotron_onnx.py. The Docker image installs these so Coolify can
+# auto-prepare missing assets on first start when ENABLED_ENGINES contains
+# "nemotron". Use Python 3.12 — onnxruntime wheels may lag on newer interpreters.
 huggingface_hub
 onnx
 onnxruntime

@@ -176,6 +176,7 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
+| `NEMOTRON_AUTO_PREPARE` | No | `true` | When `nemotron` is enabled, create `app/static/nemotron/models` and build missing model assets on container start. First run downloads ~2.6 GB and writes ~1.3 GB. Set `false` if you mount prebuilt assets and want fail-fast behavior when they are missing. |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |
 | `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Internal queue size for Deepgram transcription results. |
 | `ELEVENLABS_API_KEY` | For ElevenLabs | -- | API key from [elevenlabs.io](https://elevenlabs.io/app/settings/api-keys) |
@@ -197,6 +198,7 @@ ENABLED_ENGINES=webspeech,whisper
 
 # Browser-only with the on-device Nemotron streaming model (build the model first)
 ENABLED_ENGINES=webspeech,nemotron
+NEMOTRON_AUTO_PREPARE=true
 
 # All engines
 ENABLED_ENGINES=webspeech,whisper,nemotron,deepgram,elevenlabs
@@ -332,6 +334,17 @@ services:
 1. Create a new service pointing to the GitHub repository.
 2. Set environment variables in the Coolify dashboard (see [Configuration](#configuration)).
 3. Deploy. The `Dockerfile` includes a `HEALTHCHECK` that Coolify uses automatically.
+
+If `ENABLED_ENGINES` contains `nemotron`, the container start command runs
+`python -m app.nemotron_assets` before Uvicorn. It creates
+`app/static/nemotron/models` and, when any required model file is missing, runs
+`scripts/prepare_nemotron_onnx.py`. The first run downloads ~2.6 GB, writes ~1.3
+GB, and needs enough temporary disk and memory to convert the encoder. The Docker
+health check has a 30-minute start period so the first preparation run is not
+marked unhealthy too early. For stable redeploys, mount
+`app/static/nemotron/models` as persistent storage, or leave the generated files
+in the image/container storage if your Coolify setup preserves them across
+rebuilds.
 
 ### Behind a Reverse Proxy
 

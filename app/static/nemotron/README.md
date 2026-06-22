@@ -34,6 +34,12 @@ The script downloads the fp32 ONNX export (~2.6 GB), converts the encoder to fp1
 (~1.2 GB — fits the browser's ~2 GB ArrayBuffer limit and halves WebGPU VRAM),
 copies the fp32 decoder, and extracts `vocab.json`.
 
+In Docker/Coolify, `python -m app.nemotron_assets` runs before Uvicorn. When
+`ENABLED_ENGINES` contains `nemotron`, it creates `models/` and runs the same
+preparation script if any required file is missing. Set
+`NEMOTRON_AUTO_PREPARE=false` to disable this and fail fast when prebuilt assets
+are not mounted.
+
 ## Requirements & performance
 
 - **WebGPU strongly recommended** (real-time). Desktop Chrome/Edge 138+ or Android
