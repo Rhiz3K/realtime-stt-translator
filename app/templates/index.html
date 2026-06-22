@@ -1908,6 +1908,7 @@
       applyRecognitionSettings();
 
       recognition.onstart = () => {
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
         webSpeechLastFinalResultIndex = -1;
         webSpeechLastFinalText = '';
         webSpeechLastFinalAtMs = 0;
@@ -1922,6 +1923,7 @@
       };
 
       recognition.onaudiostart = () => {
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
         // Best-effort utterance timing.
         if (_sttSegmentStartPerf == null) {
           _sttSegmentStartPerf = performance.now();
@@ -1929,6 +1931,7 @@
       };
 
       recognition.onspeechstart = () => {
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
         _sttSegmentStartPerf = performance.now();
       };
 
@@ -2361,6 +2364,17 @@
       }, _WS_KEEPALIVE_MS);
     }
 
+    // Detach every handler from a WebSocket before discarding it. onmessage/onopen/
+    // onerror are read at event-dispatch time, so nulling them here neutralizes an
+    // event already queued for the old socket (e.g. a translation result that arrived
+    // just before Stop) — otherwise it still fires and mutates UI for a session that
+    // has moved on. recordingGeneration alone doesn't help here: a plain onmessage
+    // handler doesn't consult it, so detaching the handlers is the reliable fix.
+    function _detachSocket(ws) {
+      if (!ws) return;
+      try { ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null; } catch (_e) { /* ignore */ }
+    }
+
     /**
      * (Re-)create the /ws WebSocket used by the Web Speech path.
      * Called on initial start and on automatic reconnect.
@@ -2368,7 +2382,8 @@
     function _connectTranslateWs() {
       // Make sure any previous socket is cleaned up.
       if (socket) {
-        try { socket.onclose = null; socket.onerror = null; socket.close(); } catch (_e) { /* ignore */ }
+        _detachSocket(socket);
+        try { socket.close(); } catch (_e) { /* ignore */ }
       }
 
       socket = new WebSocket(_wsUrl('/ws'));
@@ -2812,6 +2827,10 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
             } finally {
               URL.revokeObjectURL(moduleUrl);
             }
+            // Stop/engine-switch during addModule() — bail before wiring nodes into
+            // the graph. The stop path already closed the old AudioContext/mic; the
+            // globals may now belong to a freshly started session, so don't touch them.
+            if (sessionGen !== recordingGeneration) return;
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor', {
               numberOfInputs: 1,
@@ -3154,6 +3173,10 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             } finally {
               URL.revokeObjectURL(moduleUrl);
             }
+            // Stop/engine-switch during addModule() — bail before wiring nodes into
+            // the graph. The stop path already closed the old AudioContext/mic; the
+            // globals may now belong to a freshly started session, so don't touch them.
+            if (sessionGen !== recordingGeneration) return;
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el-browser', {
               numberOfInputs: 1,
@@ -3325,6 +3348,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             } finally {
               URL.revokeObjectURL(moduleUrl);
             }
+            // Stop/engine-switch during addModule() — bail before wiring nodes into
+            // the graph. The stop path already closed the old AudioContext/mic; the
+            // globals may now belong to a freshly started session, so don't touch them.
+            if (sessionGen !== recordingGeneration) return;
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el', {
               numberOfInputs: 1,
@@ -3527,21 +3554,18 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       stopWhisperPipeline();
       stopNemotronPipeline();
 
-      // Close direct ElevenLabs WS (browser mode).
+      // Close direct ElevenLabs WS (browser mode). Detach all handlers first so a
+      // message/close event already queued for it can't fire into the next session.
       if (_elBrowserWs) {
-        try { _elBrowserWs.onclose = null; } catch (_e) { /* ignore */ }
+        _detachSocket(_elBrowserWs);
         try { _elBrowserWs.close(); } catch (_e) { /* ignore */ }
         _elBrowserWs = null;
       }
 
       if (socket) {
-        try { socket.onclose = null; } catch (_e) { /* ignore */ }
-      }
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        try {
-          socket.close();
-        } catch (_e) {
-          // no-op
+        _detachSocket(socket);
+        if (socket.readyState === WebSocket.OPEN) {
+          try { socket.close(); } catch (_e) { /* no-op */ }
         }
       }
       socket = null;
