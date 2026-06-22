@@ -33,6 +33,8 @@ python3.12 -m venv .venv-nemotron-prep
 The script downloads the fp32 ONNX export (~2.6 GB), converts the encoder to fp16
 (~1.2 GB — fits the browser's ~2 GB ArrayBuffer limit and halves WebGPU VRAM),
 copies the fp32 decoder, and extracts `vocab.json`.
+Set `NEMOTRON_MODEL_DIR=/path/to/models` when you need the script to write to a
+non-default model directory.
 
 In Docker/Coolify, `python -m app.nemotron_assets` runs before Uvicorn. When
 `ENABLED_ENGINES` contains `nemotron`, it creates `models/` and runs the same

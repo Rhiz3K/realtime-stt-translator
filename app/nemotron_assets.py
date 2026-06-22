@@ -40,9 +40,11 @@ def _split_engines(enabled_engines: str | Iterable[str] | None) -> list[str]:
     return [engine.strip().lower() for engine in raw_values if engine and engine.strip()]
 
 
-def _truthy_or_default_true(value: str | None) -> bool:
+def _truthy_or_default_true(value: str | bool | None) -> bool:
     if value is None:
         value = os.getenv("NEMOTRON_AUTO_PREPARE", "true")
+    if isinstance(value, bool):
+        return value
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
@@ -54,12 +56,15 @@ def missing_model_files(model_dir: Path = DEFAULT_MODEL_DIR) -> list[str]:
     return [name for name in REQUIRED_MODEL_FILES if not (model_dir / name).is_file()]
 
 
-def _run_prepare_script() -> None:
+def _run_prepare_script(model_dir: Path) -> None:
     timeout = _prepare_timeout_seconds()
+    env = os.environ.copy()
+    env["NEMOTRON_MODEL_DIR"] = str(model_dir)
     try:
         subprocess.run(
             [sys.executable, str(PREPARE_SCRIPT)],
             cwd=str(ROOT),
+            env=env,
             check=True,
             timeout=timeout,
         )
@@ -74,7 +79,7 @@ def _run_prepare_script() -> None:
 def ensure_nemotron_assets(
     *,
     enabled_engines: str | Iterable[str] | None = None,
-    auto_prepare: str | None = None,
+    auto_prepare: str | bool | None = None,
     model_dir: Path = DEFAULT_MODEL_DIR,
     run_prepare: Callable[[], None] | None = None,
 ) -> None:
@@ -101,7 +106,10 @@ def ensure_nemotron_assets(
         model_dir,
         ", ".join(missing),
     )
-    (run_prepare or _run_prepare_script)()
+    if run_prepare:
+        run_prepare()
+    else:
+        _run_prepare_script(model_dir)
 
     missing = missing_model_files(model_dir)
     if missing:
