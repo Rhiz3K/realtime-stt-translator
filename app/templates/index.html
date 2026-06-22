@@ -758,6 +758,19 @@
     // Engine
     let currentEngine = 'webspeech';
 
+    // Recording-session identity. Async callbacks (Web Speech onresult/onend and its
+    // backoff timer, the remote-engine socket.onopen audio-pipeline setup, the local
+    // engine transcript handler) can fire after Stop or an engine switch. Each Start
+    // and Stop bumps recordingGeneration; a callback whose captured/owning generation
+    // no longer matches the live one belongs to a dead session and must drop its
+    // event — otherwise a stale final leaks into the next session, or a zombie
+    // mic/recognition pipeline starts on top of a different engine. The per-engine
+    // *SessionGen vars let handlers bound once (Web Speech, on the persistent
+    // recognition object) or built per session (local engines) compare against it.
+    let recordingGeneration = 0;
+    let webSpeechSessionGen = -1;
+    let localEngineSessionGen = -1;
+
     // Web Speech parametry
     let recognitionLang = 'cs-CZ';
     let recognitionContinuous = true;
@@ -1920,6 +1933,11 @@
       };
 
       recognition.onresult = (event) => {
+        // recognition is bound once and outlives a session; drop events from a
+        // session that was stopped or switched away (stop() emits a trailing final).
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+          return;
+        }
         dbg('webspeech:onresult', {
           resultIndex: event.resultIndex,
           resultsLength: event.results ? event.results.length : null,
@@ -2025,6 +2043,12 @@
       };
 
       recognition.onend = () => {
+        // Drop end events from a stopped/switched-away session — don't auto-restart
+        // recognition on top of whatever engine is active now.
+        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+          dbg('webspeech:end (stale session, not restarting)');
+          return;
+        }
         // Keep going unless the user stopped recording
         if (stopButton.disabled) {
           dbg('webspeech:end (user stopped, not restarting)');
@@ -2044,8 +2068,10 @@
         if (_wsRestartCount > _WS_RESTART_MAX_RAPID) {
           // Back off to prevent flapping (rapid error→end→start loops).
           dbg('webspeech:backoff', { delayMs: _WS_RESTART_BACKOFF_MS });
+          const backoffGen = webSpeechSessionGen;
           setTimeout(() => {
-            if (!stopButton.disabled) {
+            // Skip the deferred restart if Stop or an engine switch happened meanwhile.
+            if (currentEngine === 'webspeech' && recordingGeneration === backoffGen && !stopButton.disabled) {
               try { recognition.start(); } catch (_e) { /* already started */ }
             }
           }, _WS_RESTART_BACKOFF_MS);
@@ -2414,6 +2440,10 @@
         return;
       }
 
+      // Claim a new generation so stale onresult/onend events from a prior session
+      // (or from the trailing final that stop() emits) are ignored.
+      webSpeechSessionGen = ++recordingGeneration;
+
       applyRecognitionSettings();
       updateTranslationTitles();
 
@@ -2480,7 +2510,14 @@
     // engine additionally translates the (real, growing) interim text, throttled
     // exactly like the Web Speech path. `translateInterim` selects that behaviour.
     function makeLocalTranscriptHandler({ translateInterim }) {
+      // Capture the session that owns this handler (set just above in
+      // startLocalEngineRecording). The engine can emit a trailing transcript after
+      // stop()/switch, which must not render or translate into the next session.
+      const handlerGen = localEngineSessionGen;
       return ({ text, isFinal }) => {
+        if (recordingGeneration !== handlerGen) {
+          return;
+        }
         // Stats: time-to-first-transcript and per-utterance inference latency.
         const nowPerf = performance.now();
         if (_sttTtfbMs == null) {
@@ -2537,6 +2574,12 @@
         showMessage('Microphone access is not available in this browser.');
         return;
       }
+
+      // Claim a new generation; the transcript handler built in config.createEngine()
+      // captures it (see makeLocalTranscriptHandler), so a trailing transcript from a
+      // stopped engine can't leak into the next session. Complements the per-engine
+      // getActive() !== engine guards below, which cover the startup await windows.
+      localEngineSessionGen = ++recordingGeneration;
 
       applyEngineUi(config.kind);
       applyRecognitionSettings();
@@ -2652,6 +2695,7 @@
     }
 
     async function startDeepgramRecording() {
+      const sessionGen = ++recordingGeneration;
       applyEngineUi('deepgram');
       updateTranslationTitles();
 
@@ -2679,6 +2723,7 @@
       };
 
       socket.onopen = async () => {
+        if (sessionGen !== recordingGeneration) return;
         setStatus('connected');
 
         // Send session config before audio frames.
@@ -2712,7 +2757,7 @@
         }
 
         try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({
+          const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               sampleRate: DEEPGRAM_SAMPLE_RATE,
               channelCount: 1,
@@ -2720,6 +2765,13 @@
               noiseSuppression: true,
             },
           });
+          // Stop/engine-switch during the mic prompt — release the fresh mic and
+          // don't build a zombie audio pipeline feeding a dead session.
+          if (sessionGen !== recordingGeneration) {
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            return;
+          }
+          mediaStream = stream;
 
           audioContext = new (window.AudioContext || window.webkitAudioContext)({
             sampleRate: DEEPGRAM_SAMPLE_RATE,
@@ -2865,6 +2917,7 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
 
     // --- ElevenLabs: browser-side mode (audio → ElevenLabs direct, /ws for translation) ---
     async function startElevenLabsBrowserRecording() {
+      const sessionGen = ++recordingGeneration;
       applyEngineUi('elevenlabs');
       updateTranslationTitles();
 
@@ -2907,6 +2960,8 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
       }
 
       // 2. Connect to /ws for translation (reuse keepalive/reconnect logic).
+      //    Bail if Stop/engine-switch happened during the token fetch above.
+      if (sessionGen !== recordingGeneration) return;
       _wsReconnectCount = 0;
       _connectTranslateWs();
 
@@ -3034,11 +3089,12 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
 
       // 4. Once ElevenLabs WS is open, start audio capture.
       _elBrowserWs.onopen = async () => {
+        if (sessionGen !== recordingGeneration) return;
         dbg('elevenlabs-browser: WS connected');
         setStatus('connected');
 
         try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({
+          const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               sampleRate: DEEPGRAM_SAMPLE_RATE,
               channelCount: 1,
@@ -3046,6 +3102,13 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
               noiseSuppression: true,
             },
           });
+          // Stop/engine-switch during the mic prompt — release the fresh mic and
+          // don't build a zombie audio pipeline feeding a dead session.
+          if (sessionGen !== recordingGeneration) {
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            return;
+          }
+          mediaStream = stream;
 
           audioContext = new (window.AudioContext || window.webkitAudioContext)({
             sampleRate: DEEPGRAM_SAMPLE_RATE,
@@ -3157,6 +3220,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
 
     // --- ElevenLabs: server-side mode (audio → our server → ElevenLabs API) ---
     async function startElevenLabsServerRecording() {
+      const sessionGen = ++recordingGeneration;
       applyEngineUi('elevenlabs');
       updateTranslationTitles();
 
@@ -3187,6 +3251,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
       };
 
       socket.onopen = async () => {
+        if (sessionGen !== recordingGeneration) return;
         setStatus('connected');
         _wsReconnectCount = 0;
         _startWsKeepAlive();
@@ -3210,7 +3275,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
 
         // Capture microphone and pipe PCM16 to server (same pipeline as Deepgram).
         try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({
+          const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               sampleRate: DEEPGRAM_SAMPLE_RATE,
               channelCount: 1,
@@ -3218,6 +3283,13 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
               noiseSuppression: true,
             },
           });
+          // Stop/engine-switch during the mic prompt — release the fresh mic and
+          // don't build a zombie audio pipeline feeding a dead session.
+          if (sessionGen !== recordingGeneration) {
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            return;
+          }
+          mediaStream = stream;
 
           audioContext = new (window.AudioContext || window.webkitAudioContext)({
             sampleRate: DEEPGRAM_SAMPLE_RATE,
@@ -3432,6 +3504,13 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
     }
 
     function stopRecording() {
+      // Invalidate the current recording session up front: any in-flight async
+      // callback (Web Speech onresult/onend, remote socket.onopen, local transcript
+      // handler) will then see a changed generation and drop its event instead of
+      // leaking into the next session. Must precede recognition.stop()/socket.close()
+      // below, since those can trigger a trailing onresult/onend.
+      recordingGeneration++;
+
       // Stop keepalive pings and pending reconnect attempts first,
       // so the onclose handler won't schedule another reconnect.
       _stopWsTimers();
