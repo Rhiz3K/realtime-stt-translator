@@ -2745,8 +2745,11 @@
         stopRecording();
       };
 
-      socket.onopen = async () => {
-        if (sessionGen !== recordingGeneration) return;
+      socket.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration) {
+          try { event.target.close(); } catch (_e) { /* no-op */ }
+          return;
+        }
         setStatus('connected');
 
         // Send session config before audio frames.
@@ -2792,6 +2795,7 @@
           // don't build a zombie audio pipeline feeding a dead session.
           if (sessionGen !== recordingGeneration) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
           }
           mediaStream = stream;
@@ -2838,7 +2842,10 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) return;
+            if (sessionGen !== recordingGeneration) {
+              try { event.target.close(); } catch (_e) { /* no-op */ }
+              return;
+            }
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor', {
               numberOfInputs: 1,
@@ -3115,8 +3122,11 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
       };
 
       // 4. Once ElevenLabs WS is open, start audio capture.
-      _elBrowserWs.onopen = async () => {
-        if (sessionGen !== recordingGeneration) return;
+      _elBrowserWs.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration) {
+          try { event.target.close(); } catch (_e) { /* no-op */ }
+          return;
+        }
         dbg('elevenlabs-browser: WS connected');
         setStatus('connected');
 
@@ -3133,6 +3143,7 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
           // don't build a zombie audio pipeline feeding a dead session.
           if (sessionGen !== recordingGeneration) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
           }
           mediaStream = stream;
@@ -3184,7 +3195,10 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) return;
+            if (sessionGen !== recordingGeneration) {
+              try { event.target.close(); } catch (_e) { /* no-op */ }
+              return;
+            }
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el-browser', {
               numberOfInputs: 1,
@@ -3281,8 +3295,11 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
         console.error('WebSocket error:', error);
       };
 
-      socket.onopen = async () => {
-        if (sessionGen !== recordingGeneration) return;
+      socket.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration) {
+          try { event.target.close(); } catch (_e) { /* no-op */ }
+          return;
+        }
         setStatus('connected');
         _wsReconnectCount = 0;
         _startWsKeepAlive();
@@ -3318,6 +3335,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
           // don't build a zombie audio pipeline feeding a dead session.
           if (sessionGen !== recordingGeneration) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
+            try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
           }
           mediaStream = stream;
@@ -3359,7 +3377,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) return;
+            if (sessionGen !== recordingGeneration) {
+              try { event.target.close(); } catch (_e) { /* no-op */ }
+              return;
+            }
 
             processor = new AudioWorkletNode(audioContext, 'int16-pcm-processor-el', {
               numberOfInputs: 1,
