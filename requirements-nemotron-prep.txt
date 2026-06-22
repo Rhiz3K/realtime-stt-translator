@@ -1,0 +1,10 @@
+# Dev-only deps for building the Nemotron browser-engine model assets via
+# scripts/prepare_nemotron_onnx.py. NOT needed at runtime (the app serves the
+# generated ONNX/JSON statically). Use a Python 3.12 venv — onnxruntime wheels
+# may lag on the newest interpreters.
+huggingface_hub
+onnx
+onnxruntime
+onnxconverter-common
+sentencepiece
+numpy

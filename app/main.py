@@ -71,7 +71,8 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         jsdelivr = (
             "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0 "
             "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/ "
-            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/"
+            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/ "
+            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/"
         )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
@@ -96,6 +97,12 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         # Always revalidate the local Whisper engine/worklet so a browser can't
         # pin a stale (and possibly broken) cached copy across reloads.
         if request.url.path.startswith("/static/whisper/"):
+            response.headers["Cache-Control"] = "no-cache"
+        # The Nemotron model weights (~1.2 GB) are immutable and must be cached
+        # aggressively; the engine code is revalidated like Whisper's.
+        elif request.url.path.startswith("/static/nemotron/models/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif request.url.path.startswith("/static/nemotron/"):
             response.headers["Cache-Control"] = "no-cache"
         return response
 
@@ -183,8 +190,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 # Which STT engines are available to users.  Comma-separated list.
-# Valid values: webspeech, deepgram, elevenlabs.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "whisper", "deepgram", "elevenlabs"}
+# Valid values: webspeech, whisper, nemotron, deepgram, elevenlabs.  Default: webspeech only.
+_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs"}
 _raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
 ENABLED_ENGINES: set[str] = {
     e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES

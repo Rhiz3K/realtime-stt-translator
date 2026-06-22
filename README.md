@@ -43,12 +43,13 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 ## Features
 
-- **Four STT engines** -- switchable in the UI at any time:
+- **Five STT engines** -- switchable in the UI at any time:
 
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|
   | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
   | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); selectable models tiny…large-v3-turbo (~75 MB–800 MB, cached); runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
+  | **Nemotron (local)** | Browser | None | On-device streaming ONNX ([nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)) via onnxruntime-web; **WebGPU strongly recommended** (CPU/WASM works but isn't real-time); ~1.2 GB one-time download; model must be built first ([guide](app/static/nemotron/README.md)) |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
 
@@ -88,6 +89,8 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 **Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT locally; recognized text is sent to `/ws` for translation only.
 
 **Whisper (local)** -- The browser downloads a Whisper model ([onnx-community](https://huggingface.co/onnx-community) ONNX) and runs it on-device via Transformers.js, with [Silero VAD](https://github.com/snakers4/silero-vad) (also in-browser ONNX) segmenting speech from silence. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and otherwise runs on **CPU/WASM** -- multi-threaded when the page is cross-origin isolated (the app sends the required COOP/COEP headers). The backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android), but runs entirely in the browser.
+
+**Nemotron (local)** -- The browser runs NVIDIA's [Nemotron-3.5-ASR streaming](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) model (a cache-aware FastConformer encoder + RNN-T decoder, 40 language-locales) fully on-device via onnxruntime-web. The encoder runs on **WebGPU** (strongly recommended — real-time) with a CPU/WASM fallback that works but isn't real-time for this 600 M model. Because it streams, it shows a growing live transcription and commits a final on each pause; audio never leaves the client, only text goes to `/ws`. The model assets (~1.2 GB fp16) are generated, not committed — build them once with `scripts/prepare_nemotron_onnx.py` (see [app/static/nemotron/README.md](app/static/nemotron/README.md)).
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
@@ -172,7 +175,7 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. |
+| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |
 | `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Internal queue size for Deepgram transcription results. |
 | `ELEVENLABS_API_KEY` | For ElevenLabs | -- | API key from [elevenlabs.io](https://elevenlabs.io/app/settings/api-keys) |
@@ -192,8 +195,11 @@ Engines are enabled via the `ENABLED_ENGINES` environment variable:
 # Browser-only, no API keys (Web Speech + local Whisper)
 ENABLED_ENGINES=webspeech,whisper
 
+# Browser-only with the on-device Nemotron streaming model (build the model first)
+ENABLED_ENGINES=webspeech,nemotron
+
 # All engines
-ENABLED_ENGINES=webspeech,whisper,deepgram,elevenlabs
+ENABLED_ENGINES=webspeech,whisper,nemotron,deepgram,elevenlabs
 
 # Deepgram + ElevenLabs only
 ENABLED_ENGINES=deepgram,elevenlabs
@@ -220,7 +226,7 @@ Disabled engines appear in the UI dropdown but are grayed out and cannot be sele
 
 | Path | Input | Description |
 |---|---|---|
-| `/ws` | JSON text messages | Translates text (Web Speech, local Whisper, and ElevenLabs browser mode). |
+| `/ws` | JSON text messages | Translates text (Web Speech, local Whisper, local Nemotron, and ElevenLabs browser mode). |
 | `/ws/deepgram` | Binary PCM audio | Streams audio to Deepgram for STT + translation. |
 | `/ws/elevenlabs` | Binary PCM audio | Streams audio to ElevenLabs for STT + translation. |
 

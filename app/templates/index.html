@@ -254,6 +254,7 @@
             <select id="engineSelect" aria-label="Speech engine">
               <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="whisper" {% if 'whisper' not in enabled_engines %}disabled{% endif %}>Whisper (local){% if 'whisper' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="nemotron" {% if 'nemotron' not in enabled_engines %}disabled{% endif %}>Nemotron (local){% if 'nemotron' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
             </select>
@@ -788,6 +789,9 @@
     let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
     let whisperMediaStream = null;
+    let nemotronDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
+    let nemotronLocalEngine = null;
+    let nemotronMediaStream = null;
 
     // Remote-provided language list for translation.
     let translateLangChoices = null;
@@ -1114,11 +1118,12 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs', 'whisper'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
           : enabledEngines.has('whisper') ? 'whisper'
+          : enabledEngines.has('nemotron') ? 'nemotron'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
           : 'webspeech';
@@ -1128,6 +1133,7 @@
       const labels = {
         webspeech: 'Web Speech',
         whisper: 'Whisper (local)',
+        nemotron: 'Nemotron (local)',
         deepgram: 'Deepgram Nova-3',
         elevenlabs: 'ElevenLabs Scribe',
       };
@@ -1141,7 +1147,7 @@
 
       // Local STT engines do not use a server audio stream; hide the WS status badge.
       if (statusIndicator) {
-        statusIndicator.hidden = e === 'webspeech' || e === 'whisper';
+        statusIndicator.hidden = e === 'webspeech' || e === 'whisper' || e === 'nemotron';
       }
     }
 
@@ -1713,7 +1719,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs', 'whisper'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -2443,35 +2449,96 @@
       return '';
     }
 
-    function stopWhisperPipeline() {
-      if (whisperLocalEngine) {
-        try {
-          whisperLocalEngine.stop();
-        } catch (_e) {
-          // no-op
-        }
-        whisperLocalEngine = null;
+    // Shared teardown for the browser-local engines (Whisper, Nemotron): stop the
+    // engine and release the mic tracks (both best-effort), then drop any dangling
+    // '…' interim placeholder (a transcription in flight when Stop is pressed never
+    // emits its closing final). The caller clears its module-level handles.
+    function stopLocalEnginePipeline(engine, stream) {
+      if (engine) {
+        try { engine.stop(); } catch (_e) { /* no-op */ }
       }
-      if (whisperMediaStream) {
-        try {
-          whisperMediaStream.getTracks().forEach((track) => track.stop());
-        } catch (_e) {
-          // no-op
-        }
-        whisperMediaStream = null;
+      if (stream) {
+        try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
       }
-      // A transcription in flight when Stop is pressed never emits its closing
-      // final, so drop any dangling '…' interim placeholder (no-op otherwise).
       removeInterimElement(recognizedContainer);
     }
 
-    async function startWhisperRecording() {
+    function stopWhisperPipeline() {
+      stopLocalEnginePipeline(whisperLocalEngine, whisperMediaStream);
+      whisperLocalEngine = null;
+      whisperMediaStream = null;
+    }
+
+    function stopNemotronPipeline() {
+      stopLocalEnginePipeline(nemotronLocalEngine, nemotronMediaStream);
+      nemotronLocalEngine = null;
+      nemotronMediaStream = null;
+    }
+
+    // Shared interim/final transcript handler for the browser-local engines.
+    // Whisper renders interims but only translates finals; the streaming Nemotron
+    // engine additionally translates the (real, growing) interim text, throttled
+    // exactly like the Web Speech path. `translateInterim` selects that behaviour.
+    function makeLocalTranscriptHandler({ translateInterim }) {
+      return ({ text, isFinal }) => {
+        // Stats: time-to-first-transcript and per-utterance inference latency.
+        const nowPerf = performance.now();
+        if (_sttTtfbMs == null) {
+          _sttTtfbMs = nowPerf - _sessionStartPerf;
+        }
+        if (!isFinal) {
+          if (_sttSegmentStartPerf == null) {
+            _sttSegmentStartPerf = nowPerf;
+          }
+          removeInterimElement(recognizedContainer);
+          showInterim(recognizedContainer, text || '…');
+          if (translateInterim) {
+            const now = Date.now();
+            if (text && text !== lastInterimSentText && now - lastInterimSentAtMs >= interimSendIntervalMs) {
+              lastInterimSentText = text;
+              lastInterimSentAtMs = now;
+              sendTranslateWsMessage('interim', text);
+            }
+          }
+          updateStatsBar();
+          return;
+        }
+        if (_sttSegmentStartPerf != null) {
+          const sttMs = nowPerf - _sttSegmentStartPerf;
+          _sttLastFinalMs = sttMs;
+          _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+          _sttSegmentStartPerf = null;
+        }
+        removeInterimElement(recognizedContainer);
+        if (translateInterim) {
+          lastInterimSentText = '';
+          lastInterimSentAtMs = 0;
+        }
+        if (!text) {
+          updateStatsBar();
+          return;
+        }
+        addSegment(recognizedContainer, czSegmentCount++, text);
+        sendTranslateWsMessage('final', text);
+        updateStatsBar();
+      };
+    }
+
+    // Shared start flow for the browser-local engines (Whisper, Nemotron). Both do
+    // STT on-device and send only recognized text to /ws, so the flow is identical
+    // apart from which module/engine is loaded and how its active handle is tracked.
+    // `config` supplies those engine-specific bits (kind, loadingMessage,
+    // createEngine, getActive/setActive, setStream, startedLog, failLabel).
+    // Every `await` below is a window in which Stop (or Stop + a new Start) can run,
+    // so after each one we only proceed if the active handle still points at THIS
+    // engine — otherwise a Stop during startup could resurrect a zombie session.
+    async function startLocalEngineRecording(config) {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         showMessage('Microphone access is not available in this browser.');
         return;
       }
 
-      applyEngineUi('whisper');
+      applyEngineUi(config.kind);
       applyRecognitionSettings();
       updateTranslationTitles();
 
@@ -2482,61 +2549,16 @@
 
       resetSessionUi();
 
-      // Local handle for this start attempt: every `await` below is a window in
-      // which Stop (or Stop + a new Start) can run; afterwards we only proceed
-      // if `whisperLocalEngine` still points at THIS engine.
       let engine = null;
       try {
-        showMessage('Loading Whisper model (first run downloads it from Hugging Face — ~75 MB to ~800 MB depending on model)…' + _whisperDataWarning());
-        // The ?v= token cache-busts the engine module: browsers may treat a
-        // no-Cache-Control static response as heuristically fresh and keep
-        // serving an old copy across reloads. Bump it whenever the engine or its
-        // pinned ORT/transformers versions change.
-        const mod = await import('/static/whisper/whisper-engine.mjs?v=9');
-        engine = new mod.WhisperLocalEngine({
-          modelKey: whisperModel,
-          device: whisperDevice,
-          language: translateSrc || 'cs',
-          onStatus: (msg) => {
-            if (msg) showMessage(msg);
-          },
-          onTranscript: ({ text, isFinal }) => {
-            // Stats: time-to-first-transcript and per-utterance inference latency.
-            const nowPerf = performance.now();
-            if (_sttTtfbMs == null) {
-              _sttTtfbMs = nowPerf - _sessionStartPerf;
-            }
-            if (!isFinal) {
-              if (_sttSegmentStartPerf == null) {
-                _sttSegmentStartPerf = nowPerf;
-              }
-              removeInterimElement(recognizedContainer);
-              showInterim(recognizedContainer, text || '…');
-              updateStatsBar();
-              return;
-            }
-            if (_sttSegmentStartPerf != null) {
-              const sttMs = nowPerf - _sttSegmentStartPerf;
-              _sttLastFinalMs = sttMs;
-              _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
-              _sttSegmentStartPerf = null;
-            }
-            removeInterimElement(recognizedContainer);
-            if (!text) {
-              updateStatsBar();
-              return;
-            }
-            addSegment(recognizedContainer, czSegmentCount++, text);
-            sendTranslateWsMessage('final', text);
-            updateStatsBar();
-          },
-        });
-        whisperLocalEngine = engine;
+        showMessage(config.loadingMessage + _whisperDataWarning());
+        engine = await config.createEngine();
+        config.setActive(engine);
 
         // Download/initialize the model BEFORE asking for the microphone, so the
         // mic indicator isn't lit for minutes during a first-run model download.
         await engine.load();
-        if (whisperLocalEngine !== engine) return; // Stop pressed during load
+        if (config.getActive() !== engine) return; // Stop pressed during load
 
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -2546,15 +2568,15 @@
           },
           video: false,
         });
-        if (whisperLocalEngine !== engine) {
+        if (config.getActive() !== engine) {
           // Stopped while the permission prompt was open — release the fresh mic.
           try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
           return;
         }
-        whisperMediaStream = stream;
+        config.setStream(stream);
 
         await engine.start(stream);
-        if (whisperLocalEngine !== engine) return; // Stop pressed during start
+        if (config.getActive() !== engine) return; // Stop pressed during start
 
         // Open the translate WS only after engine startup succeeded, so a failure
         // in import()/model-load/getUserMedia can't leave a socket open — and only
@@ -2565,20 +2587,68 @@
 
         setStatus('connected');
         clearMessage();
-        console.log('Whisper local recording started');
+        console.log(config.startedLog);
       } catch (err) {
         // Stop already tore everything down and the user moved on — don't
         // resurrect an error UI for an aborted start attempt.
-        if (engine && whisperLocalEngine !== engine) return;
-        console.error('Whisper start failed:', err);
+        if (engine && config.getActive() !== engine) return;
+        console.error(config.failLabel + ' start failed:', err);
         // Full teardown (engine, mic, translate WS, keepalive timers, buttons) —
-        // not just the Whisper pipeline — so nothing leaks if the WS was opened.
+        // not just this engine's pipeline — so nothing leaks if the WS was opened.
         stopRecording();
         setStatus('error');
-        showMessage(
-          'Whisper failed to start: ' + (err && err.message ? err.message : String(err))
-        );
+        showMessage(config.failLabel + ' failed to start: ' + (err && err.message ? err.message : String(err)));
       }
+    }
+
+    function startWhisperRecording() {
+      return startLocalEngineRecording({
+        kind: 'whisper',
+        loadingMessage: 'Loading Whisper model (first run downloads it from Hugging Face — ~75 MB to ~800 MB depending on model)…',
+        createEngine: async () => {
+          // The ?v= token cache-busts the engine module: browsers may treat a
+          // no-Cache-Control static response as heuristically fresh and keep
+          // serving an old copy across reloads. Bump it whenever the engine or its
+          // pinned ORT/transformers versions change.
+          const mod = await import('/static/whisper/whisper-engine.mjs?v=9');
+          return new mod.WhisperLocalEngine({
+            modelKey: whisperModel,
+            device: whisperDevice,
+            language: translateSrc || 'cs',
+            onStatus: (msg) => { if (msg) showMessage(msg); },
+            onTranscript: makeLocalTranscriptHandler({ translateInterim: false }),
+          });
+        },
+        getActive: () => whisperLocalEngine,
+        setActive: (e) => { whisperLocalEngine = e; },
+        setStream: (s) => { whisperMediaStream = s; },
+        startedLog: 'Whisper local recording started',
+        failLabel: 'Whisper',
+      });
+    }
+
+    function startNemotronRecording() {
+      return startLocalEngineRecording({
+        kind: 'nemotron',
+        loadingMessage: 'Loading Nemotron model (first run downloads ~1.2 GB; WebGPU recommended)…',
+        createEngine: async () => {
+          // ?v= cache-busts the engine module — bump when the engine or its pinned
+          // onnxruntime-web version changes (kept in sync with the CSP in main.py).
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=1');
+          return new mod.NemotronLocalEngine({
+            device: nemotronDevice,
+            language: translateSrc || 'cs',
+            normalize: 'none',
+            onStatus: (msg) => { if (msg) showMessage(msg); },
+            onTranscript: makeLocalTranscriptHandler({ translateInterim: true }),
+          });
+        },
+        getActive: () => nemotronLocalEngine,
+        setActive: (e) => { nemotronLocalEngine = e; },
+        setStream: (s) => { nemotronMediaStream = s; },
+        startedLog: 'Nemotron local recording started',
+        failLabel: 'Nemotron',
+      });
     }
 
     async function startDeepgramRecording() {
@@ -3354,6 +3424,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         startWhisperRecording();
         return;
       }
+      if (currentEngine === 'nemotron') {
+        startNemotronRecording();
+        return;
+      }
       startWebSpeechRecording();
     }
 
@@ -3372,6 +3446,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       stopDeepgramPipeline();
       stopWhisperPipeline();
+      stopNemotronPipeline();
 
       // Close direct ElevenLabs WS (browser mode).
       if (_elBrowserWs) {
