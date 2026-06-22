@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 credentials/
+app/static/nemotron/models/
 tests/
 requirements-dev.txt
 *.md
