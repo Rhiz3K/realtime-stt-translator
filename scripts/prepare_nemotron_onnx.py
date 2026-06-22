@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -27,7 +28,17 @@ SUBDIR = "nemotron-3.5-asr-streaming-0.6b-onnx"
 FILES = ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model", "config.json"]
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = ROOT / "app" / "static" / "nemotron" / "models"
+
+
+def _out_dir_from_env() -> Path:
+    raw = os.getenv("NEMOTRON_MODEL_DIR")
+    if not raw:
+        return ROOT / "app" / "static" / "nemotron" / "models"
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else ROOT / path
+
+
+OUT_DIR = _out_dir_from_env()
 
 
 def _human(n: int) -> str:
