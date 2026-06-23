@@ -101,7 +101,10 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         # The Nemotron model weights (~1.2 GB) are immutable and must be cached
         # aggressively; the engine code is revalidated like Whisper's.
         elif request.url.path.startswith("/static/nemotron/models/"):
-            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            if 200 <= response.status_code < 400:
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            else:
+                response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/nemotron/"):
             response.headers["Cache-Control"] = "no-cache"
         return response

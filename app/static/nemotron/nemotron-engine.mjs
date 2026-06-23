@@ -6,8 +6,8 @@
 // final at end-of-utterance.
 //
 // Pipeline (ported 1:1 from scripts/nemotron_reference.py — the ground truth):
-//   audio -> mel.js -> [encoder_fp16.onnx, WebGPU] -> [decoder_joint.onnx, WASM,
-//   RNNT greedy] -> tokenizer.js -> text.
+//   audio -> mel.js -> [encoder_fp16*.onnx, WebGPU/WASM] -> [decoder_joint.onnx,
+//   WASM, RNNT greedy] -> tokenizer.js -> text.
 //
 // NemotronModel is the model core (load + streaming encode + decode), testable
 // headless (scripts/nemotron_poc.html drives it on a WAV). NemotronLocalEngine
@@ -20,8 +20,92 @@ import { f32ToF16, f16ToF32, zerosF16 } from "./f16.js";
 
 const CHUNK_FRAMES = 56;   // mel frames consumed per encoder step (8960 samples / 160)
 const PRE_ENCODE = 9;      // mel frames of left context prepended from the prior chunk
+const ENCODER_DATA_FILE = "encoder_fp16.onnx.data";
+const NEMOTRON_MODEL_ASSET_VERSION = "2";
+const NEMOTRON_ENCODER_VARIANTS = [
+  { minStorageBuffers: 25, file: "encoder_fp16.onnx", label: "standard" },
+  { minStorageBuffers: 16, file: "encoder_fp16_concat16.onnx", label: "storage-buffer 16" },
+  { minStorageBuffers: 8, file: "encoder_fp16_concat8.onnx", label: "storage-buffer 8" },
+];
+const WEBGPU_MIN_STORAGE_BUFFERS = NEMOTRON_ENCODER_VARIANTS[NEMOTRON_ENCODER_VARIANTS.length - 1].minStorageBuffers;
 
 const prod = (a) => a.reduce((x, y) => x * y, 1);
+
+function emitStatus(onStatus, text, progress, indeterminate = false) {
+  onStatus({ text, progress, indeterminate });
+}
+
+async function fetchJson(url, label) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`${label} fetch failed: ${res.status}. Nemotron model assets are not ready on the server yet.`);
+  }
+  return res.json();
+}
+
+export function nemotronModelAssetUrl(dir, file) {
+  const sep = String(dir).includes("?") ? "&" : "?";
+  return `${dir}/${file}${sep}v=${NEMOTRON_MODEL_ASSET_VERSION}`;
+}
+
+export function checkNemotronWebGpuLimits(adapterOrLimits) {
+  const limits = adapterOrLimits && adapterOrLimits.limits ? adapterOrLimits.limits : adapterOrLimits;
+  const limit = Number(limits && limits.maxStorageBuffersPerShaderStage);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return {
+      ok: false,
+      limit: 0,
+      reason: "WebGPU storage-buffer limit is unavailable",
+    };
+  }
+  const variant = selectNemotronEncoderVariantForLimit(limit);
+  if (!variant) {
+    return {
+      ok: false,
+      limit,
+      reason: `WebGPU storage-buffer limit ${limit} is below Nemotron minimum ${WEBGPU_MIN_STORAGE_BUFFERS}`,
+    };
+  }
+  return {
+    ok: true,
+    limit,
+    variant,
+    reason: `WebGPU storage-buffer limit ${limit} supports Nemotron ${variant.label} encoder`,
+  };
+}
+
+export function selectNemotronEncoderVariantForLimit(limitValue) {
+  const limit = Number(limitValue);
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  return NEMOTRON_ENCODER_VARIANTS.find((variant) => limit >= variant.minStorageBuffers) || null;
+}
+
+async function probeNemotronWebGpuSupport() {
+  if (typeof navigator === "undefined" || !navigator.gpu) {
+    return { ok: false, limit: 0, reason: "WebGPU is not available in this browser" };
+  }
+  let adapter;
+  try {
+    adapter = await navigator.gpu.requestAdapter();
+  } catch (e) {
+    return {
+      ok: false,
+      limit: 0,
+      reason: `WebGPU adapter check failed: ${e && e.message ? e.message : String(e)}`,
+    };
+  }
+  if (!adapter) {
+    return { ok: false, limit: 0, reason: "WebGPU adapter is not available" };
+  }
+  return checkNemotronWebGpuLimits(adapter);
+}
+
+function encoderOptions(dir) {
+  return {
+    externalData: [{ path: ENCODER_DATA_FILE, data: nemotronModelAssetUrl(dir, ENCODER_DATA_FILE) }],
+    graphOptimizationLevel: "all",
+  };
+}
 
 export class NemotronModel {
   constructor(ort, { encSession, decSession, tokenizer, config, normalize }) {
@@ -40,38 +124,52 @@ export class NemotronModel {
   }
 
   static async load(ort, { dir = "/static/nemotron/models", device = "auto", normalize = "none", onStatus = () => {} } = {}) {
+    emitStatus(onStatus, "Checking Nemotron model assets...", 10, true);
     const [config, tokenizer] = await Promise.all([
-      fetch(`${dir}/config.json`).then((r) => r.json()),
-      Tokenizer.load(`${dir}/vocab.json`),
+      fetchJson(nemotronModelAssetUrl(dir, "config.json"), "config"),
+      Tokenizer.load(nemotronModelAssetUrl(dir, "vocab.json")),
     ]);
+    emitStatus(onStatus, "Nemotron model assets found", 25);
 
-    // Encoder: WebGPU (with WASM fallback). External fp16 weights via externalData.
-    const encUrl = `${dir}/encoder_fp16.onnx`;
-    const encOpts = {
-      externalData: [{ path: "encoder_fp16.onnx.data", data: `${dir}/encoder_fp16.onnx.data` }],
-      graphOptimizationLevel: "all",
-    };
+    // Encoder: WebGPU (with WASM fallback). Lower-limit WebGPU variants split
+    // large Concat nodes but reuse the same external fp16 weights file.
     let encSession;
     const wantGpu = device === "auto" || device === "webgpu";
     if (wantGpu) {
-      try {
-        onStatus("Loading Nemotron encoder on GPU (WebGPU)…");
-        encSession = await ort.InferenceSession.create(encUrl, { ...encOpts, executionProviders: ["webgpu"] });
-        onStatus("Nemotron encoder ready (WebGPU)");
-      } catch (e) {
-        if (device === "webgpu") throw e;
-        onStatus("WebGPU unavailable — loading Nemotron on CPU (WASM, slower)…");
+      const gpuSupport = await probeNemotronWebGpuSupport();
+      if (!gpuSupport.ok) {
+        if (device === "webgpu") {
+          throw new Error(`Nemotron WebGPU is not supported on this device: ${gpuSupport.reason}`);
+        }
+        emitStatus(onStatus, `${gpuSupport.reason}; loading Nemotron on CPU (WASM, slower)...`, 35, true);
+      } else {
+        try {
+          const variant = gpuSupport.variant || NEMOTRON_ENCODER_VARIANTS[0];
+          const encUrl = nemotronModelAssetUrl(dir, variant.file);
+          emitStatus(onStatus, `Loading Nemotron encoder on GPU (WebGPU, ${variant.label})...`, 35, true);
+          encSession = await ort.InferenceSession.create(encUrl, { ...encoderOptions(dir), executionProviders: ["webgpu"] });
+          emitStatus(onStatus, `Nemotron encoder ready (WebGPU, ${variant.label})`, 70);
+        } catch (e) {
+          if (device === "webgpu") throw e;
+          emitStatus(onStatus, "WebGPU failed; loading Nemotron on CPU (WASM, slower)...", 35, true);
+        }
       }
     }
     if (!encSession) {
-      encSession = await ort.InferenceSession.create(encUrl, { ...encOpts, executionProviders: ["wasm"] });
-      onStatus("Nemotron encoder ready (CPU/WASM)");
+      if (!wantGpu) {
+        emitStatus(onStatus, "Loading Nemotron encoder on CPU (WASM)...", 35, true);
+      }
+      const cpuVariant = NEMOTRON_ENCODER_VARIANTS[0];
+      encSession = await ort.InferenceSession.create(nemotronModelAssetUrl(dir, cpuVariant.file), { ...encoderOptions(dir), executionProviders: ["wasm"] });
+      emitStatus(onStatus, "Nemotron encoder ready (CPU/WASM)", 70);
     }
 
     // Decoder/joint: tiny, queried per token — WASM avoids per-token GPU dispatch.
-    const decSession = await ort.InferenceSession.create(`${dir}/decoder_joint.onnx`, {
+    emitStatus(onStatus, "Loading Nemotron decoder...", 78, true);
+    const decSession = await ort.InferenceSession.create(nemotronModelAssetUrl(dir, "decoder_joint.onnx"), {
       executionProviders: ["wasm"],
     });
+    emitStatus(onStatus, "Nemotron model ready", 95);
 
     return new NemotronModel(ort, { encSession, decSession, tokenizer, config, normalize });
   }
@@ -205,7 +303,7 @@ export class NemotronLocalEngine {
   }
 
   async load() {
-    this.onStatus("Loading Nemotron (first run fetches ~1.2 GB)…");
+    emitStatus(this.onStatus, "Loading Nemotron runtime...", 5, true);
     const ort = await import("https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs");
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
     // Multi-threaded WASM needs cross-origin isolation (SharedArrayBuffer); cap at
@@ -228,7 +326,7 @@ export class NemotronLocalEngine {
     this._node.port.onmessage = (e) => this._onFrame(new Int16Array(e.data));
     src.connect(this._node);
     this._node.connect(this._ctx.destination); // worklet emits silence; keeps process() pulled
-    this.onStatus("Listening (local Nemotron)…");
+    emitStatus(this.onStatus, "Listening (local Nemotron)", 100);
   }
 
   stop() {

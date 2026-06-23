@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -509,10 +510,24 @@ def test_static_nemotron_engine_served(client):
     assert resp.headers.get("cache-control") == "no-cache"
 
 
-def test_nemotron_model_assets_cached_immutably(client):
-    # The ~1.2 GB fp16 weights are content-stable and must be cached hard. The
-    # header is path-based, so it applies even before the model files are built.
-    resp = client.get("/static/nemotron/models/config.json")
+def test_missing_nemotron_model_assets_are_not_cached_immutably(client):
+    # A user can hit Nemotron before the background prepare job finishes. Never
+    # let a browser pin that transient 404 as an immutable model response.
+    resp = client.get("/static/nemotron/models/__missing_model_asset__.json")
+    assert resp.status_code == 404
+    assert resp.headers.get("cache-control") == "no-store"
+
+
+def test_existing_nemotron_model_assets_cached_immutably(client):
+    path = Path("app/static/nemotron/models/__cache_test__.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("ok")
+    try:
+        resp = client.get("/static/nemotron/models/__cache_test__.txt")
+    finally:
+        path.unlink(missing_ok=True)
+
+    assert resp.status_code == 200
     assert resp.headers.get("cache-control") == "public, max-age=31536000, immutable"
 
 

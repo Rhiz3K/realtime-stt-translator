@@ -14,6 +14,8 @@ PREPARE_SCRIPT = ROOT / "scripts" / "prepare_nemotron_onnx.py"
 
 REQUIRED_MODEL_FILES = (
     "encoder_fp16.onnx",
+    "encoder_fp16_concat16.onnx",
+    "encoder_fp16_concat8.onnx",
     "encoder_fp16.onnx.data",
     "decoder_joint.onnx",
     "config.json",

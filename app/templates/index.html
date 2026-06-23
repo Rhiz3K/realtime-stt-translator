@@ -86,6 +86,92 @@
       font-weight: 900;
     }
 
+    .local-progress {
+      max-width: var(--container);
+      margin: 0 auto;
+      padding: 12px 14px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .local-progress__meta {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .local-progress__text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .local-progress__value {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+    }
+
+    .local-progress__track {
+      height: 8px;
+      margin-top: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--border) 58%, transparent);
+    }
+
+    .local-progress__bar {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--primary);
+      transition: width 180ms ease;
+    }
+
+    .local-progress--indeterminate .local-progress__bar {
+      width: 38%;
+      animation: local-progress-indeterminate 1300ms ease-in-out infinite;
+    }
+
+    .debug-output {
+      min-height: 120px;
+      max-height: 360px;
+      overflow: auto;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 82%, var(--panel-2));
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .debug-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .field--full {
+      grid-column: 1 / -1;
+    }
+
+    @keyframes local-progress-indeterminate {
+      0% { transform: translateX(-110%); }
+      100% { transform: translateX(270%); }
+    }
+
     /* --- Collapsible top bar: keep a thin stats row visible --- */
     .topbar-inner {
       align-items: stretch;
@@ -354,6 +440,23 @@
 
 {% block message %}
   <div id="uiMessage" class="message" role="status" aria-live="polite" hidden></div>
+  <div id="localEngineProgress" class="local-progress" role="status" aria-live="polite" hidden>
+    <div class="local-progress__meta">
+      <span id="localEngineProgressText" class="local-progress__text"></span>
+      <span id="localEngineProgressValue" class="local-progress__value"></span>
+    </div>
+    <div
+      id="localEngineProgressTrack"
+      class="local-progress__track"
+      role="progressbar"
+      aria-label="Local engine loading progress"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow="0"
+    >
+      <div id="localEngineProgressBar" class="local-progress__bar"></div>
+    </div>
+  </div>
 
   <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
     <div class="modal-overlay" data-close="true"></div>
@@ -453,6 +556,30 @@
                 <option value="wasm">CPU (WASM)</option>
               </select>
               <p class="hint">WebGPU (GPU) is much faster than CPU — on desktop and Android Chrome 121+. Auto falls back to CPU/WASM.</p>
+            </div>
+          </div>
+
+          <div class="field settings-section-title">Nemotron (local, browser)</div>
+          <div class="form-grid" role="group" aria-label="Nemotron local">
+            <div class="field">
+              <label for="nemotronDevice">Compute backend</label>
+              <select id="nemotronDevice">
+                <option value="auto">Auto (WebGPU if compatible)</option>
+                <option value="webgpu">WebGPU (GPU)</option>
+                <option value="wasm">CPU (WASM)</option>
+              </select>
+              <p class="hint">Auto selects the best WebGPU encoder variant for maxStorageBuffersPerShaderStage 25, 16, or 8; lower limits fall back to CPU/WASM.</p>
+            </div>
+            <div class="field">
+              <div class="debug-actions">
+                <button class="btn" id="checkNemotronWebGpu" type="button">Check WebGPU</button>
+                <span class="hint" id="nemotronWebGpuDebugStatus">Not checked</span>
+              </div>
+              <p class="hint">Chrome does not expose chrome://flags state to web pages; this check shows the effective adapter limits that Nemotron can use.</p>
+            </div>
+            <div class="field field--full">
+              <pre id="nemotronWebGpuDebugOutput" class="debug-output" tabindex="0" aria-label="Nemotron WebGPU debug output">Run Check WebGPU to inspect Chrome adapter limits.</pre>
+              <p class="hint">If no compatible variant is found, or if you want Chrome to expose a higher limit, try Chrome Settings → System → Use graphics acceleration when available, Windows Settings → System → Display → Graphics → chrome.exe → High performance, then restart Chrome. For experiments, try chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-webgpu-developer-features; restart Chrome after changing flags.</p>
             </div>
           </div>
 
@@ -633,6 +760,11 @@
     const stopButton  = document.getElementById('stopButton');
     const statusIndicator = document.getElementById('statusIndicator');
     const uiMessage = document.getElementById('uiMessage');
+    const localEngineProgress = document.getElementById('localEngineProgress');
+    const localEngineProgressText = document.getElementById('localEngineProgressText');
+    const localEngineProgressValue = document.getElementById('localEngineProgressValue');
+    const localEngineProgressTrack = document.getElementById('localEngineProgressTrack');
+    const localEngineProgressBar = document.getElementById('localEngineProgressBar');
     const fontSize = document.getElementById('fontSize');
     const hideCz = document.getElementById('hideCz');
     const engineBadge = document.getElementById('engineBadge');
@@ -677,6 +809,10 @@
     const recognitionLangInput = document.getElementById('recognitionLang');
     const whisperModelInput = document.getElementById('whisperModel');
     const whisperDeviceInput = document.getElementById('whisperDevice');
+    const nemotronDeviceInput = document.getElementById('nemotronDevice');
+    const checkNemotronWebGpuButton = document.getElementById('checkNemotronWebGpu');
+    const nemotronWebGpuDebugStatus = document.getElementById('nemotronWebGpuDebugStatus');
+    const nemotronWebGpuDebugOutput = document.getElementById('nemotronWebGpuDebugOutput');
     const translateSrcInput = document.getElementById('translateSrc');
     const translateDestASelect = document.getElementById('translateDestA');
     const translateDestBSelect = document.getElementById('translateDestB');
@@ -920,11 +1056,67 @@
     function clearMessage() {
       uiMessage.textContent = '';
       uiMessage.hidden = true;
+      hideLocalEngineProgress();
     }
 
     function showMessage(text) {
+      hideLocalEngineProgress();
       uiMessage.textContent = text;
       uiMessage.hidden = false;
+    }
+
+    function hideLocalEngineProgress() {
+      if (!localEngineProgress) return;
+      localEngineProgress.hidden = true;
+      localEngineProgress.classList.remove('local-progress--indeterminate');
+      if (localEngineProgressText) localEngineProgressText.textContent = '';
+      if (localEngineProgressValue) localEngineProgressValue.textContent = '';
+      if (localEngineProgressBar) localEngineProgressBar.style.width = '0%';
+      if (localEngineProgressTrack) localEngineProgressTrack.setAttribute('aria-valuenow', '0');
+    }
+
+    function showLocalEngineProgress(status) {
+      if (!localEngineProgress) return;
+
+      const data = status && typeof status === 'object'
+        ? status
+        : { text: String(status || '') };
+      const text = data.text ? String(data.text) : '';
+      const numericProgress = Number(data.progress);
+      const hasProgress = Number.isFinite(numericProgress);
+      const progress = Math.max(0, Math.min(100, hasProgress ? numericProgress : 0));
+      const indeterminate = data.indeterminate === true;
+
+      uiMessage.textContent = '';
+      uiMessage.hidden = true;
+      localEngineProgress.hidden = false;
+      localEngineProgress.classList.toggle('local-progress--indeterminate', indeterminate);
+
+      if (localEngineProgressText) localEngineProgressText.textContent = text;
+      if (localEngineProgressValue) {
+        localEngineProgressValue.textContent = hasProgress && !indeterminate
+          ? `${Math.round(progress)}%`
+          : '';
+      }
+      if (localEngineProgressBar) {
+        localEngineProgressBar.style.width = indeterminate ? '' : `${progress}%`;
+      }
+      if (localEngineProgressTrack) {
+        if (indeterminate) {
+          localEngineProgressTrack.removeAttribute('aria-valuenow');
+        } else {
+          localEngineProgressTrack.setAttribute('aria-valuenow', String(Math.round(progress)));
+        }
+      }
+    }
+
+    function handleLocalEngineStatus(status) {
+      if (!status) return;
+      if (typeof status === 'object') {
+        showLocalEngineProgress(status);
+        return;
+      }
+      showMessage(String(status));
     }
 
     function setStatus(state) {
@@ -955,12 +1147,152 @@
     const LAYOUT_HIDE_CZ_STORAGE_KEY = 'srlt_hide_cz';
     const TOPBAR_COMPACT_STORAGE_KEY = 'srlt_topbar_compact';
     const FULLSCREEN_STORAGE_KEY = 'srlt_fullscreen';
+    const NEMOTRON_WEBGPU_VARIANTS = [
+      { minStorageBuffers: 25, label: 'standard' },
+      { minStorageBuffers: 16, label: 'storage-buffer 16' },
+      { minStorageBuffers: 8, label: 'storage-buffer 8' },
+    ];
+    const NEMOTRON_WEBGPU_MIN_STORAGE_BUFFERS = NEMOTRON_WEBGPU_VARIANTS[NEMOTRON_WEBGPU_VARIANTS.length - 1].minStorageBuffers;
 
     let topbarCompactEnabled = false;
     let fullscreenPreferred = false;
 
     let onboardingRequired = false;
     let _onboardingReturnFocus = null;
+
+    function _fmtDebugValue(value) {
+      if (value == null || value === '') return 'n/a';
+      return String(value);
+    }
+
+    async function _getWebGpuAdapterInfo(adapter) {
+      if (!adapter) return {};
+      if (adapter.info) return adapter.info;
+      if (typeof adapter.requestAdapterInfo === 'function') {
+        try {
+          return await adapter.requestAdapterInfo();
+        } catch (_e) {
+          return {};
+        }
+      }
+      return {};
+    }
+
+    function _formatLimit(lines, limits, key, note) {
+      const value = limits && limits[key] != null ? limits[key] : 'n/a';
+      lines.push(`  ${key}: ${value}${note ? ` (${note})` : ''}`);
+    }
+
+    function _selectNemotronDebugVariant(limitValue) {
+      const limit = Number(limitValue);
+      if (!Number.isFinite(limit) || limit <= 0) return null;
+      return NEMOTRON_WEBGPU_VARIANTS.find((variant) => limit >= variant.minStorageBuffers) || null;
+    }
+
+    async function _inspectWebGpuAdapter(label, options) {
+      const lines = [`${label}:`];
+      let adapter = null;
+      try {
+        adapter = await navigator.gpu.requestAdapter(options);
+      } catch (e) {
+        lines.push(`  adapter check failed: ${e && e.message ? e.message : String(e)}`);
+        return { compatible: false, extendedInfoVisible: false, lines };
+      }
+      if (!adapter) {
+        lines.push('  adapter: not available');
+        return { compatible: false, extendedInfoVisible: false, lines };
+      }
+
+      const info = await _getWebGpuAdapterInfo(adapter);
+      const limits = adapter.limits || {};
+      const storageLimit = Number(limits.maxStorageBuffersPerShaderStage || 0);
+      const variant = _selectNemotronDebugVariant(storageLimit);
+      const compatible = Boolean(variant);
+      const extendedKeys = ['backend', 'type', 'driver', 'powerPreference', 'd3dShaderModel', 'vkDriverVersion'];
+      const extendedInfoVisible = extendedKeys.some((key) => info && info[key] != null && info[key] !== '');
+      const features = adapter.features ? Array.from(adapter.features).sort() : [];
+
+      lines.push(`  Nemotron WebGPU: ${compatible ? 'compatible' : 'not compatible'}`);
+      lines.push(`  selected encoder variant: ${variant ? variant.label : 'none (CPU/WASM fallback)'}`);
+      lines.push(`  supported variant thresholds: ${NEMOTRON_WEBGPU_VARIANTS.map((v) => v.minStorageBuffers).join(', ')}`);
+      if ('isFallbackAdapter' in adapter) {
+        lines.push(`  fallback adapter: ${adapter.isFallbackAdapter ? 'yes' : 'no'}`);
+      }
+      lines.push('  adapter info:');
+      for (const key of ['vendor', 'architecture', 'device', 'description', ...extendedKeys]) {
+        lines.push(`    ${key}: ${_fmtDebugValue(info && info[key])}`);
+      }
+      lines.push('  limits:');
+      _formatLimit(lines, limits, 'maxStorageBuffersPerShaderStage', 'Nemotron variants: 25 / 16 / 8');
+      _formatLimit(lines, limits, 'maxStorageBufferBindingSize');
+      _formatLimit(lines, limits, 'maxBindGroups');
+      _formatLimit(lines, limits, 'maxComputeInvocationsPerWorkgroup');
+      _formatLimit(lines, limits, 'maxComputeWorkgroupSizeX');
+      _formatLimit(lines, limits, 'maxComputeWorkgroupSizeY');
+      _formatLimit(lines, limits, 'maxComputeWorkgroupSizeZ');
+      _formatLimit(lines, limits, 'maxComputeWorkgroupsPerDimension');
+      lines.push(`  features: ${features.length ? features.join(', ') : 'n/a'}`);
+
+      return { compatible, extendedInfoVisible, lines };
+    }
+
+    async function checkNemotronWebGpuDebug() {
+      if (!nemotronWebGpuDebugOutput || !nemotronWebGpuDebugStatus) return;
+
+      nemotronWebGpuDebugStatus.textContent = 'Checking...';
+      nemotronWebGpuDebugOutput.textContent = 'Checking Chrome WebGPU adapters...';
+      if (checkNemotronWebGpuButton) checkNemotronWebGpuButton.disabled = true;
+
+      try {
+        const lines = [
+          `User agent: ${navigator.userAgent || 'n/a'}`,
+          `Secure context: ${window.isSecureContext ? 'yes' : 'no'}`,
+          `Cross-origin isolated: ${typeof self !== 'undefined' && self.crossOriginIsolated ? 'yes' : 'no'}`,
+          `WebGPU API: ${navigator.gpu ? 'available' : 'not available'}`,
+        ];
+
+        if (!navigator.gpu) {
+          lines.push('', 'WebGPU is unavailable. Check Chrome version, HTTPS, and graphics acceleration.');
+          nemotronWebGpuDebugStatus.textContent = 'WebGPU unavailable';
+          nemotronWebGpuDebugOutput.textContent = lines.join('\n');
+          return;
+        }
+
+        const probes = [
+          ['Default adapter', undefined],
+          ['High performance hint', { powerPreference: 'high-performance' }],
+          ['Low power hint', { powerPreference: 'low-power' }],
+        ];
+        let anyCompatible = false;
+        let anyExtendedInfo = false;
+
+        for (const [label, options] of probes) {
+          const result = await _inspectWebGpuAdapter(label, options);
+          anyCompatible = anyCompatible || result.compatible;
+          anyExtendedInfo = anyExtendedInfo || result.extendedInfoVisible;
+          lines.push('', ...result.lines);
+        }
+
+        lines.push(
+          '',
+          'Chrome flags:',
+          '  chrome://flags state: not exposed to web pages',
+          `  WebGPU Developer Features effect visible: ${anyExtendedInfo ? 'extended adapter fields are visible' : 'extended adapter fields are not visible'}`,
+          `  Unsafe WebGPU effect visible: rerun this check; Nemotron can use WebGPU at maxStorageBuffersPerShaderStage >= ${NEMOTRON_WEBGPU_MIN_STORAGE_BUFFERS}`
+        );
+
+        nemotronWebGpuDebugStatus.textContent = anyCompatible
+          ? 'Compatible WebGPU adapter found'
+          : 'No compatible WebGPU adapter found';
+        nemotronWebGpuDebugOutput.textContent = lines.join('\n');
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        nemotronWebGpuDebugStatus.textContent = 'WebGPU check failed';
+        nemotronWebGpuDebugOutput.textContent = `WebGPU check failed: ${msg}`;
+      } finally {
+        if (checkNemotronWebGpuButton) checkNemotronWebGpuButton.disabled = false;
+      }
+    }
 
     function hasSavedLanguageSettings() {
       try {
@@ -1684,6 +2016,9 @@
       if (whisperDeviceInput) {
         whisperDeviceInput.value = whisperDevice;
       }
+      if (nemotronDeviceInput) {
+        nemotronDeviceInput.value = nemotronDevice;
+      }
     }
 
     function loadSettings() {
@@ -1765,6 +2100,9 @@
         if (typeof parsed.whisperDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.whisperDevice)) {
           whisperDevice = parsed.whisperDevice;
         }
+        if (typeof parsed.nemotronDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.nemotronDevice)) {
+          nemotronDevice = parsed.nemotronDevice;
+        }
       } catch (_e) {
         // ignore invalid storage
       }
@@ -1797,6 +2135,7 @@
             elevenlabsCommitStrategy,
             whisperModel,
             whisperDevice,
+            nemotronDevice,
           })
         );
       } catch (_e) {
@@ -1862,6 +2201,10 @@
       if (whisperDeviceInput) {
         const wd = whisperDeviceInput.value;
         whisperDevice = ['auto', 'webgpu', 'wasm'].includes(wd) ? wd : 'auto';
+      }
+      if (nemotronDeviceInput) {
+        const nd = nemotronDeviceInput.value;
+        nemotronDevice = ['auto', 'webgpu', 'wasm'].includes(nd) ? nd : 'auto';
       }
 
       persistSettings();
@@ -2617,7 +2960,12 @@
 
       let engine = null;
       try {
-        showMessage(config.loadingMessage + _whisperDataWarning());
+        const loadingMessage = config.loadingMessage + _whisperDataWarning();
+        if (config.progressStatus) {
+          showLocalEngineProgress({ text: loadingMessage, progress: 2, indeterminate: true });
+        } else {
+          showMessage(loadingMessage);
+        }
         engine = await config.createEngine();
         config.setActive(engine);
 
@@ -2697,15 +3045,16 @@
       return startLocalEngineRecording({
         kind: 'nemotron',
         loadingMessage: 'Loading Nemotron model (first run downloads ~1.2 GB; WebGPU recommended)…',
+        progressStatus: true,
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes (kept in sync with the CSP in main.py).
-          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=1');
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=3');
           return new mod.NemotronLocalEngine({
             device: nemotronDevice,
             language: translateSrc || 'cs',
             normalize: 'none',
-            onStatus: (msg) => { if (msg) showMessage(msg); },
+            onStatus: (status) => { handleLocalEngineStatus(status); },
             onTranscript: makeLocalTranscriptHandler({ translateInterim: true }),
           });
         },
@@ -3677,6 +4026,12 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
     if (checkWebSpeechLangButton) {
       checkWebSpeechLangButton.addEventListener('click', () => {
         checkWebSpeechAvailability();
+      });
+    }
+
+    if (checkNemotronWebGpuButton) {
+      checkNemotronWebGpuButton.addEventListener('click', () => {
+        checkNemotronWebGpuDebug();
       });
     }
 

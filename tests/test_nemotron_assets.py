@@ -5,6 +5,14 @@ import subprocess
 import pytest
 
 
+def test_required_model_files_include_webgpu_concat_variants():
+    from app.nemotron_assets import REQUIRED_MODEL_FILES
+
+    assert "encoder_fp16_concat16.onnx" in REQUIRED_MODEL_FILES
+    assert "encoder_fp16_concat8.onnx" in REQUIRED_MODEL_FILES
+    assert "encoder_fp16.onnx.data" in REQUIRED_MODEL_FILES
+
+
 def test_ensure_nemotron_assets_skips_when_engine_disabled(tmp_path: Path):
     from app.nemotron_assets import ensure_nemotron_assets
 

@@ -14,7 +14,9 @@ export class Tokenizer {
 
   static async load(url) {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`vocab fetch failed: ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`vocab fetch failed: ${res.status}. Nemotron model assets are not ready on the server yet.`);
+    }
     return new Tokenizer(await res.json());
   }
 
