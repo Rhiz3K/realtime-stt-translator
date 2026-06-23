@@ -323,6 +323,115 @@
         min-height: 180px;
       }
     }
+
+    /* On-screen debug overlay (toggle: Settings → Debug overlay, or Ctrl+Alt+D). */
+    .dbg-overlay {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      z-index: 1200;
+      width: min(440px, calc(100vw - 24px));
+      max-height: min(46vh, 520px);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(6px);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11.5px;
+      color: var(--text);
+    }
+
+    .dbg-overlay[hidden] {
+      display: none;
+    }
+
+    .dbg-overlay__head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dbg-overlay__title {
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      text-transform: uppercase;
+      font-size: 10.5px;
+    }
+
+    .dbg-overlay__actions {
+      margin-left: auto;
+      display: inline-flex;
+      gap: 4px;
+    }
+
+    .dbg-btn {
+      appearance: none;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 2px 7px;
+      font: inherit;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .dbg-btn:hover {
+      color: var(--text);
+      border-color: var(--primary);
+    }
+
+    .dbg-overlay__metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 12px;
+      color: var(--muted);
+    }
+
+    .dbg-metric-value {
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-weight: 800;
+    }
+
+    .dbg-metric-value.dbg-warn {
+      color: #d98a00;
+    }
+
+    .dbg-metric-value.dbg-bad {
+      color: #d64545;
+    }
+
+    .dbg-overlay__log {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      overflow-x: hidden;
+      min-height: 80px;
+      padding: 6px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel-2) 70%, transparent);
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overscroll-behavior: contain;
+    }
+
+    .dbg-line {
+      display: block;
+    }
+
+    .dbg-ts {
+      color: var(--muted);
+      margin-right: 6px;
+    }
   </style>
 {% endblock %}
 
@@ -458,6 +567,25 @@
     </div>
   </div>
 
+  <div id="debugOverlay" class="dbg-overlay" hidden role="region" aria-label="STT debug overlay">
+    <div class="dbg-overlay__head">
+      <span class="dbg-overlay__title">STT debug</span>
+      <span id="dbgOvState" class="badge badge--neutral">idle</span>
+      <div class="dbg-overlay__actions">
+        <button class="dbg-btn" type="button" id="dbgOverlayClear" title="Clear log">clear</button>
+        <button class="dbg-btn" type="button" id="dbgOverlayCopy" title="Copy log to clipboard">copy</button>
+        <button class="dbg-btn" type="button" id="dbgOverlayClose" title="Close (Ctrl+Alt+D)" aria-label="Close debug overlay">✕</button>
+      </div>
+    </div>
+    <div class="dbg-overlay__metrics">
+      <span class="dbg-metric">restarts <b id="dbgOvRestarts" class="dbg-metric-value">0</b></span>
+      <span class="dbg-metric">gap <b id="dbgOvGap" class="dbg-metric-value">—</b></span>
+      <span class="dbg-metric">mode <b id="dbgOvMode" class="dbg-metric-value">—</b></span>
+      <span class="dbg-metric">last <b id="dbgOvEnd" class="dbg-metric-value">—</b></span>
+    </div>
+    <div id="debugOverlayLog" class="dbg-overlay__log" role="log" aria-live="off"></div>
+  </div>
+
   <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
     <div class="modal-overlay" data-close="true"></div>
     <div class="modal-card" role="document">
@@ -489,6 +617,13 @@
                 <label for="debugLogging">Debug logging</label>
               </span>
               <p class="hint">Writes STT/WS events to the browser console</p>
+            </div>
+            <div class="field">
+              <span class="checkbox">
+                <input id="debugOverlayToggle" type="checkbox" />
+                <label for="debugOverlayToggle">Debug overlay</label>
+              </span>
+              <p class="hint">On-screen STT event log + Web Speech health (Ctrl+Alt+D)</p>
             </div>
           </div>
 
@@ -532,6 +667,7 @@
             </div>
             <div class="field">
               <button class="btn" id="checkWebSpeechLang" type="button">Check language availability</button>
+              <button class="btn" id="installWebSpeechModel" type="button" hidden>Install on-device model</button>
               <p class="hint" id="webSpeechLangStatus">&nbsp;</p>
             </div>
           </div>
@@ -805,6 +941,17 @@
 
     const themeSelect = document.getElementById('themeSelect');
     const debugLoggingCheckbox = document.getElementById('debugLogging');
+    const debugOverlayCheckbox = document.getElementById('debugOverlayToggle');
+    const debugOverlay = document.getElementById('debugOverlay');
+    const debugOverlayLog = document.getElementById('debugOverlayLog');
+    const dbgOvState = document.getElementById('dbgOvState');
+    const dbgOvRestarts = document.getElementById('dbgOvRestarts');
+    const dbgOvGap = document.getElementById('dbgOvGap');
+    const dbgOvMode = document.getElementById('dbgOvMode');
+    const dbgOvEnd = document.getElementById('dbgOvEnd');
+    const dbgOverlayClose = document.getElementById('dbgOverlayClose');
+    const dbgOverlayClear = document.getElementById('dbgOverlayClear');
+    const dbgOverlayCopy = document.getElementById('dbgOverlayCopy');
 
     const recognitionLangInput = document.getElementById('recognitionLang');
     const whisperModelInput = document.getElementById('whisperModel');
@@ -822,6 +969,7 @@
     const processLocallyCheckbox = document.getElementById('processLocally');
     const phrasesTextarea = document.getElementById('phrases');
     const checkWebSpeechLangButton = document.getElementById('checkWebSpeechLang');
+    const installWebSpeechModelButton = document.getElementById('installWebSpeechModel');
     const webSpeechLangStatus = document.getElementById('webSpeechLangStatus');
     const translateInterimCheckbox = document.getElementById('translateInterim');
     const interimIntervalInput = document.getElementById('interimInterval');
@@ -878,6 +1026,17 @@
     const _WS_RESTART_WINDOW_MS = 5000;     // reset counter after 5 s of stability
     const _WS_RESTART_MAX_RAPID = 8;        // max rapid restarts before backing off
     const _WS_RESTART_BACKOFF_MS = 3000;    // pause before next restart when flapping
+
+    // Web Speech health, surfaced live in the debug overlay. _wsLastResultAtMs also
+    // doubles as a liveness signal: a session that produced any result was healthy and
+    // must NOT count toward the flapping backoff (see onend), otherwise normal choppy
+    // dictation (short sessions ending every few seconds) wrongly triggers the 3 s pause.
+    let _wsLastResultAtMs = 0;     // last onresult of the active session
+    let _wsLastStartAtMs = 0;      // last onstart/onaudiostart
+    let _wsLastEndReason = '';     // best-effort: last error before onend, or 'end'
+    let _wsLastErrorStr = '';      // last onerror code this session
+    let _wsState = 'idle';         // idle|connecting|listening|speech|restarting|backoff|error
+    let _wsMode = '';              // 'on-device' | 'cloud' | '' (unknown)
 
     // Web Speech API does not expose a public endpointing/pause setting for final results.
     // To get faster updates we translate interim text with a client-side throttle.
@@ -1601,7 +1760,162 @@
       }
     }
 
+    // --- On-screen debug overlay -------------------------------------------------
+    // Surfaces the same dbg() event stream the console gets, plus live Web Speech
+    // health (state, restart count, gap since last result, mode). The gap is the key
+    // freeze indicator: when recognition stalls during a restart it climbs visibly.
+    const DEBUG_OVERLAY_STORAGE_KEY = 'srlt_debug_overlay';
+    let debugOverlayEnabled = false;
+    const _ovLog = [];               // {t:number, text:string}
+    const _OV_LOG_MAX = 200;
+    let _ovTimer = null;
+
+    function loadOverlayPreference() {
+      try {
+        debugOverlayEnabled = localStorage.getItem(DEBUG_OVERLAY_STORAGE_KEY) === '1';
+      } catch (_e) {
+        debugOverlayEnabled = false;
+      }
+    }
+
+    function _ovFmtTime(ms) {
+      const d = new Date(ms);
+      const p = (n, w) => String(n).padStart(w || 2, '0');
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+    }
+
+    function _ovFmtArgs(args) {
+      const parts = [];
+      for (const a of args) {
+        if (typeof a === 'string') {
+          parts.push(a);
+        } else {
+          let s;
+          try { s = JSON.stringify(a); } catch (_e) { s = String(a); }
+          if (s && s.length > 220) s = s.slice(0, 217) + '…';
+          parts.push(s);
+        }
+      }
+      return parts.join(' ');
+    }
+
+    function _ovPush(args) {
+      const entry = { t: Date.now(), text: _ovFmtArgs(args) };
+      _ovLog.push(entry);
+      if (_ovLog.length > _OV_LOG_MAX) _ovLog.shift();
+      if (debugOverlayEnabled && debugOverlayLog && !debugOverlay.hidden) {
+        _ovAppendLine(entry);
+      }
+    }
+
+    function _ovAppendLine(entry) {
+      const atBottom =
+        debugOverlayLog.scrollHeight - debugOverlayLog.scrollTop - debugOverlayLog.clientHeight < 24;
+      const line = document.createElement('div');
+      line.className = 'dbg-line';
+      const ts = document.createElement('span');
+      ts.className = 'dbg-ts';
+      ts.textContent = _ovFmtTime(entry.t);
+      line.appendChild(ts);
+      line.appendChild(document.createTextNode(' ' + entry.text));
+      debugOverlayLog.appendChild(line);
+      while (debugOverlayLog.childElementCount > _OV_LOG_MAX) {
+        debugOverlayLog.removeChild(debugOverlayLog.firstChild);
+      }
+      if (atBottom) debugOverlayLog.scrollTop = debugOverlayLog.scrollHeight;
+    }
+
+    function _ovRenderLogFull() {
+      if (!debugOverlayLog) return;
+      debugOverlayLog.replaceChildren();
+      for (const entry of _ovLog) _ovAppendLine(entry);
+      debugOverlayLog.scrollTop = debugOverlayLog.scrollHeight;
+    }
+
+    const _OV_STATE_CLASS = {
+      idle: 'badge--neutral',
+      connecting: 'badge--warn',
+      listening: 'badge--success',
+      speech: 'badge--success',
+      restarting: 'badge--warn',
+      backoff: 'badge--danger',
+      error: 'badge--danger',
+    };
+
+    function _ovRenderHeader() {
+      if (!debugOverlay || debugOverlay.hidden) return;
+      const recording = stopButton && !stopButton.disabled;
+      if (dbgOvState) {
+        dbgOvState.textContent = _wsState;
+        dbgOvState.className = 'badge ' + (_OV_STATE_CLASS[_wsState] || 'badge--neutral');
+      }
+      if (dbgOvRestarts) dbgOvRestarts.textContent = String(_wsRestartCount);
+      if (dbgOvMode) dbgOvMode.textContent = _wsMode || '—';
+      if (dbgOvEnd) {
+        dbgOvEnd.textContent = _wsLastErrorStr
+          ? `err:${_wsLastErrorStr}`
+          : (_wsLastEndReason || '—');
+      }
+      if (dbgOvGap) {
+        let txt = '—';
+        let cls = 'dbg-metric-value';
+        if (recording && currentEngine === 'webspeech' && _wsLastResultAtMs > 0) {
+          const g = Date.now() - _wsLastResultAtMs;
+          txt = _fmtMs(g);
+          if (g > 3000) cls += ' dbg-bad';
+          else if (g > 1500) cls += ' dbg-warn';
+        }
+        dbgOvGap.textContent = txt;
+        dbgOvGap.className = cls;
+      }
+    }
+
+    function _ovStartTicker() {
+      if (_ovTimer != null) return;
+      try { _ovTimer = setInterval(_ovRenderHeader, 250); } catch (_e) { /* no-op */ }
+    }
+
+    function _ovStopTicker() {
+      if (_ovTimer != null) {
+        clearInterval(_ovTimer);
+        _ovTimer = null;
+      }
+    }
+
+    function showDebugOverlay() {
+      if (!debugOverlay) return;
+      debugOverlay.hidden = false;
+      _ovRenderLogFull();
+      _ovRenderHeader();
+      _ovStartTicker();
+    }
+
+    function hideDebugOverlay() {
+      if (!debugOverlay) return;
+      debugOverlay.hidden = true;
+      _ovStopTicker();
+    }
+
+    function setOverlayPreference(enabled) {
+      debugOverlayEnabled = Boolean(enabled);
+      try {
+        localStorage.setItem(DEBUG_OVERLAY_STORAGE_KEY, debugOverlayEnabled ? '1' : '0');
+      } catch (_e) {
+        // no-op
+      }
+      if (debugOverlayEnabled) showDebugOverlay();
+      else hideDebugOverlay();
+      if (debugOverlayCheckbox) debugOverlayCheckbox.checked = debugOverlayEnabled;
+    }
+
+    function toggleDebugOverlay() {
+      setOverlayPreference(!debugOverlayEnabled);
+    }
+
     function dbg(...args) {
+      if (debugOverlayEnabled) {
+        try { _ovPush(args); } catch (_e) { /* never let logging break the app */ }
+      }
       if (!debugEnabled) {
         return;
       }
@@ -1987,6 +2301,9 @@
       if (debugLoggingCheckbox) {
         debugLoggingCheckbox.checked = debugEnabled;
       }
+      if (debugOverlayCheckbox) {
+        debugOverlayCheckbox.checked = debugOverlayEnabled;
+      }
 
       recognitionLangInput.value = recognitionLang;
       translateSrcInput.value = translateSrc;
@@ -2165,6 +2482,9 @@
       if (debugLoggingCheckbox) {
         setDebugPreference(debugLoggingCheckbox.checked);
       }
+      if (debugOverlayCheckbox) {
+        setOverlayPreference(debugOverlayCheckbox.checked);
+      }
 
       recognitionLang = recognitionLangInput.value || 'cs-CZ';
       translateSrc = translateSrcInput.value || 'cs';
@@ -2256,6 +2576,10 @@
         webSpeechLastFinalText = '';
         webSpeechLastFinalAtMs = 0;
         _sttSegmentStartPerf = null;
+        _wsLastStartAtMs = Date.now();
+        _wsState = 'listening';
+        _wsLastEndReason = '';
+        _wsMode = recognitionProcessLocally ? 'on-device (req)' : 'cloud';
         dbg('webspeech:start', {
           lang: recognitionLang,
           continuous: recognitionContinuous,
@@ -2276,6 +2600,7 @@
       recognition.onspeechstart = () => {
         if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
         _sttSegmentStartPerf = performance.now();
+        _wsState = 'speech';
       };
 
       recognition.onresult = (event) => {
@@ -2284,6 +2609,11 @@
         if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
           return;
         }
+        // Liveness: the service responded. Used to render the overlay "gap" metric and
+        // to keep a healthy-but-choppy session from accumulating toward the backoff.
+        _wsLastResultAtMs = Date.now();
+        _wsLastErrorStr = '';
+        _wsState = 'listening';
         dbg('webspeech:onresult', {
           resultIndex: event.resultIndex,
           resultsLength: event.results ? event.results.length : null,
@@ -2398,21 +2728,31 @@
         // Keep going unless the user stopped recording
         if (stopButton.disabled) {
           dbg('webspeech:end (user stopped, not restarting)');
+          _wsState = 'idle';
           return;
         }
 
         const now = Date.now();
-        // Reset rapid-restart counter if we've been stable for a while.
-        if (now - _wsLastRestartAtMs > _WS_RESTART_WINDOW_MS) {
+        // Reset the rapid-restart counter when the session was healthy: it either
+        // produced a result since the previous restart (real recognition happened) or
+        // ran longer than the flapping window. Only genuinely empty, back-to-back
+        // restarts (dead mic/network) should accumulate toward the backoff — otherwise
+        // normal choppy dictation (short sessions ending every few seconds) wrongly
+        // trips the 3 s pause and inserts a visible freeze into working recognition.
+        const producedResult = _wsLastResultAtMs > _wsLastRestartAtMs;
+        if (producedResult || now - _wsLastRestartAtMs > _WS_RESTART_WINDOW_MS) {
           _wsRestartCount = 0;
         }
         _wsRestartCount++;
         _wsLastRestartAtMs = now;
+        if (!_wsLastErrorStr) _wsLastEndReason = 'end';
+        _wsState = 'restarting';
 
-        dbg('webspeech:end → restart', { count: _wsRestartCount, max: _WS_RESTART_MAX_RAPID });
+        dbg('webspeech:end → restart', { count: _wsRestartCount, max: _WS_RESTART_MAX_RAPID, producedResult });
 
         if (_wsRestartCount > _WS_RESTART_MAX_RAPID) {
           // Back off to prevent flapping (rapid error→end→start loops).
+          _wsState = 'backoff';
           dbg('webspeech:backoff', { delayMs: _WS_RESTART_BACKOFF_MS });
           const backoffGen = webSpeechSessionGen;
           setTimeout(() => {
@@ -2440,6 +2780,9 @@
           return;
         }
         dbg('webspeech:error', { error: event.error, message: event.message });
+        _wsLastErrorStr = String(event.error || 'error');
+        _wsLastEndReason = _wsLastErrorStr;
+        _wsState = 'error';
 
         // Fatal errors — stop recording and notify user.
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
@@ -2824,6 +3167,13 @@
       webSpeechLastFinalAtMs = 0;
       _wsRestartCount = 0;
       _wsLastRestartAtMs = 0;
+      _wsLastResultAtMs = 0;
+      _wsLastStartAtMs = 0;
+      _wsLastErrorStr = '';
+      _wsLastEndReason = '';
+      _wsState = 'connecting';
+      _wsMode = recognitionProcessLocally ? 'on-device (req)' : 'cloud';
+      _ovRenderHeader();
 
       _wsReconnectCount = 0;
       _connectTranslateWs();
@@ -3971,6 +4321,11 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
     });
     document.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.ctrlKey || e.metaKey) && e.code === 'KeyD') {
+        e.preventDefault();
+        toggleDebugOverlay();
+        return;
+      }
       if (!onboardingModal.hidden && e.key === 'Escape') {
         closeOnboarding();
         return;
@@ -3979,6 +4334,28 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         closeSettings();
       }
     });
+
+    if (dbgOverlayClose) {
+      dbgOverlayClose.addEventListener('click', () => setOverlayPreference(false));
+    }
+    if (dbgOverlayClear) {
+      dbgOverlayClear.addEventListener('click', () => {
+        _ovLog.length = 0;
+        if (debugOverlayLog) debugOverlayLog.replaceChildren();
+      });
+    }
+    if (dbgOverlayCopy) {
+      dbgOverlayCopy.addEventListener('click', async () => {
+        const text = _ovLog.map((entry) => `${_ovFmtTime(entry.t)} ${entry.text}`).join('\n');
+        try {
+          await navigator.clipboard.writeText(text);
+          dbgOverlayCopy.textContent = 'copied';
+        } catch (_e) {
+          dbgOverlayCopy.textContent = 'failed';
+        }
+        setTimeout(() => { dbgOverlayCopy.textContent = 'copy'; }, 1200);
+      });
+    }
     settingsForm.addEventListener('submit', (e) => {
       e.preventDefault();
       saveSettingsFromForm();
@@ -4006,9 +4383,16 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       webSpeechLangStatus.textContent = text || '';
     }
 
+    function _wsShowInstall(show, lang) {
+      if (!installWebSpeechModelButton) return;
+      installWebSpeechModelButton.hidden = !show;
+      if (show && lang) installWebSpeechModelButton.dataset.lang = lang;
+    }
+
     async function checkWebSpeechAvailability() {
       if (!SpeechRecognition || typeof SpeechRecognition.available !== 'function') {
         setWebSpeechLangStatus('SpeechRecognition.available() not supported in this browser.');
+        _wsShowInstall(false);
         return;
       }
       const lang = recognitionLangInput.value || recognitionLang;
@@ -4018,14 +4402,52 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
           processLocally: Boolean(processLocallyCheckbox.checked),
         });
         setWebSpeechLangStatus(`Availability for ${lang}: ${result}`);
+        // The on-device model is fetched on demand — offer an explicit install so the
+        // large download is never silent. On-device recognition avoids the network
+        // reconnect that stalls cloud recognition for seconds after each restart.
+        const canInstall = typeof SpeechRecognition.install === 'function';
+        _wsShowInstall(canInstall && result === 'downloadable', lang);
       } catch (e) {
         setWebSpeechLangStatus(`Availability check failed: ${e && e.message ? e.message : String(e)}`);
+        _wsShowInstall(false);
+      }
+    }
+
+    async function installWebSpeechModel() {
+      if (!SpeechRecognition || typeof SpeechRecognition.install !== 'function') {
+        setWebSpeechLangStatus('On-device install not supported in this browser.');
+        return;
+      }
+      const lang =
+        (installWebSpeechModelButton && installWebSpeechModelButton.dataset.lang) ||
+        recognitionLangInput.value ||
+        recognitionLang;
+      if (installWebSpeechModelButton) installWebSpeechModelButton.disabled = true;
+      setWebSpeechLangStatus(`Installing on-device model for ${lang}… (large download)`);
+      try {
+        const ok = await SpeechRecognition.install({ langs: [lang], processLocally: true });
+        if (ok) {
+          setWebSpeechLangStatus(`On-device model ready for ${lang}. Enable "Process locally" to use it.`);
+          _wsShowInstall(false, lang);
+        } else {
+          setWebSpeechLangStatus(`On-device install for ${lang} did not complete.`);
+        }
+      } catch (e) {
+        setWebSpeechLangStatus(`Install failed: ${e && e.message ? e.message : String(e)}`);
+      } finally {
+        if (installWebSpeechModelButton) installWebSpeechModelButton.disabled = false;
       }
     }
 
     if (checkWebSpeechLangButton) {
       checkWebSpeechLangButton.addEventListener('click', () => {
         checkWebSpeechAvailability();
+      });
+    }
+
+    if (installWebSpeechModelButton) {
+      installWebSpeechModelButton.addEventListener('click', () => {
+        installWebSpeechModel();
       });
     }
 
@@ -4061,6 +4483,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
     }
 
     loadDebugPreference();
+    loadOverlayPreference();
     loadSettings();
     // Apply theme early (base.html already does, this keeps the select in sync).
     applyThemePreference(getThemePreference());
@@ -4068,6 +4491,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
     applySettingsToForm();
     applyRecognitionSettings();
     updateTranslationTitles();
+    if (debugOverlayEnabled) showDebugOverlay();
 
     onboardingRequired = !hasSavedLanguageSettings();
     if (onboardingRequired) {
