@@ -1117,7 +1117,10 @@
     // Whisper local (browser ONNX via Transformers.js)
     // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
     const WHISPER_MODEL_KEYS = ['tiny', 'base', 'small', 'large-v3-turbo'];
-    let whisperModel = 'base';
+    // Default to 'small' — 'base' is noticeably weaker for Czech, and 'small' still
+    // runs on CPU. WebGPU users can pick large-v3-turbo for top quality. Only affects
+    // users who haven't already chosen a model (the choice is persisted).
+    let whisperModel = 'small';
     let whisperDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let whisperLocalEngine = null;
     let whisperMediaStream = null;
