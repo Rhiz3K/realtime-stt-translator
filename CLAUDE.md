@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Real-time speech-to-text + translation web app: FastAPI backend, Jinja templates with inline JS/CSS, six switchable STT engines. `AGENTS.md` contains additional agent notes and code-style detail; `CONTRIBUTING.md` has the full workflow.
+Real-time speech-to-text + translation web app: FastAPI backend, Jinja templates with inline JS/CSS, seven switchable STT engines. `AGENTS.md` contains additional agent notes and code-style detail; `CONTRIBUTING.md` has the full workflow.
 
 ## Commands
 
@@ -35,12 +35,13 @@ Commits follow Conventional Commits (`feat(stt): ...`, `fix(ws): ...`). New env 
 
 The entire backend is `app/main.py` (~1500 lines): auth, CSP middleware, HTTP routes, and three WebSocket endpoints. The entire frontend UI is `app/templates/index.html` (~3500 lines of inline JS/CSS) plus the local-Whisper engine in `app/static/whisper/`.
 
-### Six STT engines, two data-flow shapes
+### Seven STT engines, two data-flow shapes
 
 1. **Text-only flow** — STT happens in the browser; the server only translates:
    - **Web Speech**: browser `SpeechRecognition` → text → `/ws`
    - **Whisper (local)**: mic → `pcm-worklet.js` (16 kHz int16 frames) → Silero VAD (`silero-vad.onnx`) segments speech → Transformers.js Whisper ONNX (WebGPU, or WASM/CPU fallback) in `whisper-engine.mjs` → text → `/ws`. Audio never leaves the client.
    - **Nemotron (local)**: mic → `pcm-worklet.js` → `mel.js` log-mel → fp16 cache-aware FastConformer encoder (onnxruntime-web, WebGPU with WASM fallback) + RNN-T greedy decode (`rnnt.js`) in `nemotron-engine.mjs` → text → `/ws`. Streaming, so it emits growing interims and commits a final at end-of-utterance (RMS VAD). Model assets are generated/gitignored (~1.2 GB) — see `app/static/nemotron/README.md`. Audio never leaves the client.
+   - **Parakeet v3 (local)**: mic → `pcm-worklet.js` → `../nemotron/mel.js` log-mel (128-bin) → int8 FastConformer encoder (onnxruntime-web, WebGPU/WASM) + **TDT greedy decode** (`parakeet/tdt.js`, duration head) in `parakeet/parakeet-engine.mjs` → text → `/ws`. Reuses the Nemotron front-end but the export is **offline** (no streaming cache), so it re-encodes the growing buffer per interim and commits a final on RMS-VAD pause. Multilingual incl. Czech. Assets (~930 MB int8) downloaded/gitignored by `scripts/prepare_parakeet_onnx.py`. Audio never leaves the client.
    - **ElevenLabs browser mode**: browser fetches a single-use token via `POST /api/elevenlabs/token`, connects directly to the ElevenLabs WS, sends recognized text to `/ws`.
    - **Azure Speech (browser-direct)**: browser fetches a short-lived token via `POST /api/azure/token` (server mints it from `AZURE_SPEECH_KEY`/`AZURE_SPEECH_REGION`), then the lazily-loaded Azure SpeechSDK (`window.SpeechSDK`) streams mic audio directly to Azure; `recognizing`/`recognized` text → `/ws`. Good Czech quality; free F0 tier.
 

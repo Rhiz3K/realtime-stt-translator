@@ -111,6 +111,14 @@ class _CSPMiddleware(BaseHTTPMiddleware):
                 response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/nemotron/"):
             response.headers["Cache-Control"] = "no-cache"
+        # Parakeet mirrors Nemotron: immutable ~930 MB model weights, revalidated code.
+        elif request.url.path.startswith("/static/parakeet/models/"):
+            if 200 <= response.status_code < 400:
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            else:
+                response.headers["Cache-Control"] = "no-store"
+        elif request.url.path.startswith("/static/parakeet/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
 
@@ -204,7 +212,7 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
 
 # Which STT engines are available to users.  Comma-separated list.
 # Valid values: webspeech, whisper, nemotron, deepgram, elevenlabs, azure.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure"}
+_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure", "parakeet"}
 _raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
 ENABLED_ENGINES: set[str] = {
     e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES

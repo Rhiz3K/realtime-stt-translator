@@ -50,6 +50,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
   | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
   | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); selectable models tiny…large-v3-turbo (~75 MB–800 MB, cached); runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
   | **Nemotron (local)** | Browser | None | On-device streaming ONNX ([nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)) via onnxruntime-web; **WebGPU strongly recommended** (CPU/WASM works but isn't real-time); ~1.2 GB one-time download; model must be built first ([guide](app/static/nemotron/README.md)) |
+  | **Parakeet v3 (local)** | Browser | None | On-device ONNX ([nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), TDT) via onnxruntime-web; multilingual incl. Czech (~11% FLEURS WER); **WebGPU recommended**; ~930 MB int8 one-time download; build assets first with `scripts/prepare_parakeet_onnx.py` |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
 
@@ -91,6 +92,8 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 **Whisper (local)** -- The browser downloads a Whisper model ([onnx-community](https://huggingface.co/onnx-community) ONNX) and runs it on-device via Transformers.js, with [Silero VAD](https://github.com/snakers4/silero-vad) (also in-browser ONNX) segmenting speech from silence. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and otherwise runs on **CPU/WASM** -- multi-threaded when the page is cross-origin isolated (the app sends the required COOP/COEP headers). The backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android), but runs entirely in the browser.
 
 **Nemotron (local)** -- The browser runs NVIDIA's [Nemotron-3.5-ASR streaming](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) model (a cache-aware FastConformer encoder + RNN-T decoder, 40 language-locales) fully on-device via onnxruntime-web. The encoder runs on **WebGPU** (strongly recommended — real-time) with a CPU/WASM fallback that works but isn't real-time for this 600 M model. Because it streams, it shows a growing live transcription and commits a final on each pause; audio never leaves the client, only text goes to `/ws`. The model assets (~1.2 GB fp16) are generated, not committed — build them once with `scripts/prepare_nemotron_onnx.py` (see [app/static/nemotron/README.md](app/static/nemotron/README.md)).
+
+**Parakeet v3 (local)** -- The browser runs NVIDIA's [Parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer encoder + TDT decoder, 25 languages incl. Czech) fully on-device via onnxruntime-web, reusing the Nemotron log-mel front-end. Unlike Nemotron the int8 export is offline, so the engine re-encodes the growing utterance buffer for interims and commits a final on each pause. **WebGPU recommended**; audio never leaves the client, only text goes to `/ws`. The ~930 MB int8 assets are downloaded (not committed) by `scripts/prepare_parakeet_onnx.py`.
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
@@ -177,7 +180,7 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`, `azure`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
+| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `parakeet`, `deepgram`, `elevenlabs`, `azure`. Disabled engines appear grayed out in the UI. (`nemotron`/`parakeet` require building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md) / run `python scripts/prepare_parakeet_onnx.py`.) |
 | `NEMOTRON_AUTO_PREPARE` | No | `true` | When `nemotron` is enabled, create `app/static/nemotron/models` and build missing model assets in the background on container start. First run downloads ~2.6 GB and writes ~1.3 GB. Set `false` if you mount prebuilt assets and do not want automatic generation. |
 | `NEMOTRON_PREPARE_TIMEOUT_SECONDS` | No | `1800` | Timeout for the Nemotron model preparation subprocess. Set `0` to disable, or increase it for slow disks/network. |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |

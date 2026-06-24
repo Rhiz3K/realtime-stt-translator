@@ -468,6 +468,7 @@
               <option value="webspeech" {% if 'webspeech' not in enabled_engines %}disabled{% endif %}>Web Speech{% if 'webspeech' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="whisper" {% if 'whisper' not in enabled_engines %}disabled{% endif %}>Whisper (local){% if 'whisper' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="nemotron" {% if 'nemotron' not in enabled_engines %}disabled{% endif %}>Nemotron (local){% if 'nemotron' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="parakeet" {% if 'parakeet' not in enabled_engines %}disabled{% endif %}>Parakeet v3 (local){% if 'parakeet' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="azure" {% if 'azure' not in enabled_engines %}disabled{% endif %}>Azure Speech{% if 'azure' not in enabled_engines %} (unavailable){% endif %}</option>
@@ -740,6 +741,19 @@
             </div>
           </div>
 
+          <div class="field settings-section-title">Parakeet v3 (local, browser)</div>
+          <div class="form-grid" role="group" aria-label="Parakeet local">
+            <div class="field">
+              <label for="parakeetDevice">Compute backend</label>
+              <select id="parakeetDevice">
+                <option value="auto">Auto (WebGPU if available)</option>
+                <option value="webgpu">WebGPU (GPU)</option>
+                <option value="wasm">CPU (WASM)</option>
+              </select>
+              <p class="hint">Multilingual incl. Czech (~930 MB int8, WebGPU recommended). Build assets first: python scripts/prepare_parakeet_onnx.py. Audio never leaves the client.</p>
+            </div>
+          </div>
+
           <div class="field settings-section-title">Translation</div>
           <div class="form-grid" role="group" aria-label="Translation">
             <div class="field">
@@ -997,6 +1011,7 @@
     const whisperModelInput = document.getElementById('whisperModel');
     const whisperDeviceInput = document.getElementById('whisperDevice');
     const nemotronDeviceInput = document.getElementById('nemotronDevice');
+    const parakeetDeviceInput = document.getElementById('parakeetDevice');
     const checkNemotronWebGpuButton = document.getElementById('checkNemotronWebGpu');
     const nemotronWebGpuDebugStatus = document.getElementById('nemotronWebGpuDebugStatus');
     const nemotronWebGpuDebugOutput = document.getElementById('nemotronWebGpuDebugOutput');
@@ -1151,6 +1166,10 @@
     let nemotronDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
     let nemotronLocalEngine = null;
     let nemotronMediaStream = null;
+
+    let parakeetDevice = 'auto'; // 'auto' | 'webgpu' | 'wasm'
+    let parakeetLocalEngine = null;
+    let parakeetMediaStream = null;
 
     // Remote-provided language list for translation.
     let translateLangChoices = null;
@@ -1673,12 +1692,13 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure', 'parakeet'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
           : enabledEngines.has('whisper') ? 'whisper'
           : enabledEngines.has('nemotron') ? 'nemotron'
+          : enabledEngines.has('parakeet') ? 'parakeet'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
           : enabledEngines.has('azure') ? 'azure'
@@ -1693,6 +1713,7 @@
         deepgram: 'Deepgram Nova-3',
         elevenlabs: 'ElevenLabs Scribe',
         azure: 'Azure Speech',
+        parakeet: 'Parakeet v3 (local)',
       };
       engineBadge.textContent = labels[e] || e;
       document.title = `Live Translator (${engineBadge.textContent})`;
@@ -1704,7 +1725,7 @@
 
       // Local STT engines do not use a server audio stream; hide the WS status badge.
       if (statusIndicator) {
-        statusIndicator.hidden = e === 'webspeech' || e === 'whisper' || e === 'nemotron';
+        statusIndicator.hidden = e === 'webspeech' || e === 'whisper' || e === 'nemotron' || e === 'parakeet';
       }
     }
 
@@ -2455,6 +2476,9 @@
       if (nemotronDeviceInput) {
         nemotronDeviceInput.value = nemotronDevice;
       }
+      if (parakeetDeviceInput) {
+        parakeetDeviceInput.value = parakeetDevice;
+      }
     }
 
     function loadSettings() {
@@ -2503,7 +2527,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure', 'parakeet'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -2545,6 +2569,9 @@
         if (typeof parsed.nemotronDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.nemotronDevice)) {
           nemotronDevice = parsed.nemotronDevice;
         }
+        if (typeof parsed.parakeetDevice === 'string' && ['auto', 'webgpu', 'wasm'].includes(parsed.parakeetDevice)) {
+          parakeetDevice = parsed.parakeetDevice;
+        }
       } catch (_e) {
         // ignore invalid storage
       }
@@ -2580,6 +2607,7 @@
             whisperModel,
             whisperDevice,
             nemotronDevice,
+            parakeetDevice,
           })
         );
       } catch (_e) {
@@ -2654,6 +2682,10 @@
       if (nemotronDeviceInput) {
         const nd = nemotronDeviceInput.value;
         nemotronDevice = ['auto', 'webgpu', 'wasm'].includes(nd) ? nd : 'auto';
+      }
+      if (parakeetDeviceInput) {
+        const pd = parakeetDeviceInput.value;
+        parakeetDevice = ['auto', 'webgpu', 'wasm'].includes(pd) ? pd : 'auto';
       }
 
       persistSettings();
@@ -3389,6 +3421,12 @@
       nemotronMediaStream = null;
     }
 
+    function stopParakeetPipeline() {
+      stopLocalEnginePipeline(parakeetLocalEngine, parakeetMediaStream);
+      parakeetLocalEngine = null;
+      parakeetMediaStream = null;
+    }
+
     // Shared interim/final transcript handler for the browser-local engines.
     // Whisper renders interims but only translates finals; the streaming Nemotron
     // engine additionally translates the (real, growing) interim text, throttled
@@ -3581,6 +3619,31 @@
         setStream: (s) => { nemotronMediaStream = s; },
         startedLog: 'Nemotron local recording started',
         failLabel: 'Nemotron',
+      });
+    }
+
+    function startParakeetRecording() {
+      return startLocalEngineRecording({
+        kind: 'parakeet',
+        loadingMessage: 'Loading Parakeet v3 model (first run downloads ~930 MB; WebGPU recommended)…',
+        progressStatus: true,
+        createEngine: async () => {
+          // ?v= cache-busts the engine module — bump when the engine or its pinned
+          // onnxruntime-web version changes.
+          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=1');
+          return new mod.ParakeetLocalEngine({
+            device: parakeetDevice,
+            language: translateSrc || 'cs',
+            normalize: 'none',
+            onStatus: (status) => { handleLocalEngineStatus(status); },
+            onTranscript: makeLocalTranscriptHandler({ translateInterim: true }),
+          });
+        },
+        getActive: () => parakeetLocalEngine,
+        setActive: (e) => { parakeetLocalEngine = e; },
+        setStream: (s) => { parakeetMediaStream = s; },
+        startedLog: 'Parakeet local recording started',
+        failLabel: 'Parakeet',
       });
     }
 
@@ -4588,6 +4651,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         startAzureRecording();
         return;
       }
+      if (currentEngine === 'parakeet') {
+        startParakeetRecording();
+        return;
+      }
       startWebSpeechRecording();
     }
 
@@ -4618,6 +4685,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       stopDeepgramPipeline();
       stopWhisperPipeline();
       stopNemotronPipeline();
+      stopParakeetPipeline();
       stopAzurePipeline();
 
       // Close direct ElevenLabs WS (browser mode). Detach all handlers first so a
