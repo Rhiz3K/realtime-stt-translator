@@ -388,6 +388,12 @@
       border-color: var(--primary);
     }
 
+    .dbg-btn--active {
+      color: var(--text);
+      border-color: var(--primary);
+      background: color-mix(in srgb, var(--primary) 22%, var(--panel-2));
+    }
+
     .dbg-overlay__metrics {
       display: flex;
       flex-wrap: wrap;
@@ -431,6 +437,18 @@
     .dbg-ts {
       color: var(--muted);
       margin-right: 6px;
+    }
+
+    /* Minimized: collapse to status + ms (hide log and log-only controls). */
+    .dbg-overlay--min {
+      width: auto;
+      max-width: calc(100vw - 24px);
+      max-height: none;
+    }
+
+    .dbg-overlay--min .dbg-overlay__log,
+    .dbg-overlay--min .dbg-min-hide {
+      display: none;
     }
   </style>
 {% endblock %}
@@ -572,8 +590,10 @@
       <span class="dbg-overlay__title">STT debug</span>
       <span id="dbgOvState" class="badge badge--neutral">idle</span>
       <div class="dbg-overlay__actions">
-        <button class="dbg-btn" type="button" id="dbgOverlayClear" title="Clear log">clear</button>
-        <button class="dbg-btn" type="button" id="dbgOverlayCopy" title="Copy log to clipboard">copy</button>
+        <button class="dbg-btn dbg-btn--active dbg-min-hide" type="button" id="dbgOverlayFilter" title="Showing technical events only — click to also show translation/recognized text">tech</button>
+        <button class="dbg-btn dbg-min-hide" type="button" id="dbgOverlayClear" title="Clear log">clear</button>
+        <button class="dbg-btn dbg-min-hide" type="button" id="dbgOverlayCopy" title="Copy log to clipboard">copy</button>
+        <button class="dbg-btn" type="button" id="dbgOverlayMin" title="Minimize to status + ms" aria-label="Minimize debug overlay">▾</button>
         <button class="dbg-btn" type="button" id="dbgOverlayClose" title="Close (Ctrl+Alt+D)" aria-label="Close debug overlay">✕</button>
       </div>
     </div>
@@ -952,6 +972,8 @@
     const dbgOverlayClose = document.getElementById('dbgOverlayClose');
     const dbgOverlayClear = document.getElementById('dbgOverlayClear');
     const dbgOverlayCopy = document.getElementById('dbgOverlayCopy');
+    const dbgOverlayFilter = document.getElementById('dbgOverlayFilter');
+    const dbgOverlayMin = document.getElementById('dbgOverlayMin');
 
     const recognitionLangInput = document.getElementById('recognitionLang');
     const whisperModelInput = document.getElementById('whisperModel');
@@ -1765,17 +1787,37 @@
     // health (state, restart count, gap since last result, mode). The gap is the key
     // freeze indicator: when recognition stalls during a restart it climbs visibly.
     const DEBUG_OVERLAY_STORAGE_KEY = 'srlt_debug_overlay';
+    const DEBUG_OVERLAY_FILTER_KEY = 'srlt_debug_overlay_filter';
+    const DEBUG_OVERLAY_MIN_KEY = 'srlt_debug_overlay_min';
     let debugOverlayEnabled = false;
-    const _ovLog = [];               // {t:number, text:string}
+    let _ovFilter = 'tech';          // 'tech' = technical events only | 'all' = everything
+    let _ovMinimized = false;        // collapsed to status + ms (log hidden)
+    const _ovLog = [];               // {t:number, text:string, cat:'tech'|'data'}
     const _OV_LOG_MAX = 200;
     let _ovTimer = null;
 
     function loadOverlayPreference() {
       try {
         debugOverlayEnabled = localStorage.getItem(DEBUG_OVERLAY_STORAGE_KEY) === '1';
+        _ovFilter = localStorage.getItem(DEBUG_OVERLAY_FILTER_KEY) === 'all' ? 'all' : 'tech';
+        _ovMinimized = localStorage.getItem(DEBUG_OVERLAY_MIN_KEY) === '1';
       } catch (_e) {
         debugOverlayEnabled = false;
       }
+    }
+
+    // Classify a dbg() event by its label. 'data' = verbose recognized/translated text
+    // being sent or received (the noise that buries the freeze signal); 'tech' =
+    // recognition lifecycle, timing, errors, connection. 'tech' mode shows only 'tech'.
+    function _ovCategory(label) {
+      const s = String(label || '');
+      if (/\b(send|recv)\b/.test(s)) return 'data';
+      if (s.indexOf('webspeech:result') === 0 || s.indexOf('webspeech:dedupe-skip') === 0) return 'data';
+      return 'tech';
+    }
+
+    function _ovPassesFilter(cat) {
+      return _ovFilter === 'all' || cat === 'tech';
     }
 
     function _ovFmtTime(ms) {
@@ -1800,10 +1842,11 @@
     }
 
     function _ovPush(args) {
-      const entry = { t: Date.now(), text: _ovFmtArgs(args) };
+      const label = args && args.length ? args[0] : '';
+      const entry = { t: Date.now(), text: _ovFmtArgs(args), cat: _ovCategory(label) };
       _ovLog.push(entry);
       if (_ovLog.length > _OV_LOG_MAX) _ovLog.shift();
-      if (debugOverlayEnabled && debugOverlayLog && !debugOverlay.hidden) {
+      if (debugOverlayEnabled && debugOverlayLog && !debugOverlay.hidden && _ovPassesFilter(entry.cat)) {
         _ovAppendLine(entry);
       }
     }
@@ -1828,7 +1871,9 @@
     function _ovRenderLogFull() {
       if (!debugOverlayLog) return;
       debugOverlayLog.replaceChildren();
-      for (const entry of _ovLog) _ovAppendLine(entry);
+      for (const entry of _ovLog) {
+        if (_ovPassesFilter(entry.cat)) _ovAppendLine(entry);
+      }
       debugOverlayLog.scrollTop = debugOverlayLog.scrollHeight;
     }
 
@@ -1885,6 +1930,8 @@
     function showDebugOverlay() {
       if (!debugOverlay) return;
       debugOverlay.hidden = false;
+      _ovApplyFilterButton();
+      _ovApplyMinimized();
       _ovRenderLogFull();
       _ovRenderHeader();
       _ovStartTicker();
@@ -1910,6 +1957,45 @@
 
     function toggleDebugOverlay() {
       setOverlayPreference(!debugOverlayEnabled);
+    }
+
+    function _ovApplyFilterButton() {
+      if (!dbgOverlayFilter) return;
+      dbgOverlayFilter.textContent = _ovFilter === 'all' ? 'all' : 'tech';
+      dbgOverlayFilter.title = _ovFilter === 'all'
+        ? 'Showing all events — click for technical only'
+        : 'Showing technical events only — click to also show translation/recognized text';
+      dbgOverlayFilter.classList.toggle('dbg-btn--active', _ovFilter === 'tech');
+    }
+
+    function setOverlayFilter(mode) {
+      _ovFilter = mode === 'all' ? 'all' : 'tech';
+      try { localStorage.setItem(DEBUG_OVERLAY_FILTER_KEY, _ovFilter); } catch (_e) { /* no-op */ }
+      _ovApplyFilterButton();
+      _ovRenderLogFull();
+    }
+
+    function toggleOverlayFilter() {
+      setOverlayFilter(_ovFilter === 'tech' ? 'all' : 'tech');
+    }
+
+    function _ovApplyMinimized() {
+      if (!debugOverlay) return;
+      debugOverlay.classList.toggle('dbg-overlay--min', _ovMinimized);
+      if (dbgOverlayMin) {
+        dbgOverlayMin.textContent = _ovMinimized ? '▴' : '▾';
+        dbgOverlayMin.title = _ovMinimized ? 'Expand log' : 'Minimize to status + ms';
+      }
+    }
+
+    function setOverlayMinimized(min) {
+      _ovMinimized = Boolean(min);
+      try { localStorage.setItem(DEBUG_OVERLAY_MIN_KEY, _ovMinimized ? '1' : '0'); } catch (_e) { /* no-op */ }
+      _ovApplyMinimized();
+    }
+
+    function toggleOverlayMinimized() {
+      setOverlayMinimized(!_ovMinimized);
     }
 
     function dbg(...args) {
@@ -4337,6 +4423,12 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
     if (dbgOverlayClose) {
       dbgOverlayClose.addEventListener('click', () => setOverlayPreference(false));
+    }
+    if (dbgOverlayFilter) {
+      dbgOverlayFilter.addEventListener('click', () => toggleOverlayFilter());
+    }
+    if (dbgOverlayMin) {
+      dbgOverlayMin.addEventListener('click', () => toggleOverlayMinimized());
     }
     if (dbgOverlayClear) {
       dbgOverlayClear.addEventListener('click', () => {
