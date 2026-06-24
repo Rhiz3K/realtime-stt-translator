@@ -1059,6 +1059,8 @@
     let _wsLastErrorStr = '';      // last onerror code this session
     let _wsState = 'idle';         // idle|connecting|listening|speech|restarting|backoff|error
     let _wsMode = '';              // 'on-device' | 'cloud' | '' (unknown)
+    let _wsStartRetryId = null;    // pending guarded start() retry after an unexpected failure
+    let _wsBackoffId = null;       // pending flapping-backoff restart timer
 
     // Web Speech API does not expose a public endpointing/pause setting for final results.
     // To get faster updates we translate interim text with a client-side throttle.
@@ -2818,6 +2820,10 @@
           return;
         }
 
+        // Drop the trailing interim of the session that just ended — otherwise it
+        // lingers frozen on screen through the restart dead-air and looks live.
+        removeInterimElement(recognizedContainer);
+
         const now = Date.now();
         // Reset the rapid-restart counter when the session was healthy: it either
         // produced a result since the previous restart (real recognition happened) or
@@ -2841,20 +2847,18 @@
           _wsState = 'backoff';
           dbg('webspeech:backoff', { delayMs: _WS_RESTART_BACKOFF_MS });
           const backoffGen = webSpeechSessionGen;
-          setTimeout(() => {
+          if (_wsBackoffId != null) clearTimeout(_wsBackoffId);
+          _wsBackoffId = setTimeout(() => {
+            _wsBackoffId = null;
             // Skip the deferred restart if Stop or an engine switch happened meanwhile.
             if (currentEngine === 'webspeech' && recordingGeneration === backoffGen && !stopButton.disabled) {
-              try { recognition.start(); } catch (_e) { /* already started */ }
+              _webSpeechSafeStart(1);
             }
           }, _WS_RESTART_BACKOFF_MS);
           return;
         }
 
-        try {
-          recognition.start();
-        } catch (_e) {
-          // InvalidStateError if already started — safe to ignore.
-        }
+        _webSpeechSafeStart(1);
       };
 
       recognition.onerror = (event) => {
@@ -3229,6 +3233,39 @@
     }
 
 
+    // Start recognition defensively. Chrome throws InvalidStateError if a prior
+    // session is still tearing down (rapid Stop→Start, engine switch) — harmless, that
+    // session's onend restarts under the current generation. Any OTHER error means
+    // recognition is NOT running and, left unhandled, would leave the UI claiming to
+    // record while producing nothing — so retry once (guarded by generation), then fail
+    // loudly instead of silently freezing.
+    function _webSpeechSafeStart(retriesLeft) {
+      if (!recognition) return;
+      try {
+        recognition.start();
+      } catch (e) {
+        const name = (e && e.name) ? e.name : String(e);
+        if (name === 'InvalidStateError') {
+          dbg('webspeech:start skipped (already running)', { error: name });
+          return;
+        }
+        dbg('webspeech:start failed', { error: name, retriesLeft });
+        if (retriesLeft > 0) {
+          const gen = webSpeechSessionGen;
+          if (_wsStartRetryId != null) clearTimeout(_wsStartRetryId);
+          _wsStartRetryId = setTimeout(() => {
+            _wsStartRetryId = null;
+            if (currentEngine === 'webspeech' && recordingGeneration === gen && !stopButton.disabled) {
+              _webSpeechSafeStart(retriesLeft - 1);
+            }
+          }, 500);
+        } else {
+          _wsState = 'error';
+          showMessage('Speech recognition could not start. Press Stop and then Start to retry.');
+        }
+      }
+    }
+
     function startWebSpeechRecording() {
       if (!webSpeechSupported || !recognition) {
         showMessage('Your browser does not support the Web Speech API. Switch to Deepgram.');
@@ -3259,12 +3296,16 @@
       _wsLastEndReason = '';
       _wsState = 'connecting';
       _wsMode = recognitionProcessLocally ? 'on-device (req)' : 'cloud';
+      if (_wsStartRetryId != null) { clearTimeout(_wsStartRetryId); _wsStartRetryId = null; }
+      if (_wsBackoffId != null) { clearTimeout(_wsBackoffId); _wsBackoffId = null; }
       _ovRenderHeader();
 
       _wsReconnectCount = 0;
       _connectTranslateWs();
 
-      recognition.start();
+      // Guarded start: a prior session still tearing down (rapid Stop→Start) would make
+      // a bare start() throw and leave the UI "recording" but dead.
+      _webSpeechSafeStart(1);
       console.log('Recording started');
     }
 
@@ -4355,6 +4396,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       // Stop keepalive pings and pending reconnect attempts first,
       // so the onclose handler won't schedule another reconnect.
       _stopWsTimers();
+
+      // Cancel any pending Web Speech restart timers so they can't fire after Stop.
+      if (_wsStartRetryId != null) { clearTimeout(_wsStartRetryId); _wsStartRetryId = null; }
+      if (_wsBackoffId != null) { clearTimeout(_wsBackoffId); _wsBackoffId = null; }
 
       if (recognition) {
         try {
