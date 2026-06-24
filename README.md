@@ -98,6 +98,8 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 **ElevenLabs (browser mode)** -- The browser fetches a single-use token via `POST /api/elevenlabs/token`, connects directly to the ElevenLabs WS, and sends recognized text to `/ws` for translation (same flow as Web Speech).
 
+**Azure AI Speech (browser-direct)** -- The browser fetches a short-lived token via `POST /api/azure/token`, then the Azure SpeechSDK streams mic audio directly to Azure and sends recognized text to `/ws` for translation (same flow as ElevenLabs browser mode). Good Czech support; free **F0** tier ~5 hrs/month.
+
 ## Quick Start
 
 ### Prerequisites
@@ -175,12 +177,14 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
+| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`, `azure`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
 | `NEMOTRON_AUTO_PREPARE` | No | `true` | When `nemotron` is enabled, create `app/static/nemotron/models` and build missing model assets in the background on container start. First run downloads ~2.6 GB and writes ~1.3 GB. Set `false` if you mount prebuilt assets and do not want automatic generation. |
 | `NEMOTRON_PREPARE_TIMEOUT_SECONDS` | No | `1800` | Timeout for the Nemotron model preparation subprocess. Set `0` to disable, or increase it for slow disks/network. |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |
 | `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Internal queue size for Deepgram transcription results. |
 | `ELEVENLABS_API_KEY` | For ElevenLabs | -- | API key from [elevenlabs.io](https://elevenlabs.io/app/settings/api-keys) |
+| `AZURE_SPEECH_KEY` | For Azure | -- | Speech resource key from the [Azure Portal](https://portal.azure.com/). Browser-direct mode; users may also supply their own key in the UI. |
+| `AZURE_SPEECH_REGION` | For Azure | -- | Azure region of the Speech resource (e.g. `westeurope`). Free **F0** tier gives ~5 audio hours/month. |
 
 #### Translation
 

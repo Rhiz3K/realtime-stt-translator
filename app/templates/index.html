@@ -470,6 +470,7 @@
               <option value="nemotron" {% if 'nemotron' not in enabled_engines %}disabled{% endif %}>Nemotron (local){% if 'nemotron' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="deepgram" {% if 'deepgram' not in enabled_engines %}disabled{% endif %}>Deepgram{% if 'deepgram' not in enabled_engines %} (unavailable){% endif %}</option>
               <option value="elevenlabs" {% if 'elevenlabs' not in enabled_engines %}disabled{% endif %}>ElevenLabs{% if 'elevenlabs' not in enabled_engines %} (unavailable){% endif %}</option>
+              <option value="azure" {% if 'azure' not in enabled_engines %}disabled{% endif %}>Azure Speech{% if 'azure' not in enabled_engines %} (unavailable){% endif %}</option>
             </select>
           </div>
           <div class="control">
@@ -827,6 +828,23 @@
             </div>
           </div>
 
+          <div class="field settings-section-title">Azure Speech</div>
+          <div class="form-grid" role="group" aria-label="Azure Speech">
+            <div class="field">
+              <label for="azureRegion">Region</label>
+              <input id="azureRegion" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. westeurope" />
+              <p class="hint">Leave empty to use the server's AZURE_SPEECH_REGION</p>
+            </div>
+            <div class="field">
+              <label for="azureApiKey">API Key (optional)</label>
+              <input id="azureApiKey" type="password" autocomplete="off" placeholder="leave empty to use server key" />
+              <p class="hint">Stored locally, sent to our server only to mint a short-lived token</p>
+            </div>
+            <div class="field">
+              <p class="hint">Recognition language uses the Web Speech API language above (e.g. cs-CZ). Streams directly from the browser; needs a free F0 Azure resource.</p>
+            </div>
+          </div>
+
         </div>
 
         <div class="modal-actions">
@@ -1005,6 +1023,8 @@
     const elevenlabsApiKeyInput = document.getElementById('elevenlabsApiKey');
     const elevenlabsLanguageInput = document.getElementById('elevenlabsLanguage');
     const elevenlabsCommitStrategyInput = document.getElementById('elevenlabsCommitStrategy');
+    const azureRegionInput = document.getElementById('azureRegion');
+    const azureApiKeyInput = document.getElementById('azureApiKey');
 
     const czTitleEl = document.getElementById('czTitle');
     const enTitleEl = document.getElementById('enTitle');
@@ -1112,6 +1132,10 @@
     let elevenlabsApiKey = '';       // user-provided key for browser mode (localStorage only)
     let elevenlabsLanguage = '';
     let elevenlabsCommitStrategy = 'vad';
+
+    // Azure Speech params (browser-direct mode; values are localStorage-only).
+    let azureRegion = '';
+    let azureApiKey = '';
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
 
     // Whisper local (browser ONNX via Transformers.js)
@@ -1649,7 +1673,7 @@
     }
 
     function applyEngineUi(engine) {
-      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(engine) ? engine : 'webspeech';
+      let e = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure'].includes(engine) ? engine : 'webspeech';
       // Fall back to first enabled engine if the selected one is disabled.
       if (!enabledEngines.has(e)) {
         e = enabledEngines.has('webspeech') ? 'webspeech'
@@ -1657,6 +1681,7 @@
           : enabledEngines.has('nemotron') ? 'nemotron'
           : enabledEngines.has('deepgram') ? 'deepgram'
           : enabledEngines.has('elevenlabs') ? 'elevenlabs'
+          : enabledEngines.has('azure') ? 'azure'
           : 'webspeech';
       }
       currentEngine = e;
@@ -1667,6 +1692,7 @@
         nemotron: 'Nemotron (local)',
         deepgram: 'Deepgram Nova-3',
         elevenlabs: 'ElevenLabs Scribe',
+        azure: 'Azure Speech',
       };
       engineBadge.textContent = labels[e] || e;
       document.title = `Live Translator (${engineBadge.textContent})`;
@@ -2417,6 +2443,8 @@
       elevenlabsApiKeyInput.value = elevenlabsApiKey;
       elevenlabsLanguageInput.value = elevenlabsLanguage;
       elevenlabsCommitStrategyInput.value = elevenlabsCommitStrategy;
+      if (azureRegionInput) azureRegionInput.value = azureRegion;
+      if (azureApiKeyInput) azureApiKeyInput.value = azureApiKey;
 
       if (whisperModelInput) {
         whisperModelInput.value = whisperModel;
@@ -2475,7 +2503,7 @@
         }
 
         if (typeof parsed.engine === 'string') {
-          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron'].includes(parsed.engine)
+          currentEngine = ['deepgram', 'elevenlabs', 'whisper', 'nemotron', 'azure'].includes(parsed.engine)
             ? parsed.engine
             : 'webspeech';
         }
@@ -2501,6 +2529,12 @@
         }
         if (typeof parsed.elevenlabsCommitStrategy === 'string') {
           elevenlabsCommitStrategy = parsed.elevenlabsCommitStrategy === 'manual' ? 'manual' : 'vad';
+        }
+        if (typeof parsed.azureRegion === 'string') {
+          azureRegion = parsed.azureRegion;
+        }
+        if (typeof parsed.azureApiKey === 'string') {
+          azureApiKey = parsed.azureApiKey;
         }
         if (typeof parsed.whisperModel === 'string' && WHISPER_MODEL_KEYS.includes(parsed.whisperModel)) {
           whisperModel = parsed.whisperModel;
@@ -2541,6 +2575,8 @@
             elevenlabsApiKey,
             elevenlabsLanguage,
             elevenlabsCommitStrategy,
+            azureRegion,
+            azureApiKey,
             whisperModel,
             whisperDevice,
             nemotronDevice,
@@ -2604,6 +2640,8 @@
       elevenlabsApiKey = (elevenlabsApiKeyInput.value || '').trim();
       elevenlabsLanguage = elevenlabsLanguageInput.value || '';
       elevenlabsCommitStrategy = elevenlabsCommitStrategyInput.value === 'manual' ? 'manual' : 'vad';
+      if (azureRegionInput) azureRegion = azureRegionInput.value.trim();
+      if (azureApiKeyInput) azureApiKey = azureApiKeyInput.value.trim();
 
       if (whisperModelInput) {
         const wm = whisperModelInput.value;
@@ -4357,6 +4395,167 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
     }
 
+    // --- Azure AI Speech (browser-direct) ----------------------------------------
+    // Mirrors the ElevenLabs browser mode: the server mints a short-lived token, the
+    // Azure SpeechSDK streams mic audio directly from the browser, and recognized text
+    // is sent to /ws for translation. Keep AZURE_SDK_VERSION in sync with the CSP entry
+    // in app/main.py (_CSPMiddleware).
+    const AZURE_SDK_VERSION = '1.50.0';
+    let _azureSdkPromise = null;
+    let _azureRecognizer = null;
+
+    function _loadAzureSdk() {
+      if (window.SpeechSDK) return Promise.resolve(window.SpeechSDK);
+      if (_azureSdkPromise) return _azureSdkPromise;
+      _azureSdkPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = `https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@${AZURE_SDK_VERSION}/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js`;
+        s.async = true;
+        s.onload = () => window.SpeechSDK
+          ? resolve(window.SpeechSDK)
+          : reject(new Error('Azure SpeechSDK global missing after load'));
+        s.onerror = () => { _azureSdkPromise = null; reject(new Error('Failed to load Azure SpeechSDK')); };
+        document.head.appendChild(s);
+      });
+      return _azureSdkPromise;
+    }
+
+    function stopAzurePipeline() {
+      if (!_azureRecognizer) return;
+      const reco = _azureRecognizer;
+      _azureRecognizer = null;
+      try {
+        reco.stopContinuousRecognitionAsync(
+          () => { try { reco.close(); } catch (_e) { /* ignore */ } },
+          () => { try { reco.close(); } catch (_e) { /* ignore */ } }
+        );
+      } catch (_e) {
+        try { reco.close(); } catch (_e2) { /* ignore */ }
+      }
+    }
+
+    async function startAzureRecording() {
+      const gen = ++recordingGeneration;
+      clearMessage();
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      setStatus('connecting');
+      resetSessionUi();
+      lastInterimSentText = '';
+      lastInterimSentAtMs = 0;
+      _wsReconnectCount = 0;
+      _connectTranslateWs();
+
+      let SpeechSDK;
+      try {
+        SpeechSDK = await _loadAzureSdk();
+      } catch (_e) {
+        if (recordingGeneration !== gen) return;
+        showMessage('Could not load the Azure Speech SDK (check connection / CSP).');
+        stopRecording();
+        return;
+      }
+      if (recordingGeneration !== gen || stopButton.disabled) return;
+
+      // Mint a short-lived token via our server.
+      let token = '';
+      let region = '';
+      try {
+        const reqBody = {};
+        if (azureApiKey) reqBody.api_key = azureApiKey;
+        if (azureRegion) reqBody.region = azureRegion;
+        dbg('azure:token request', { region: azureRegion || '(server)' });
+        const r = await fetch('/api/azure/token', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+        if (!r.ok) {
+          let detail = 'Azure token request failed (' + r.status + ')';
+          try { const j = await r.json(); if (j && j.detail) detail = j.detail; } catch (_e) { /* ignore */ }
+          throw new Error(detail);
+        }
+        const data = await r.json();
+        token = data.token;
+        region = data.region;
+      } catch (e) {
+        if (recordingGeneration !== gen) return;
+        showMessage(String(e && e.message ? e.message : e));
+        stopRecording();
+        return;
+      }
+      if (recordingGeneration !== gen || stopButton.disabled) return;
+
+      try {
+        const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
+        speechConfig.speechRecognitionLanguage = recognitionLang || 'cs-CZ';
+        if (SpeechSDK.Recognizer && typeof SpeechSDK.Recognizer.enableTelemetry === 'function') {
+          try { SpeechSDK.Recognizer.enableTelemetry(false); } catch (_e) { /* ignore */ }
+        }
+        const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+        const reco = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+        _azureRecognizer = reco;
+
+        reco.recognizing = (s, e) => {
+          if (recordingGeneration !== gen) return;
+          const text = (e.result && e.result.text) ? e.result.text : '';
+          if (_sttTtfbMs == null) { _sttTtfbMs = performance.now() - _sessionStartPerf; updateStatsBar(); }
+          dbg('azure:recognizing', { len: text.length });
+          if (!text) return;
+          removeInterimElement(recognizedContainer);
+          showInterim(recognizedContainer, text);
+          const now = Date.now();
+          if (socket && socket.readyState === WebSocket.OPEN && translateInterimEnabled
+              && text !== lastInterimSentText && now - lastInterimSentAtMs >= interimSendIntervalMs) {
+            lastInterimSentText = text;
+            lastInterimSentAtMs = now;
+            sendTranslateWsMessage('interim', text);
+          }
+        };
+
+        reco.recognized = (s, e) => {
+          if (recordingGeneration !== gen) return;
+          if (!e.result || e.result.reason !== SpeechSDK.ResultReason.RecognizedSpeech) return;
+          const text = (e.result.text || '').trim();
+          dbg('azure:recognized', { len: text.length });
+          if (!text) return;
+          removeInterimElement(recognizedContainer);
+          czSegmentCount++;
+          addSegment(recognizedContainer, czSegmentCount, text);
+          sendTranslateWsMessage('final', text);
+          lastInterimSentText = '';
+          lastInterimSentAtMs = 0;
+        };
+
+        reco.canceled = (s, e) => {
+          if (recordingGeneration !== gen) return;
+          const isErr = e && SpeechSDK.CancellationReason && e.reason === SpeechSDK.CancellationReason.Error;
+          dbg('azure:canceled', { reason: String(e && e.reason), err: String((e && e.errorDetails) || '') });
+          if (isErr) {
+            showMessage('Azure recognition error: ' + ((e && e.errorDetails) || 'canceled'));
+            setStatus('error');
+          }
+        };
+
+        reco.sessionStopped = () => {
+          if (recordingGeneration !== gen) return;
+          dbg('azure:sessionStopped');
+        };
+
+        reco.startContinuousRecognitionAsync(
+          () => { if (recordingGeneration === gen) { setStatus('connected'); dbg('azure:started', { lang: recognitionLang, region }); } },
+          (err) => { if (recordingGeneration !== gen) return; showMessage('Azure start failed: ' + err); stopRecording(); }
+        );
+      } catch (e) {
+        if (recordingGeneration !== gen) return;
+        showMessage('Azure recognizer error: ' + (e && e.message ? e.message : e));
+        stopRecording();
+        return;
+      }
+      console.log('Recording started (azure)');
+    }
+
     function startRecording() {
       if (onboardingRequired) {
         openOnboarding();
@@ -4383,6 +4582,10 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
       if (currentEngine === 'nemotron') {
         startNemotronRecording();
+        return;
+      }
+      if (currentEngine === 'azure') {
+        startAzureRecording();
         return;
       }
       startWebSpeechRecording();
@@ -4415,6 +4618,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       stopDeepgramPipeline();
       stopWhisperPipeline();
       stopNemotronPipeline();
+      stopAzurePipeline();
 
       // Close direct ElevenLabs WS (browser mode). Detach all handlers first so a
       // message/close event already queued for it can't fire into the next session.

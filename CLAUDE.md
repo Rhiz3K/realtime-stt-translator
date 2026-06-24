@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Real-time speech-to-text + translation web app: FastAPI backend, Jinja templates with inline JS/CSS, five switchable STT engines. `AGENTS.md` contains additional agent notes and code-style detail; `CONTRIBUTING.md` has the full workflow.
+Real-time speech-to-text + translation web app: FastAPI backend, Jinja templates with inline JS/CSS, six switchable STT engines. `AGENTS.md` contains additional agent notes and code-style detail; `CONTRIBUTING.md` has the full workflow.
 
 ## Commands
 
@@ -35,13 +35,14 @@ Commits follow Conventional Commits (`feat(stt): ...`, `fix(ws): ...`). New env 
 
 The entire backend is `app/main.py` (~1500 lines): auth, CSP middleware, HTTP routes, and three WebSocket endpoints. The entire frontend UI is `app/templates/index.html` (~3500 lines of inline JS/CSS) plus the local-Whisper engine in `app/static/whisper/`.
 
-### Five STT engines, two data-flow shapes
+### Six STT engines, two data-flow shapes
 
 1. **Text-only flow** — STT happens in the browser; the server only translates:
    - **Web Speech**: browser `SpeechRecognition` → text → `/ws`
    - **Whisper (local)**: mic → `pcm-worklet.js` (16 kHz int16 frames) → Silero VAD (`silero-vad.onnx`) segments speech → Transformers.js Whisper ONNX (WebGPU, or WASM/CPU fallback) in `whisper-engine.mjs` → text → `/ws`. Audio never leaves the client.
    - **Nemotron (local)**: mic → `pcm-worklet.js` → `mel.js` log-mel → fp16 cache-aware FastConformer encoder (onnxruntime-web, WebGPU with WASM fallback) + RNN-T greedy decode (`rnnt.js`) in `nemotron-engine.mjs` → text → `/ws`. Streaming, so it emits growing interims and commits a final at end-of-utterance (RMS VAD). Model assets are generated/gitignored (~1.2 GB) — see `app/static/nemotron/README.md`. Audio never leaves the client.
    - **ElevenLabs browser mode**: browser fetches a single-use token via `POST /api/elevenlabs/token`, connects directly to the ElevenLabs WS, sends recognized text to `/ws`.
+   - **Azure Speech (browser-direct)**: browser fetches a short-lived token via `POST /api/azure/token` (server mints it from `AZURE_SPEECH_KEY`/`AZURE_SPEECH_REGION`), then the lazily-loaded Azure SpeechSDK (`window.SpeechSDK`) streams mic audio directly to Azure; `recognizing`/`recognized` text → `/ws`. Good Czech quality; free F0 tier.
 
 2. **Audio-proxy flow** — browser streams raw PCM (16-bit, 16 kHz, mono) to the server, which proxies to a vendor STT API and translates results:
    - **`/ws/deepgram`**: Deepgram SDK live connection. The SDK callback runs in a separate listener thread; results cross into asyncio via `event_loop.call_soon_threadsafe` into a bounded `asyncio.Queue` (drops interim results when full, prefers keeping finals — preserve this bounding behavior). Shutdown drains the queue within a grace deadline.
@@ -77,6 +78,7 @@ These pairs must change together:
 - **Nemotron engine**: the onnxruntime-web version is pinned in *both* the CSP in `app/main.py` (`_CSPMiddleware`) and `nemotron-engine.mjs` (import URL + `env.wasm.wasmPaths`); bump the `?v=N` on the `nemotron-engine.mjs` import in `index.html` when changing it. The fp16 model in `app/static/nemotron/models/` is gitignored and rebuilt by `scripts/prepare_nemotron_onnx.py` (`requirements-nemotron-prep.txt`). The encoder is uniformly fp16 (JS feeds fp16 via `f16.js`); `decoder_joint.onnx` stays fp32 on WASM. `mel.js` must stay numerically in sync with `scripts/nemotron_reference.py` (validated by `scripts/validate_mel.mjs`).
 - **PCM framing**: `FRAME_SAMPLES = 512` in `pcm-worklet.js` matches the VAD timing constants (~32 ms/frame at 16 kHz) in `whisper-engine.mjs`.
 - **Engine names**: `_ALL_ENGINES` / `ENABLED_ENGINES` in `main.py` ↔ engine dropdown and gating logic in `index.html` (template receives `enabled_engines`).
+- **Azure Speech SDK version**: pinned in *both* the CSP `script-src` in `app/main.py` (`_CSPMiddleware`, the `azure_sdk` jsDelivr URL) and `AZURE_SDK_VERSION` in `index.html`. A mismatch means the CSP silently blocks the SDK script fetch. Azure's `connect-src` (`wss://*.stt.speech.microsoft.com`, `https://*.api.cognitive.microsoft.com`) also lives in that CSP.
 
 ## Conventions that matter here
 

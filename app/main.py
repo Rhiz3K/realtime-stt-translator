@@ -74,14 +74,18 @@ class _CSPMiddleware(BaseHTTPMiddleware):
             "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/ "
             "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/"
         )
+        # Azure AI Speech browser SDK (loaded only for the 'azure' engine). The
+        # version here must match the one index.html loads (see AZURE_SDK_VERSION).
+        azure_sdk = "https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.50.0/"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            f"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: {jsdelivr}; "
+            f"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: {jsdelivr} {azure_sdk}; "
             "worker-src 'self' blob:; "
             "style-src 'self' 'unsafe-inline'; "
             f"connect-src 'self' wss://api.elevenlabs.io {jsdelivr} "
             "https://huggingface.co https://cdn-lfs.huggingface.co "
-            "https://cas-bridge.xethub.hf.co; "
+            "https://cas-bridge.xethub.hf.co "
+            "wss://*.stt.speech.microsoft.com https://*.api.cognitive.microsoft.com; "
             "img-src 'self' data:; "
             "frame-ancestors 'none'"
         )
@@ -192,9 +196,15 @@ DEEPGRAM_RESULT_QUEUE_SIZE = _env_int("DEEPGRAM_RESULT_QUEUE_SIZE", 100)
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
+# Azure AI Speech (browser-direct mode): the server only mints a short-lived
+# auth token; the browser SpeechSDK does the streaming. Region must match the
+# resource (e.g. "westeurope"). Free F0 tier gives ~5 audio hours/month.
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
+
 # Which STT engines are available to users.  Comma-separated list.
-# Valid values: webspeech, whisper, nemotron, deepgram, elevenlabs.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs"}
+# Valid values: webspeech, whisper, nemotron, deepgram, elevenlabs, azure.  Default: webspeech only.
+_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure"}
 _raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
 ENABLED_ENGINES: set[str] = {
     e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES
@@ -207,6 +217,11 @@ if "elevenlabs" in ENABLED_ENGINES and not ELEVENLABS_API_KEY:
     logging.warning(
         "Engine 'elevenlabs' is enabled but ELEVENLABS_API_KEY is not set. "
         "Server-side mode will fail; browser mode requires users to provide their own key."
+    )
+if "azure" in ENABLED_ENGINES and not (AZURE_SPEECH_KEY and AZURE_SPEECH_REGION):
+    logging.warning(
+        "Engine 'azure' is enabled but AZURE_SPEECH_KEY / AZURE_SPEECH_REGION are not set. "
+        "Token minting will fail until both are configured (or the client supplies its own)."
     )
 
 MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH", 5000)
@@ -534,6 +549,63 @@ async def api_elevenlabs_token(request: Request):
         raise HTTPException(status_code=e.response.status_code, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to create token: {e}")
+
+
+def _valid_azure_region(region: str) -> bool:
+    # Region is interpolated into the token URL host — restrict to the Azure
+    # region charset to prevent SSRF/host injection.
+    return bool(region) and len(region) <= 40 and all(c.isalnum() or c == "-" for c in region)
+
+
+@app.post("/api/azure/token")
+async def api_azure_token(request: Request):
+    """Mint a short-lived Azure AI Speech auth token for browser-side recognition.
+
+    The client may supply its own ``api_key``/``region`` in the JSON body;
+    otherwise the server-side ``AZURE_SPEECH_KEY`` / ``AZURE_SPEECH_REGION`` are
+    used. Azure's issueToken returns the token as plain text, valid ~10 minutes;
+    the browser SpeechSDK consumes it via ``fromAuthorizationToken``.
+    """
+    _require_http_auth(request)
+
+    body: dict = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    api_key = ""
+    region = ""
+    if isinstance(body, dict):
+        if isinstance(body.get("api_key"), str):
+            api_key = body["api_key"].strip()
+        if isinstance(body.get("region"), str):
+            region = body["region"].strip()
+    api_key = api_key or AZURE_SPEECH_KEY
+    region = region or AZURE_SPEECH_REGION
+
+    if not api_key or not region:
+        raise HTTPException(status_code=400, detail="Azure Speech key/region not configured")
+    if not _valid_azure_region(region):
+        raise HTTPException(status_code=400, detail="Invalid Azure region")
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
+                headers={"Ocp-Apim-Subscription-Key": api_key, "Content-Length": "0"},
+            )
+            resp.raise_for_status()
+            return {"token": resp.text, "region": region}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Azure token error: {e.response.status_code}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to create Azure token: {e}")
 
 
 @app.post("/login")
