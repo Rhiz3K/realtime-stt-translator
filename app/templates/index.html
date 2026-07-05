@@ -1675,8 +1675,11 @@
                 return null;
               }
               const boostRaw = (parts[1] || '').trim();
-              const boost = boostRaw ? Number.parseFloat(boostRaw) : 1.0;
-              return new window.SpeechRecognitionPhrase(phrase, Number.isFinite(boost) ? boost : 1.0);
+              const parsedBoost = boostRaw ? Number.parseFloat(boostRaw) : 1.0;
+              // SpeechRecognitionPhrase throws outside [0, 10] and one bad line
+              // would silently drop the whole list, so clamp instead.
+              const boost = Number.isFinite(parsedBoost) ? Math.min(10, Math.max(0, parsedBoost)) : 1.0;
+              return new window.SpeechRecognitionPhrase(phrase, boost);
             })
             .filter(Boolean);
 
@@ -2322,7 +2325,9 @@
 
     function populateSettingsLanguageLists() {
       // Web Speech language list: there is no standard API to enumerate supported
-      // recognition languages, so we build a broad list from Intl + browser prefs.
+      // recognition languages (Intl.supportedValuesOf has no 'language' key), so we
+      // merge the browser's preferred languages with a curated list of locales
+      // commonly supported by speech recognition backends.
       const preferred = [];
       try {
         if (Array.isArray(navigator.languages)) {
@@ -2335,14 +2340,15 @@
         // no-op
       }
 
-      let langSubtags = [];
-      try {
-        if (typeof Intl !== 'undefined' && typeof Intl.supportedValuesOf === 'function') {
-          langSubtags = Intl.supportedValuesOf('language') || [];
-        }
-      } catch (_e) {
-        // no-op
-      }
+      const curatedRecoLangs = [
+        'ar-SA', 'bg-BG', 'ca-ES', 'cs-CZ', 'da-DK', 'de-DE', 'el-GR',
+        'en-AU', 'en-CA', 'en-GB', 'en-IN', 'en-US', 'es-ES', 'es-MX',
+        'fi-FI', 'fr-CA', 'fr-FR', 'he-IL', 'hi-IN', 'hr-HR', 'hu-HU',
+        'id-ID', 'it-IT', 'ja-JP', 'ko-KR', 'lt-LT', 'lv-LV', 'nb-NO',
+        'nl-NL', 'pl-PL', 'pt-BR', 'pt-PT', 'ro-RO', 'ru-RU', 'sk-SK',
+        'sl-SI', 'sr-RS', 'sv-SE', 'th-TH', 'tr-TR', 'uk-UA', 'vi-VN',
+        'zh-CN', 'zh-TW',
+      ];
 
       const displayNames =
         typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function'
@@ -2353,18 +2359,7 @@
         new Set([
           ...preferred,
           recognitionLang,
-          ...langSubtags,
-          // keep a few common region tags visible
-          'cs-CZ',
-          'en-US',
-          'en-GB',
-          'de-DE',
-          'fr-FR',
-          'es-ES',
-          'it-IT',
-          'pl-PL',
-          'uk-UA',
-          'ru-RU',
+          ...curatedRecoLangs,
         ])
       )
         .filter((c) => typeof c === 'string' && c.trim())
@@ -2766,7 +2761,8 @@
 
       recognition.onresult = (event) => {
         // recognition is bound once and outlives a session; drop events from a
-        // session that was stopped or switched away (stop() emits a trailing final).
+        // session that was stopped or switched away (an onresult may already be
+        // queued when Stop aborts the session).
         if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
           return;
         }
@@ -2951,6 +2947,27 @@
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           console.error('Speech recognition permission denied:', event.error);
           showMessage('Permission to use microphone is denied. Allow microphone access and try again.');
+          stopRecording();
+          return;
+        }
+
+        // Permanent-config errors — a restart can never fix these, so letting the
+        // onend auto-restart run would loop start→error→end forever with no
+        // user-visible message (only the debug overlay would show the reason).
+        if (event.error === 'language-not-supported') {
+          console.error('Speech recognition language not supported:', recognitionLang);
+          showMessage(
+            'Speech recognition does not support the selected language (' + recognitionLang + ').' +
+            (recognitionProcessLocally
+              ? ' Install the on-device model in Settings ("Check language availability") or disable "Process locally".'
+              : ' Choose a different recognition language in Settings.')
+          );
+          stopRecording();
+          return;
+        }
+        if (event.error === 'phrases-not-supported') {
+          console.error('Speech recognition context phrases not supported by this recognizer');
+          showMessage('Context phrases are not supported by this recognizer. Clear the phrases field in Settings (or try "Process locally").');
           stopRecording();
           return;
         }
@@ -3346,7 +3363,7 @@
       }
 
       // Claim a new generation so stale onresult/onend events from a prior session
-      // (or from the trailing final that stop() emits) are ignored.
+      // (or ones already queued when Stop aborted it) are ignored.
       webSpeechSessionGen = ++recordingGeneration;
 
       applyRecognitionSettings();
@@ -4662,8 +4679,8 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       // Invalidate the current recording session up front: any in-flight async
       // callback (Web Speech onresult/onend, remote socket.onopen, local transcript
       // handler) will then see a changed generation and drop its event instead of
-      // leaking into the next session. Must precede recognition.stop()/socket.close()
-      // below, since those can trigger a trailing onresult/onend.
+      // leaking into the next session. Must precede recognition.abort()/socket.close()
+      // below, since those can trigger a trailing onend (or an already-queued onresult).
       recordingGeneration++;
 
       // Stop keepalive pings and pending reconnect attempts first,
@@ -4673,10 +4690,17 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       // Cancel any pending Web Speech restart timers so they can't fire after Stop.
       if (_wsStartRetryId != null) { clearTimeout(_wsStartRetryId); _wsStartRetryId = null; }
       if (_wsBackoffId != null) { clearTimeout(_wsBackoffId); _wsBackoffId = null; }
+      // onend can't reset this after Stop (the generation is already bumped, so it
+      // takes the stale-session branch), so reset the overlay state badge here.
+      _wsState = 'idle';
 
       if (recognition) {
         try {
-          recognition.stop();
+          // abort(), not stop(): stop() keeps the session alive while the cloud
+          // flushes a trailing final — on a rapid Stop→Start the generations
+          // re-align and that stale final would leak into the fresh session.
+          // abort() discards pending results and tears down immediately.
+          recognition.abort();
         } catch (_e) {
           // no-op
         }
