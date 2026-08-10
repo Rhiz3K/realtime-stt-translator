@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ID = "nasedkinpv/parakeet-tdt-0.6b-v3-onnx-int8"
 # Pinned for the same reason as the Nemotron prep script: a community repo feeding
 # an auto-prepare path must not change under us. To move the pin:
-# `HfApi().repo_info(REPO_ID).sha`, bump, then re-run `--inspect` and re-verify I/O.
+# `HfApi().repo_info(REPO_ID).sha`, bump, then re-run `--inspect-only` and re-verify I/O.
 REVISION = "f27d0efd32282dcb8124a4ddd2e09ce42eca03c6"
 ENCODER = "encoder-int8.onnx"
 ENCODER_DATA = "encoder-int8.onnx.data"
@@ -124,10 +124,22 @@ def install(src: Path) -> None:
         print(f"      {f:28s} {_human(dst.stat().st_size)}")
 
 
+def _sweep_stale_temporaries() -> None:
+    """Remove `.tmp` debris from a run that was killed mid-write (SIGKILL/OOM),
+    which try/finally cannot clean up. These are hundreds of MB each."""
+    if not OUT_DIR.exists():
+        return
+    for leftover in sorted(OUT_DIR.glob("*.tmp")):
+        print(f"  removing stale temporary {leftover.name}")
+        leftover.unlink(missing_ok=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--inspect-only", action="store_true", help="download only the small graph files, print I/O, then stop")
     args = ap.parse_args()
+
+    _sweep_stale_temporaries()
 
     if args.inspect_only:
         src = download(INSPECT_FILES)

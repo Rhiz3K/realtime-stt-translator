@@ -425,7 +425,12 @@ def verify_auth_token(token: str | None) -> bool:
 
 
 def sanitize_next_path(next_path: str | None) -> str:
+    # Only same-site absolute paths. "//host" is protocol-relative, and browsers
+    # normalize backslashes to slashes in Location, so "/\host" is too — both would
+    # turn a post-login redirect into an off-site one.
     if not next_path or not next_path.startswith("/") or next_path.startswith("//"):
+        return "/"
+    if "\\" in next_path or any(c < " " or c == "\x7f" for c in next_path):
         return "/"
     return next_path
 
@@ -624,7 +629,11 @@ def _check_login_rate_limit(client_ip: str) -> bool:
     attempts = _LOGIN_ATTEMPTS.get(client_ip, [])
     # Prune old entries.
     attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
-    _LOGIN_ATTEMPTS[client_ip] = attempts
+    if attempts:
+        _LOGIN_ATTEMPTS[client_ip] = attempts
+    else:
+        # Drop the key entirely, or a scanner walking IPs grows this dict forever.
+        _LOGIN_ATTEMPTS.pop(client_ip, None)
     return len(attempts) < _LOGIN_MAX_ATTEMPTS
 
 
@@ -1289,13 +1298,26 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             dg_socket.on(EventType.CLOSE, on_close)
             
             # Spustit poslouchání v samostatném vlákně
+            def _notify_listener_failure(message: str) -> None:
+                async_stop_event.set()
+
+                async def _send() -> None:
+                    try:
+                        await _send_browser({"error": f"Deepgram listener stopped: {message}"})
+                    except Exception as send_err:
+                        logging.debug(f"Nelze poslat Deepgram listener error: {send_err}")
+
+                asyncio.create_task(_send())
+
             def listen_thread_func():
                 try:
                     dg_socket.start_listening()
                 except Exception as e:
                     logging.error(f"Listen thread error: {e}")
                     stop_event.set()
-                    event_loop.call_soon_threadsafe(async_stop_event.set)
+                    # Tell the browser too. Without this the session just goes quiet:
+                    # no transcripts, no error, and the UI keeps claiming to record.
+                    event_loop.call_soon_threadsafe(_notify_listener_failure, str(e))
             
             listen_thread = threading.Thread(target=listen_thread_func, daemon=True)
             listen_thread.start()

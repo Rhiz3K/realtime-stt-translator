@@ -5,6 +5,5 @@
 huggingface_hub==1.19.0
 onnx==1.22.0
 onnxruntime==1.27.0
-onnxconverter-common==1.16.0
 sentencepiece==0.2.1
 numpy==2.4.6

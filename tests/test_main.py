@@ -889,6 +889,12 @@ def test_translate_languages_requires_auth_and_returns_sorted_choices(client):
         ("", "/"),
         ("https://evil.example", "/"),
         ("//evil.example", "/"),
+        # Browsers normalize "\" to "/" in Location, so these are protocol-relative too.
+        ("/\\evil.example", "/"),
+        ("/\\\\evil.example", "/"),
+        ("\\/evil.example", "/"),
+        # A newline would let the value split the redirect header.
+        ("/safe\r\nX-Injected: 1", "/"),
         ("/safe/path?x=1", "/safe/path?x=1"),
     ],
 )
@@ -1789,3 +1795,35 @@ def test_ws_supports_a_synchronous_translator(client, monkeypatch):
 
     assert data["translations"] == {"en": "en:Ahoj"}
     assert calls and calls[0][:3] == ("Ahoj", "cs", "en")
+
+
+def test_ws_deepgram_listener_crash_is_reported_to_the_browser(client, monkeypatch):
+    """A dead listener thread must not leave the UI recording into a void."""
+    monkeypatch.setattr(main, "DEEPGRAM_API_KEY", "test-key")
+
+    class ExplodingDgSocket:
+        def on(self, event_type, callback):
+            pass
+
+        def start_listening(self):
+            raise RuntimeError("listener died")
+
+        def send_media(self, data):
+            pass
+
+        def send_finalize(self, _message=None):
+            pass
+
+        def send_close_stream(self, _message=None):
+            pass
+
+    monkeypatch.setattr(main, "DeepgramClient", _deepgram_client_for(ExplodingDgSocket()))
+    client.post("/login", data={"password": "test-password", "next": "/deepgram"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
+        ws.send_bytes(b"\x00\x01")
+        data = ws.receive_json()
+
+    # Typeless error -> the browser stops the session instead of hanging.
+    assert "type" not in data
+    assert "listener died" in data["error"]

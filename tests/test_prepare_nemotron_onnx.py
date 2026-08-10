@@ -61,3 +61,22 @@ def test_nemotron_download_pins_the_model_revision(tmp_path, monkeypatch):
     assert prepare.download() == snapshot / prepare.SUBDIR
     assert seen["revision"] == prepare.REVISION
     assert seen["repo_id"] == prepare.REPO_ID
+
+
+def test_nemotron_sweeps_temporaries_and_the_fp32_working_copy(tmp_path, monkeypatch):
+    output = tmp_path / "models"
+    output.mkdir()
+    stale_tmp = output / "encoder_fp16.onnx.data.tmp"
+    stale_tmp.write_bytes(b"partial")
+    workdir = output / "_fp32tmp"
+    workdir.mkdir()
+    (workdir / "encoder.onnx").write_bytes(b"2.3 GB stand-in")
+    keeper = output / "config.json"
+    keeper.write_bytes(b"{}")
+    monkeypatch.setattr(prepare, "OUT_DIR", output)
+
+    prepare._sweep_stale_temporaries()
+
+    assert not stale_tmp.exists()
+    assert not workdir.exists()
+    assert keeper.read_bytes() == b"{}"

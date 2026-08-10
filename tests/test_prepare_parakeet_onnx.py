@@ -93,3 +93,24 @@ def test_parakeet_install_rejects_an_empty_downloaded_asset(tmp_path, monkeypatc
     # The good copy survives a truncated download.
     assert destination.read_bytes() == b"previous-complete-model"
     assert not (output / f"{prepare.ENCODER}.tmp").exists()
+
+
+def test_parakeet_sweeps_temporaries_left_by_a_killed_run(tmp_path, monkeypatch, capsys):
+    """SIGKILL/OOM leaves .tmp files behind; try/finally can't clean those up."""
+    output = tmp_path / "output"
+    output.mkdir()
+    stale = output / f"{prepare.ENCODER_DATA}.tmp"
+    stale.write_bytes(b"half a download")
+    keeper = output / prepare.VOCAB
+    keeper.write_bytes(b"real asset")
+    monkeypatch.setattr(prepare, "OUT_DIR", output)
+
+    prepare._sweep_stale_temporaries()
+
+    assert not stale.exists()
+    assert keeper.read_bytes() == b"real asset"
+
+
+def test_parakeet_sweep_is_a_noop_without_an_output_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(prepare, "OUT_DIR", tmp_path / "never-created")
+    prepare._sweep_stale_temporaries()  # must not raise

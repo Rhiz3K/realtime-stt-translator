@@ -317,6 +317,11 @@ def convert_encoder_fp16(src: Path) -> None:
                     offset += len(raw)
             f.flush()
             os.fsync(f.fileno())
+        # Drop the old graph first: it indexes the OLD weight offsets. If we die
+        # between these two lines, the graph is simply missing and the next run
+        # rebuilds — far better than a new .data paired with a stale graph, which
+        # is non-empty on both sides and so passes every "is it there?" check.
+        out_onnx.unlink(missing_ok=True)
         os.replace(data_temporary, data_destination)
     finally:
         data_temporary.unlink(missing_ok=True)
@@ -372,10 +377,30 @@ def extract_vocab(src: Path) -> None:
     print(f"      sample pieces: {pieces[:5]} … unk={sp.id_to_piece(sp.unk_id())!r}")
 
 
+def _sweep_stale_temporaries() -> None:
+    """Remove debris from a run that was killed mid-write.
+
+    try/finally cleans up after exceptions but not after SIGKILL/OOM, and this
+    script writes multi-GB temporaries — left behind they make the retry likelier
+    to hit ENOSPC, and `_fp32tmp` alone is ~2.3 GB.
+    """
+    if not OUT_DIR.exists():
+        return
+    for leftover in sorted(OUT_DIR.glob("*.tmp")):
+        print(f"      removing stale temporary {leftover.name}")
+        leftover.unlink(missing_ok=True)
+    stale_workdir = OUT_DIR / "_fp32tmp"
+    if stale_workdir.is_dir():
+        print("      removing stale fp32 working copy (_fp32tmp)")
+        shutil.rmtree(stale_workdir, ignore_errors=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inspect-only", action="store_true", help="download + print ONNX I/O, then stop")
     args = ap.parse_args()
+
+    _sweep_stale_temporaries()
 
     if not args.inspect_only and _write_missing_concat_variants_from_existing():
         print(f"\nDone. Assets in {OUT_DIR.relative_to(ROOT)}/:")
