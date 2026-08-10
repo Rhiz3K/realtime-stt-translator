@@ -109,7 +109,14 @@ def install(src: Path) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for f in ALL_FILES:
         dst = OUT_DIR / f
-        shutil.copyfile(src / f, dst)
+        tmp = dst.with_name(dst.name + ".tmp")
+        try:
+            shutil.copyfile(src / f, tmp)
+            if tmp.stat().st_size == 0:
+                raise RuntimeError(f"Downloaded model asset is empty: {f}")
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
         print(f"      {f:28s} {_human(dst.stat().st_size)}")
 
 

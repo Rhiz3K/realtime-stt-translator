@@ -13,6 +13,16 @@ def test_required_model_files_include_webgpu_concat_variants():
     assert "encoder_fp16.onnx.data" in REQUIRED_MODEL_FILES
 
 
+def test_zero_length_model_file_is_treated_as_missing(tmp_path: Path):
+    from app.nemotron_assets import REQUIRED_MODEL_FILES, missing_model_files
+
+    for name in REQUIRED_MODEL_FILES:
+        (tmp_path / name).write_text("ok")
+    (tmp_path / "encoder_fp16.onnx.data").write_bytes(b"")
+
+    assert missing_model_files(tmp_path) == ["encoder_fp16.onnx.data"]
+
+
 def test_ensure_nemotron_assets_skips_when_engine_disabled(tmp_path: Path):
     from app.nemotron_assets import ensure_nemotron_assets
 

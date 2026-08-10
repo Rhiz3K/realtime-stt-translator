@@ -119,6 +119,7 @@ const MIN_SPEECH_FRAMES = 8;        // ignore sub-256 ms blips
 const PRE_ROLL_FRAMES = 8;          // lead-in kept from just before speech onset
 const MAX_UTT_SAMPLES = 20 * SR;    // hard cap (~20 s) -> force a final
 const INTERIM_MIN_NEW_SAMPLES = Math.floor(1.2 * SR); // re-encode for interims at most ~every 1.2 s
+const MAX_PENDING_FINALS = 8;
 
 function rmsNorm(int16) {
   let s = 0;
@@ -143,19 +144,24 @@ export class ParakeetLocalEngine {
     this._ctx = null;
     this._node = null;
     this._stream = null;
+    this._lifecycle = 0;
     this._resetUtterance();
   }
 
-  _resetUtterance() {
+  _resetCapture() {
     this._frames = [];      // Float32Array(512) chunks of the current utterance
     this._preRoll = [];     // recent frames captured before speech onset
     this._inSpeech = false;
     this._silence = 0;
     this._speechFrames = 0;
-    this._busy = false;
-    this._needsProcess = false;
-    this._finalPending = false;
     this._lastInterimSamples = 0;
+  }
+
+  _resetUtterance() {
+    this._resetCapture();
+    this._busy = false;
+    this._interimRequested = false;
+    this._finalJobs = [];
   }
 
   async load() {
@@ -183,6 +189,7 @@ export class ParakeetLocalEngine {
   }
 
   stop() {
+    this._lifecycle++;
     try { if (this._node) this._node.disconnect(); } catch (_e) {}
     try { if (this._ctx) this._ctx.close(); } catch (_e) {}
     try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
@@ -216,7 +223,7 @@ export class ParakeetLocalEngine {
     if (samples >= MAX_UTT_SAMPLES) { this._schedule(true); return; }
     if (this._silence >= SILENCE_FRAMES_END) {
       if (this._speechFrames >= MIN_SPEECH_FRAMES) this._schedule(true);
-      else this._resetUtterance(); // discard a noise blip
+      else this._resetCapture(); // discard a noise blip without disturbing inference jobs
       return;
     }
     // Throttle interim re-encodes (the whole buffer is re-encoded each time).
@@ -227,24 +234,47 @@ export class ParakeetLocalEngine {
   }
 
   _schedule(isFinal) {
-    this._needsProcess = true;
-    if (isFinal) this._finalPending = true;
+    if (isFinal) {
+      const audio = this._flatten();
+      this._resetCapture();
+      this._interimRequested = false;
+      if (audio.length) {
+        this._finalJobs.push(audio);
+        if (this._finalJobs.length > MAX_PENDING_FINALS) {
+          this._finalJobs.shift();
+          this.onStatus("Parakeet can't keep up — dropped the oldest buffered final segment");
+        }
+      }
+    } else {
+      // Only the newest growing hypothesis matters. It is snapshotted when the
+      // worker reaches it, after all earlier committed segments are processed.
+      this._interimRequested = true;
+    }
     if (this._busy) return;
     this._busy = true;
     queueMicrotask(() => this._drain());
   }
 
   async _drain() {
-    while (this._needsProcess) {
-      this._needsProcess = false;
-      const isFinal = this._finalPending;
-      this._finalPending = false;
+    const lifecycle = this._lifecycle;
+    while (this._finalJobs.length || this._interimRequested) {
+      let audio;
+      let isFinal;
+      if (this._finalJobs.length) {
+        audio = this._finalJobs.shift();
+        isFinal = true;
+      } else {
+        this._interimRequested = false;
+        audio = this._flatten();
+        isFinal = false;
+      }
+      if (!audio.length) continue;
       try {
-        await this._process(isFinal);
+        await this._process(audio, isFinal);
       } catch (e) {
         this.onStatus("Parakeet error: " + (e && e.message ? e.message : e));
       }
-      if (isFinal) break;
+      if (lifecycle !== this._lifecycle) return;
     }
     this._busy = false;
   }
@@ -258,11 +288,10 @@ export class ParakeetLocalEngine {
     return out;
   }
 
-  async _process(isFinal) {
-    const { text } = await this._model.transcribe(this._flatten());
+  async _process(audio, isFinal) {
+    const { text } = await this._model.transcribe(audio);
     if (isFinal) {
       this.onTranscript({ text, isFinal: true });
-      this._resetUtterance();
     } else {
       this.onTranscript({ text, isFinal: false });
     }

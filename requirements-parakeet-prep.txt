@@ -3,5 +3,5 @@
 # conversion is needed (a ready int8 export is downloaded as-is), so this is just
 # the HF downloader plus onnx for header-only I/O inspection.
 # Use Python 3.12 — onnx wheels may lag on newer interpreters.
-huggingface_hub
-onnx
+huggingface_hub==1.19.0
+onnx==1.22.0

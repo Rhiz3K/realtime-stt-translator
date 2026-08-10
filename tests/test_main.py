@@ -1,8 +1,11 @@
-import re
+import asyncio
 from pathlib import Path
+import re
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import app.main as main
 
@@ -12,7 +15,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
-    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs"})
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure"})
     return TestClient(main.app)
 
 
@@ -27,15 +30,25 @@ def test_get_index_requires_password(client):
     assert "Incorrect password" not in resp.text
 
 
-def test_get_index_wrong_password_shows_error(client):
+def test_query_password_does_not_attempt_login(client):
     resp = client.get("/?pwd=wrong")
     assert resp.status_code == 200
     _assert_login_h1(resp.text)
-    assert "Incorrect password" in resp.text
+    assert "Incorrect password" not in resp.text
 
 
-def test_get_index_correct_password_serves_index_html(client):
+def test_query_password_cannot_authenticate(client):
     resp = client.get("/?pwd=test-password", follow_redirects=False)
+    assert resp.status_code == 200
+    _assert_login_h1(resp.text)
+
+
+def test_post_password_serves_index_html(client):
+    resp = client.post(
+        "/login",
+        data={"password": "test-password", "next": "/"},
+        follow_redirects=False,
+    )
     assert resp.status_code == 303
 
     resp = client.get("/")
@@ -53,6 +66,60 @@ def test_get_deepgram_always_redirects_to_index(client):
 class _FakeTranslation:
     def __init__(self, text: str):
         self.text = text
+
+
+def test_latest_interim_queue_coalesces_interims_and_prioritizes_finals():
+    async def scenario():
+        queue = main.LatestInterimQueue()
+        queue.put(main.TranslationWork("a", "interim", "cs", ["en"]))
+        queue.put(main.TranslationWork("ab", "interim", "cs", ["en"]))
+        assert (await queue.get()).text == "ab"
+
+        queue.put(main.TranslationWork("abc?", "interim", "cs", ["en"]))
+        queue.put(main.TranslationWork("abc", "final", "cs", ["en"]))
+        queue.put(main.TranslationWork("def", "final", "cs", ["en"]))
+        assert (await queue.get()).text == "abc"
+        assert (await queue.get()).text == "def"
+
+    asyncio.run(scenario())
+
+
+def test_deepgram_result_queue_never_evicts_finals_for_interims():
+    async def scenario():
+        queue = main.LatestTranscriptQueue()
+        queue.put({"transcript": "final-1", "is_final": True})
+        queue.put({"transcript": "interim-1", "is_final": False})
+        queue.put({"transcript": "interim-2", "is_final": False})
+        queue.put({"transcript": "final-2", "is_final": True})
+        assert (await queue.get())["transcript"] == "final-1"
+        assert (await queue.get())["transcript"] == "final-2"
+
+    asyncio.run(scenario())
+
+
+def test_deepgram_result_queue_rejects_overflow_without_evicting_final():
+    async def scenario():
+        queue = main.LatestTranscriptQueue(max_finals=1)
+        assert queue.put({"transcript": "keep", "is_final": True}) is True
+        assert queue.put({"transcript": "reject", "is_final": True}) is False
+        assert (await queue.get())["transcript"] == "keep"
+
+    asyncio.run(scenario())
+
+
+def test_translation_http_error_is_not_mistaken_for_a_valid_result():
+    class FailedResponse:
+        status_code = 503
+
+        def __bool__(self):
+            # httpx.Response uses status-dependent truthiness.
+            return False
+
+    result = _FakeTranslation("source text echoed by upstream")
+    result._response = FailedResponse()
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        main._validate_translation_result(result)
 
 
 def test_ws_translates_text(client, monkeypatch):
@@ -138,6 +205,52 @@ def test_ws_ping_pong(client, monkeypatch):
     assert data == {"type": "pong"}
 
 
+def test_ws_cancels_superseded_interim_before_final(client, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowTranslator:
+        async def translate(self, text, src, dest):
+            if text == "a":
+                started.set()
+                await asyncio.to_thread(release.wait)
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", SlowTranslator)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "interim", "text": "a", "dests": ["en"]})
+        assert started.wait(timeout=1)
+        ws.send_json({"type": "interim", "text": "ab", "dests": ["en"]})
+        ws.send_json({"type": "final", "text": "abc", "dests": ["en"]})
+        release.set()
+        data = ws.receive_json()
+
+    assert data["type"] == "final"
+    assert data["original"] == "abc"
+    assert data["translations"] == {"en": "en:abc"}
+
+
+def test_ws_rejects_oversized_text_without_translation(client, monkeypatch):
+    class FakeAsyncTranslator:
+        async def translate(self, *_args, **_kwargs):
+            raise AssertionError("oversized text must not be translated")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+    monkeypatch.setattr(main, "MAX_TEXT_LENGTH", 3)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "four", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["type"] == "final"
+    assert data["original"] == ""
+    assert data["translations"] == {"en": ""}
+    assert data["error"] == "text_too_long"
+
+
 def test_ws_elevenlabs_missing_api_key_returns_error(client, monkeypatch):
     monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "")
 
@@ -193,7 +306,7 @@ def test_ws_deepgram_missing_sdk_returns_error(client, monkeypatch):
     assert payload == {"error": "deepgram-sdk not installed"}
 
 
-def test_ws_deepgram_happy_path_emits_interim_and_final(client, monkeypatch):
+def test_ws_deepgram_happy_path_delivers_translated_final(client, monkeypatch):
     monkeypatch.setattr(main, "DEEPGRAM_API_KEY", "test-key")
 
     class FakeAlt:
@@ -285,17 +398,21 @@ def test_ws_deepgram_happy_path_emits_interim_and_final(client, monkeypatch):
 
     with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
         ws.send_bytes(b"\x00\x01")
-        interim = ws.receive_json()
-        final = ws.receive_json()
+        # The listener thread hands the interim and the final to the loop as two
+        # separate callbacks, so whether the worker drains the interim before the
+        # final coalesces it away is pure scheduling — accept either ordering and
+        # read until the final. Coalescing itself is pinned deterministically by
+        # the LatestTranscriptQueue unit tests above.
+        final = None
+        for _ in range(2):
+            message = ws.receive_json()
+            if message["type"] == "final":
+                final = message
+                break
+            assert message["type"] == "interim"
+            assert message["original"] == "prubezne"
 
-    assert interim["type"] == "interim"
-    assert interim["original"] == "prubezne"
-    assert interim["dests"] == ["en", "ru"]
-    assert interim["translations"] == {"en": "", "ru": ""}
-    assert interim["en"] == ""
-    assert interim["ru"] == ""
-    assert isinstance(interim.get("timing", {}), dict)
-
+    assert final is not None, "no final transcript arrived"
     assert final["type"] == "final"
     assert final["original"] == "finalni"
     assert final["dests"] == ["en", "ru"]
@@ -305,6 +422,73 @@ def test_ws_deepgram_happy_path_emits_interim_and_final(client, monkeypatch):
     assert isinstance(final.get("timing", {}), dict)
     assert translator.calls == [("finalni", "cs", "en"), ("finalni", "cs", "ru")]
     assert fake_socket.sent_media == [b"\x00\x01"]
+
+
+def test_ws_elevenlabs_happy_path_translates_final_without_blocking_receiver(client, monkeypatch):
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    class FakeElevenSocket:
+        def __init__(self):
+            self.events = iter(
+                [
+                    '{"message_type":"partial_transcript","text":"ah"}',
+                    '{"message_type":"committed_transcript","text":"ahoj"}',
+                ]
+            )
+            self.closed = False
+
+        async def recv(self):
+            return '{"message_type":"session_started","session_id":"session-1"}'
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def send(self, _payload):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+    upstream = FakeElevenSocket()
+    connected = {}
+
+    async def fake_connect(url, additional_headers):
+        connected["url"] = url
+        connected["headers"] = additional_headers
+        return upstream
+
+    monkeypatch.setattr(main.ws_lib, "connect", fake_connect)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json(
+            {
+                "type": "config",
+                "elevenlabs": {"language_code": "cs-CZ", "commit_strategy": "manual"},
+                "translate": {"src": "cs", "dests": ["en"]},
+                "translate_interim": True,
+            }
+        )
+        data = ws.receive_json()
+
+    assert data["type"] == "final"
+    assert data["original"] == "ahoj"
+    assert data["translations"] == {"en": "en:ahoj"}
+    assert "language_code=cs-CZ" in connected["url"]
+    assert connected["headers"] == {"xi-api-key": "test-key"}
+    assert upstream.closed is True
 
 
 # --- /api/elevenlabs/token tests ---
@@ -413,10 +597,38 @@ def test_auth_disabled_ws_no_cookie_needed(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "")
 
     c = TestClient(main.app)
-    with c.websocket_connect("/ws") as ws:
+    with c.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
         ws.send_json({"type": "ping"})
         data = ws.receive_json()
         assert data == {"type": "pong"}
+
+
+def test_auth_disabled_still_rejects_cross_origin_ws(monkeypatch):
+    monkeypatch.setattr(main, "AUTH_ENABLED", False)
+    monkeypatch.setattr(main, "APP_PASSWORD", "")
+
+    c = TestClient(main.app)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with c.websocket_connect("/ws", headers={"origin": "https://evil.example"}):
+            pass
+    assert exc_info.value.code == 1008
+
+
+def test_disabled_vendor_engines_are_rejected_server_side(client, monkeypatch):
+    client.post("/login", data={"password": "test-password", "next": "/"})
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech"})
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "server-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "azure-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "westeurope")
+
+    assert client.post("/api/elevenlabs/token", json={}).status_code == 404
+    assert client.post("/api/azure/token", json={}).status_code == 404
+
+    for path in ("/ws/deepgram", "/ws/elevenlabs"):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(path, headers={"origin": "http://testserver"}):
+                pass
+        assert exc_info.value.code == 1008
 
 
 # --- ENABLED_ENGINES tests ---
@@ -489,6 +701,12 @@ def test_cross_origin_isolation_headers(client):
     assert resp.headers.get("Cross-Origin-Embedder-Policy") == "credentialless"
 
 
+def test_permissions_policy_allows_same_origin_microphone_and_local_speech(client):
+    policy = client.get("/health").headers.get("Permissions-Policy", "")
+    assert "microphone=(self)" in policy
+    assert "on-device-speech-recognition=(self)" in policy
+
+
 def test_enabled_engines_includes_nemotron_in_template(monkeypatch):
     monkeypatch.setattr(main, "APP_PASSWORD", "test-password")
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
@@ -551,6 +769,42 @@ def test_enabled_engines_default_webspeech_only(monkeypatch):
     assert resp.status_code == 200
     assert 'value="deepgram" disabled' in resp.text
     assert 'value="elevenlabs" disabled' in resp.text
+
+
+def test_translate_languages_requires_auth_and_returns_sorted_choices(client):
+    assert client.get("/api/translate/languages").status_code == 401
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    response = client.get("/api/translate/languages")
+    assert response.status_code == 200
+    languages = response.json()["languages"]
+    assert any(item["code"] == "en" for item in languages)
+    assert languages == sorted(languages, key=lambda item: (item["name"], item["code"]))
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        (None, "/"),
+        ("", "/"),
+        ("https://evil.example", "/"),
+        ("//evil.example", "/"),
+        ("/safe/path?x=1", "/safe/path?x=1"),
+    ],
+)
+def test_sanitize_next_path(candidate, expected):
+    assert main.sanitize_next_path(candidate) == expected
+
+
+def test_auth_token_expires(monkeypatch):
+    monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
+    monkeypatch.setattr(main, "AUTH_TOKEN_TTL_SECONDS", 10)
+    monkeypatch.setattr(main.time, "time", lambda: 100)
+    token = main.create_auth_token()
+    assert main.verify_auth_token(token) is True
+
+    monkeypatch.setattr(main.time, "time", lambda: 111)
+    assert main.verify_auth_token(token) is False
 
 
 # --- /health endpoint ---

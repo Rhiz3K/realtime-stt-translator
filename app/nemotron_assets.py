@@ -55,7 +55,11 @@ def nemotron_enabled(enabled_engines: str | Iterable[str] | None = None) -> bool
 
 
 def missing_model_files(model_dir: Path = DEFAULT_MODEL_DIR) -> list[str]:
-    return [name for name in REQUIRED_MODEL_FILES if not (model_dir / name).is_file()]
+    return [
+        name
+        for name in REQUIRED_MODEL_FILES
+        if not (model_dir / name).is_file() or (model_dir / name).stat().st_size == 0
+    ]
 
 
 def _run_prepare_script(model_dir: Path) -> None:

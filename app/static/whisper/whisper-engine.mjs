@@ -271,8 +271,13 @@ export class WhisperLocalEngine {
 
   async load() {
     const spec = this._modelSpec();
+    const wantsWebGpu = await this._wantsWebGpu();
 
-    if (await this._wantsWebGpu()) {
+    if (this.modelKey === 'large-v3-turbo' && !wantsWebGpu) {
+      throw new Error('Whisper large-v3-turbo requires WebGPU; choose tiny, base, or small for CPU/WASM.');
+    }
+
+    if (wantsWebGpu) {
       try {
         this.onStatus(`Loading Whisper ${spec.label} on GPU (WebGPU)…`);
         this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
@@ -284,8 +289,11 @@ export class WhisperLocalEngine {
         await this._loadVad();
         return;
       } catch (err) {
+        if (this.device === 'webgpu' || this.modelKey === 'large-v3-turbo') {
+          throw new Error(`Whisper WebGPU initialization failed: ${err?.message || err}`, { cause: err });
+        }
         // No GPU adapter, missing fp16 model, or a driver/runtime issue — fall
-        // back to CPU so the engine still works (just slower).
+        // back to CPU only in Auto mode for models that are documented to support it.
         console.warn('WebGPU Whisper unavailable, falling back to CPU/WASM:', err);
         this.onStatus('WebGPU unavailable — loading on CPU (WASM)…');
         this._transcriber = null;

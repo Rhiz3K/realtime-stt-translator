@@ -146,19 +146,36 @@ def _write_concat_limited_encoder_variants(model) -> None:
     for max_storage_buffers, filename in ENCODER_CONCAT_VARIANTS:
         variant = copy.deepcopy(model)
         rewritten = _split_large_concat_nodes(variant, max_storage_buffers=max_storage_buffers)
-        onnx.save_model(variant, str(OUT_DIR / filename))
+        destination = OUT_DIR / filename
+        temporary = destination.with_name(destination.name + ".tmp")
+        try:
+            onnx.save_model(variant, str(temporary))
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
         print(
             f"      wrote {filename} for WebGPU storage-buffer limit {max_storage_buffers} "
             f"({rewritten} Concat node(s) split)"
         )
 
 
+def _is_nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
 def _base_browser_assets_exist() -> bool:
-    return all((OUT_DIR / name).is_file() for name in (ENCODER_BASE, ENCODER_DATA, "decoder_joint.onnx", "config.json", "vocab.json"))
+    return all(
+        _is_nonempty_file(OUT_DIR / name)
+        for name in (ENCODER_BASE, ENCODER_DATA, "decoder_joint.onnx", "config.json", "vocab.json")
+    )
 
 
 def _missing_concat_variant_files() -> list[str]:
-    return [filename for _limit, filename in ENCODER_CONCAT_VARIANTS if not (OUT_DIR / filename).is_file()]
+    return [
+        filename
+        for _limit, filename in ENCODER_CONCAT_VARIANTS
+        if not _is_nonempty_file(OUT_DIR / filename)
+    ]
 
 
 def _write_missing_concat_variants_from_existing() -> bool:
@@ -278,19 +295,33 @@ def convert_encoder_fp16(src: Path) -> None:
 
     print("      writing external fp16 weights (manual, gap-free)…")
     offset = 0
-    with open(OUT_DIR / out_data, "wb") as f:
-        for init in model.graph.initializer:
-            if init.HasField("raw_data") and len(init.raw_data) >= 1024:
-                raw = init.raw_data
-                f.write(raw)
-                init.data_location = TensorProto.EXTERNAL
-                del init.external_data[:]
-                for k, v in (("location", out_data), ("offset", str(offset)), ("length", str(len(raw)))):
-                    e = init.external_data.add()
-                    e.key, e.value = k, v
-                init.ClearField("raw_data")
-                offset += len(raw)
-    onnx.save_model(model, str(out_onnx))  # graph + small inline tensors; refs our .data
+    data_destination = OUT_DIR / out_data
+    data_temporary = data_destination.with_name(data_destination.name + ".tmp")
+    try:
+        with open(data_temporary, "wb") as f:
+            for init in model.graph.initializer:
+                if init.HasField("raw_data") and len(init.raw_data) >= 1024:
+                    raw = init.raw_data
+                    f.write(raw)
+                    init.data_location = TensorProto.EXTERNAL
+                    del init.external_data[:]
+                    for k, v in (("location", out_data), ("offset", str(offset)), ("length", str(len(raw)))):
+                        e = init.external_data.add()
+                        e.key, e.value = k, v
+                    init.ClearField("raw_data")
+                    offset += len(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(data_temporary, data_destination)
+    finally:
+        data_temporary.unlink(missing_ok=True)
+
+    graph_temporary = out_onnx.with_name(out_onnx.name + ".tmp")
+    try:
+        onnx.save_model(model, str(graph_temporary))  # graph + small inline tensors; refs our .data
+        os.replace(graph_temporary, out_onnx)
+    finally:
+        graph_temporary.unlink(missing_ok=True)
     print("      writing Concat-limited encoder graph variants for lower WebGPU limits…")
     _write_concat_limited_encoder_variants(model)
 
@@ -306,8 +337,14 @@ def convert_encoder_fp16(src: Path) -> None:
     shutil.rmtree(tmp, ignore_errors=True)  # drop the 2.3 GB fp32 working copy
 
     # decoder_joint stays fp32 (small; runs on WASM per-token).
-    shutil.copy2(src / "decoder_joint.onnx", OUT_DIR / "decoder_joint.onnx")
-    shutil.copy2(src / "config.json", OUT_DIR / "config.json")
+    for source_name in ("decoder_joint.onnx", "config.json"):
+        destination = OUT_DIR / source_name
+        temporary = destination.with_name(destination.name + ".tmp")
+        try:
+            shutil.copy2(src / source_name, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(f"      copied decoder_joint.onnx ({_human((OUT_DIR / 'decoder_joint.onnx').stat().st_size)}) + config.json")
 
 
@@ -317,7 +354,13 @@ def extract_vocab(src: Path) -> None:
     print("\n[4/4] Extracting vocab.json from tokenizer.model…")
     sp = spm.SentencePieceProcessor(model_file=str(src / "tokenizer.model"))
     pieces = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
-    (OUT_DIR / "vocab.json").write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8")
+    destination = OUT_DIR / "vocab.json"
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        temporary.write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     cfg = json.loads((src / "config.json").read_text())
     print(f"      sentencepiece pieces: {len(pieces)}  (config vocab_size={cfg.get('vocab_size')}, "
           f"blank_id={cfg.get('blank_id')})")

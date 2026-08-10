@@ -2,9 +2,9 @@
 # scripts/prepare_nemotron_onnx.py. The Docker image installs these so Coolify can
 # auto-prepare missing assets on first start when ENABLED_ENGINES contains
 # "nemotron". Use Python 3.12 — onnxruntime wheels may lag on newer interpreters.
-huggingface_hub
-onnx
-onnxruntime
-onnxconverter-common
-sentencepiece
-numpy
+huggingface_hub==1.19.0
+onnx==1.22.0
+onnxruntime==1.27.0
+onnxconverter-common==1.16.0
+sentencepiece==0.2.1
+numpy==2.4.6

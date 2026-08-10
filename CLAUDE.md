@@ -27,13 +27,13 @@ python -m compileall app tests
 
 No linter/formatter is pinned. If available locally: `ruff check .`, `ruff format .`, `mypy app` (expect noise from googletrans/deepgram typing). CI (`.github/workflows/ci.yml`) runs `pytest` on a self-hosted runner, Python 3.12; fork PRs are skipped. Code targets Python 3.10+ (`X | None` unions).
 
-**Known issue:** three Deepgram tests (`test_ws_deepgram_happy_path_emits_interim_and_final`, `test_ws_deepgram_init_failure_sends_error`, `test_ws_deepgram_missing_sdk_returns_error`) can hang due to threading/SDK interactions — run them individually when touching Deepgram code and be ready to kill them.
+**Deepgram tests:** these drive a real SDK listener thread, so anything that asserts a fixed ordering between an interim and a final is a scheduling coin flip — the two cross into the event loop as separate `call_soon_threadsafe` callbacks. The old happy-path test did exactly that and appeared to "hang" (it blocked forever waiting for an interim that had been coalesced away); it now reads until the final instead. Coalescing itself is asserted directly on `LatestTranscriptQueue` in unit tests. Keep new Deepgram tests order-agnostic, and run them under `timeout` while iterating.
 
 Commits follow Conventional Commits (`feat(stt): ...`, `fix(ws): ...`). New env vars must be documented in `.env.example` (and README's table).
 
 ## Architecture
 
-The entire backend is `app/main.py` (~1500 lines): auth, CSP middleware, HTTP routes, and three WebSocket endpoints. The entire frontend UI is `app/templates/index.html` (~3500 lines of inline JS/CSS) plus the local-Whisper engine in `app/static/whisper/`.
+The entire backend is `app/main.py` (~1800 lines): auth, CSP middleware, HTTP routes, and three WebSocket endpoints. The entire frontend UI is `app/templates/index.html` (~5200 lines of inline JS/CSS) plus the local-Whisper engine in `app/static/whisper/`.
 
 ### Seven STT engines, two data-flow shapes
 
@@ -46,12 +46,12 @@ The entire backend is `app/main.py` (~1500 lines): auth, CSP middleware, HTTP ro
    - **Azure Speech (browser-direct)**: browser fetches a short-lived token via `POST /api/azure/token` (server mints it from `AZURE_SPEECH_KEY`/`AZURE_SPEECH_REGION`), then the lazily-loaded Azure SpeechSDK (`window.SpeechSDK`) streams mic audio directly to Azure; `recognizing`/`recognized` text → `/ws`. Good Czech quality; free F0 tier.
 
 2. **Audio-proxy flow** — browser streams raw PCM (16-bit, 16 kHz, mono) to the server, which proxies to a vendor STT API and translates results:
-   - **`/ws/deepgram`**: Deepgram SDK live connection. The SDK callback runs in a separate listener thread; results cross into asyncio via `event_loop.call_soon_threadsafe` into a bounded `asyncio.Queue` (drops interim results when full, prefers keeping finals — preserve this bounding behavior). Shutdown drains the queue within a grace deadline.
+   - **`/ws/deepgram`**: Deepgram SDK live connection. The SDK callback runs in a separate listener thread; results cross into asyncio via `event_loop.call_soon_threadsafe` into a `LatestTranscriptQueue` — only the newest interim is held (older ones are coalesced away, never queued), finals are never dropped, and if finals do back up past the cap the session stops with `transcript_queue_full` rather than losing one. Preserve that asymmetry: interims are disposable, finals are not. Shutdown drains the queue within a grace deadline.
    - **`/ws/elevenlabs`**: server opens its own WS to ElevenLabs Scribe (via `websockets`), then runs two concurrent tasks (`_forward_audio`, `_receive_transcripts`) until either stops.
 
 ### WebSocket protocol (`/ws` and audio endpoints)
 
-Clients send typed JSON: `{"type": "config", ...}` (optional, first message), `{"type": "interim"|"final", "text": ..., "src": ..., "dests": [...]}`, `{"type": "ping"}`. Server replies with `{"type": ..., "original": ..., "translations": {...}}` or `{"error": ...}`. A legacy plain-text path (Czech → en/ru) is retained in `/ws` — don't break it. Interim messages carry a version counter server-side; stale interims are skipped before and after the (slow) translation call, while finals are always translated.
+Clients send typed JSON: `{"type": "config", ...}` (optional, first message), `{"type": "interim"|"final", "text": ..., "src": ..., "dests": [...]}`, `{"type": "ping"}`. Server replies with `{"type": ..., "original": ..., "translations": {...}}` or `{"error": ...}`. A legacy plain-text path (Czech → en/ru) is retained in `/ws` — don't break it. A reader task feeds a `LatestInterimQueue` that a worker task drains: superseded interims are coalesced, cancelled in flight, and re-checked against the revision counter before and after the (slow) translation call, while finals are always translated. An error payload without a `type` is terminal — the browser tears the session down on it (`translation_queue_full` → close 1013, `server_error` → 1011), so don't send a typeless error you expect the client to survive.
 
 ### Translation
 
@@ -67,7 +67,7 @@ Clients send typed JSON: `{"type": "config", ...}` (optional, first message), `{
 
 ### Version-drift defensiveness (intentional pattern — preserve it)
 
-`deepgram-sdk` and `googletrans` have breaking API changes across versions. All their imports are wrapped in `try/except` with duck-typed fallbacks (`_looks_like_deepgram_results`, `_deepgram_send_finalize`, sync/async `_translate`). Deepgram must stay optional so the app still boots (Web Speech mode) without the SDK. Dependencies in `requirements.txt` are deliberately mostly unpinned.
+`deepgram-sdk` and `googletrans` have breaking API changes across versions. All their imports are wrapped in `try/except` with duck-typed fallbacks (`_looks_like_deepgram_results`, `_deepgram_send_finalize`, sync/async `_translate`). Deepgram must stay optional so the app still boots (Web Speech mode) without the SDK. Dependencies are pinned exactly (`requirements*.txt`), which fixes the version you get today but not the one you get after a bump — keep the duck-typing, since upgrades still cross breaking majors.
 
 ## Cross-file sync constraints
 
@@ -75,9 +75,10 @@ These pairs must change together:
 
 - **Transformers.js / ONNX Runtime versions** are pinned in *both* the CSP in `app/main.py` (`_CSPMiddleware`) and `app/static/whisper/whisper-engine.mjs` (import URL + `env.backends.onnx.wasm.wasmPaths`). The wasm must come from the same transformers.js build or session creation throws (`s._OrtGetInputName is not a function`); a CSP mismatch silently blocks the CDN fetch.
 - **Whisper model list**: `WHISPER_MODELS` in `whisper-engine.mjs` ↔ the model `<select>` in `index.html` (marked with a "Keep in sync" comment).
-- **Cache-buster**: `index.html` imports `/static/whisper/whisper-engine.mjs?v=N` — bump `N` when changing the engine file.
+- **Cache-buster**: `index.html` imports each engine as `?v=N` — `whisper-engine.mjs`, `nemotron-engine.mjs`, `parakeet-engine.mjs`. Bump `N` for **every** engine file you touch, in the same change. `tests/test_nemotron_frontend.py` pins the nemotron value, so a bump there is a deliberate two-line edit.
 - **Nemotron engine**: the onnxruntime-web version is pinned in *both* the CSP in `app/main.py` (`_CSPMiddleware`) and `nemotron-engine.mjs` (import URL + `env.wasm.wasmPaths`); bump the `?v=N` on the `nemotron-engine.mjs` import in `index.html` when changing it. The fp16 model in `app/static/nemotron/models/` is gitignored and rebuilt by `scripts/prepare_nemotron_onnx.py` (`requirements-nemotron-prep.txt`). The encoder is uniformly fp16 (JS feeds fp16 via `f16.js`); `decoder_joint.onnx` stays fp32 on WASM. `mel.js` must stay numerically in sync with `scripts/nemotron_reference.py` (validated by `scripts/validate_mel.mjs`).
-- **PCM framing**: `FRAME_SAMPLES = 512` in `pcm-worklet.js` matches the VAD timing constants (~32 ms/frame at 16 kHz) in `whisper-engine.mjs`.
+- **Parakeet engine**: shares the Nemotron front-end (`../nemotron/mel.js`) and the same onnxruntime-web pin, so a CSP/ORT bump must cover `parakeet-engine.mjs` too. The int8 model in `app/static/parakeet/models/` is gitignored and fetched by `scripts/prepare_parakeet_onnx.py` (`requirements-parakeet-prep.txt`); its file names (`encoder-int8.onnx`, `decoder_joint-int8.onnx`, `vocab.txt`) are duplicated in the engine — change both.
+- **PCM framing**: `FRAME_SAMPLES = 512` in `pcm-worklet.js` matches the VAD timing constants (~32 ms/frame at 16 kHz) in `whisper-engine.mjs`, and is re-declared in `nemotron-engine.mjs` / `parakeet-engine.mjs`.
 - **Engine names**: `_ALL_ENGINES` / `ENABLED_ENGINES` in `main.py` ↔ engine dropdown and gating logic in `index.html` (template receives `enabled_engines`).
 - **Azure Speech SDK version**: pinned in *both* the CSP `script-src` in `app/main.py` (`_CSPMiddleware`, the `azure_sdk` jsDelivr URL) and `AZURE_SDK_VERSION` in `index.html`. A mismatch means the CSP silently blocks the SDK script fetch. Azure's `connect-src` (`wss://*.stt.speech.microsoft.com`, `https://*.api.cognitive.microsoft.com`) also lives in that CSP.
 

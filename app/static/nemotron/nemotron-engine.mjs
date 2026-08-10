@@ -20,6 +20,9 @@ import { f32ToF16, f16ToF32, zerosF16 } from "./f16.js";
 
 const CHUNK_FRAMES = 56;   // mel frames consumed per encoder step (8960 samples / 160)
 const PRE_ENCODE = 9;      // mel frames of left context prepended from the prior chunk
+const MAX_PENDING_FINALS = 8;
+// Queued in _finalJobs instead of audio: "reset the decoder here", see _discardBlip().
+const DISCARD_DECODE = Symbol("discard-decode");
 const ENCODER_DATA_FILE = "encoder_fp16.onnx.data";
 const NEMOTRON_MODEL_ASSET_VERSION = "2";
 const NEMOTRON_ENCODER_VARIANTS = [
@@ -285,21 +288,30 @@ export class NemotronLocalEngine {
     this._ctx = null;
     this._node = null;
     this._stream = null;
+    this._lifecycle = 0;
     this._resetUtterance();
   }
 
-  _resetUtterance() {
+  _resetCapture() {
     this._frames = [];      // Float32Array(512) chunks of the current utterance
     this._preRoll = [];     // recent frames captured before speech onset
-    this._uttTokens = [];
-    this._consumed = 0;     // mel frames already fed to the model
     this._inSpeech = false;
     this._silence = 0;
     this._speechFrames = 0;
-    this._busy = false;
-    this._needsProcess = false;
-    this._finalPending = false;
+  }
+
+  _resetDecode() {
+    this._uttTokens = [];
+    this._consumed = 0;     // mel frames already fed to the model
     if (this._model) this._model.resetStream();
+  }
+
+  _resetUtterance() {
+    this._resetCapture();
+    this._resetDecode();
+    this._busy = false;
+    this._interimRequested = false;
+    this._finalJobs = [];
   }
 
   async load() {
@@ -330,6 +342,7 @@ export class NemotronLocalEngine {
   }
 
   stop() {
+    this._lifecycle++;
     try { if (this._node) this._node.disconnect(); } catch (_e) {}
     try { if (this._ctx) this._ctx.close(); } catch (_e) {}
     try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
@@ -363,29 +376,84 @@ export class NemotronLocalEngine {
     if (samples - this._consumed * HOP >= CHUNK_SAMPLES) this._schedule(false);
     if (this._silence >= SILENCE_FRAMES_END) {
       if (this._speechFrames >= MIN_SPEECH_FRAMES) this._schedule(true);
-      else this._resetUtterance(); // discard a noise blip
+      else this._discardBlip();
     }
   }
 
+  /**
+   * Drop a sub-MIN_SPEECH_FRAMES noise blip. Capture state can go immediately,
+   * but a blip long enough to reach the silence cut-off (pre-roll + loud frames
+   * + ~900 ms of silence) has usually already been decoded by an interim, so the
+   * decoder reset must be sequenced behind any in-flight job — otherwise the next
+   * utterance inherits the blip's tokens, mel offset and encoder caches.
+   */
+  _discardBlip() {
+    this._resetCapture();
+    this._interimRequested = false;
+    // Nothing decoded and nothing running -> no stream state to throw away.
+    if (!this._busy && this._consumed === 0 && !this._uttTokens.length) return;
+    // A reset already waiting at the tail covers this blip too: jobs drain in
+    // order, so no decoding can have happened since it was queued.
+    if (this._finalJobs[this._finalJobs.length - 1] === DISCARD_DECODE) return;
+    this._finalJobs.push(DISCARD_DECODE);
+    if (this._busy) return;
+    this._busy = true;
+    queueMicrotask(() => this._drain());
+  }
+
   _schedule(isFinal) {
-    this._needsProcess = true;
-    if (isFinal) this._finalPending = true;
+    if (isFinal) {
+      const audio = this._flatten();
+      this._resetCapture();
+      this._interimRequested = false;
+      if (audio.length) {
+        this._finalJobs.push(audio);
+        if (this._finalJobs.length > MAX_PENDING_FINALS) {
+          // Drop the oldest audio segment, never a queued decode reset: resets cost
+          // nothing and the segments behind them would inherit stale stream state.
+          // The push above guarantees at least one audio job, so the index is valid.
+          this._finalJobs.splice(this._finalJobs.findIndex((job) => job !== DISCARD_DECODE), 1);
+          this.onStatus("Nemotron can't keep up — dropped the oldest buffered final segment");
+        }
+      }
+    } else {
+      this._interimRequested = true;
+    }
     if (this._busy) return;
     this._busy = true;
     queueMicrotask(() => this._drain());
   }
 
   async _drain() {
-    while (this._needsProcess) {
-      this._needsProcess = false;
-      const isFinal = this._finalPending;
-      this._finalPending = false;
+    const lifecycle = this._lifecycle;
+    while (this._finalJobs.length || this._interimRequested) {
+      let audio;
+      let isFinal;
+      if (this._finalJobs.length) {
+        const job = this._finalJobs.shift();
+        if (job === DISCARD_DECODE) {
+          this._resetDecode(); // queued by _discardBlip(): drop what the blip decoded
+          continue;
+        }
+        audio = job;
+        isFinal = true;
+      } else {
+        this._interimRequested = false;
+        audio = this._flatten();
+        isFinal = false;
+      }
+      if (!audio.length) continue;
       try {
-        await this._process(isFinal);
+        await this._process(audio, isFinal);
       } catch (e) {
         this.onStatus("Nemotron error: " + (e && e.message ? e.message : e));
+      } finally {
+        // A failed final must not leak decoder/cache state into the next
+        // utterance. Capture state is independent and may already contain new
+        // microphone frames, so only reset the decoder here.
+        if (isFinal) this._resetDecode();
       }
-      if (isFinal) break;
+      if (lifecycle !== this._lifecycle) return;
     }
     this._busy = false;
   }
@@ -399,8 +467,8 @@ export class NemotronLocalEngine {
     return out;
   }
 
-  async _process(isFinal) {
-    const { data, nFrames } = computeLogMel(this._flatten(), { normalize: this.normalize });
+  async _process(audio, isFinal) {
+    const { data, nFrames } = computeLogMel(audio, { normalize: this.normalize });
     const avail = nFrames - this._consumed;
     const count = isFinal ? avail : Math.floor((avail - EDGE_MARGIN_FRAMES) / CHUNK_FRAMES) * CHUNK_FRAMES;
     if (count > 0) {
@@ -412,7 +480,6 @@ export class NemotronLocalEngine {
     const text = this._model.tokenizer.decode(this._uttTokens);
     if (isFinal) {
       this.onTranscript({ text, isFinal: true });
-      this._resetUtterance();
     } else {
       this.onTranscript({ text, isFinal: false });
     }

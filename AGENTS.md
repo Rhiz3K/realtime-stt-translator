@@ -1,11 +1,13 @@
 # Agent Notes (sr_live-translator)
 
-This repository is a small FastAPI app that serves a password-protected UI with five STT engines:
+This repository is a small FastAPI app that serves a password-protected UI with seven STT engines:
 - **Web Speech** – browser Web Speech API, sends recognized text to `/ws` for translation.
 - **Whisper (local)** – browser Transformers.js + ONNX, WebGPU with CPU/WASM fallback (browser analogue of whisper_android); audio stays on device, text to `/ws`.
 - **Nemotron (local)** – browser onnxruntime-web streaming ASR (NVIDIA Nemotron-3.5), WebGPU with CPU/WASM fallback; audio stays on device, text to `/ws`. Model assets are generated/gitignored — see `app/static/nemotron/README.md`.
+- **Parakeet v3 (local)** – browser onnxruntime-web offline ASR (NVIDIA Parakeet-TDT-0.6b-v3, int8) reusing the Nemotron front-end with TDT decode; multilingual incl. Czech, audio stays on device. Assets downloaded/gitignored by `scripts/prepare_parakeet_onnx.py`.
 - **Deepgram** – streams audio to `/ws/deepgram` for Deepgram Nova-3 transcription + translation.
 - **ElevenLabs** – streams audio to `/ws/elevenlabs`, server proxies to ElevenLabs Scribe v2 Realtime WS API.
+- **Azure Speech** – browser fetches a short-lived token from `POST /api/azure/token` and streams mic audio directly to Azure; recognized text to `/ws`.
 
 Repo layout:
 - `app/main.py`: FastAPI app, auth cookie, websocket handlers, Deepgram + ElevenLabs integration.
@@ -157,4 +159,4 @@ mypy app
   - `.env` is gitignored.
   - `credentials/*.json` is gitignored.
 - Deepgram websocket logic uses threads + async queues; changes here can introduce races.
-- Keep queue bounding behavior (drop old interim results when full) to avoid memory growth.
+- Keep the queue asymmetry (`LatestTranscriptQueue`): only the newest interim is held, finals are never dropped, and a finals backlog past the cap stops the session with `transcript_queue_full`. That bounds memory without losing a committed transcript.

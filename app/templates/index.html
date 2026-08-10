@@ -528,6 +528,7 @@
         <div class="topbar-stats-right" role="group" aria-label="Runtime controls">
           <span class="badge badge--neutral" id="engineBadge" aria-label="Mode">Web Speech</span>
           <button class="btn btn-primary" id="startButton" type="button" aria-label="Start recording">Start</button>
+          <button class="btn" id="commitButton" type="button" aria-label="Commit current transcript" hidden disabled>Commit</button>
           <button class="btn btn-danger" id="stopButton" type="button" aria-label="Stop recording" disabled>Stop</button>
           <button class="btn icon-btn" id="settingsButton" type="button" aria-label="Settings" title="Settings">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -823,7 +824,7 @@
             <div class="field">
               <label for="elevenlabsApiKey">API Key (browser mode)</label>
               <input id="elevenlabsApiKey" type="password" autocomplete="off" placeholder="xi-..." />
-              <p class="hint">Stored locally, sent to our server only for token creation</p>
+              <p class="hint">Kept in memory for this page only; sent to our server only for token creation</p>
             </div>
             <div class="field">
               <label for="elevenlabsLanguage">Language</label>
@@ -852,7 +853,7 @@
             <div class="field">
               <label for="azureApiKey">API Key (optional)</label>
               <input id="azureApiKey" type="password" autocomplete="off" placeholder="leave empty to use server key" />
-              <p class="hint">Stored locally, sent to our server only to mint a short-lived token</p>
+              <p class="hint">Kept in memory for this page only; sent to our server only to mint a short-lived token</p>
             </div>
             <div class="field">
               <p class="hint">Recognition language uses the Web Speech API language above (e.g. cs-CZ). Streams directly from the browser; needs a free F0 Azure resource.</p>
@@ -917,7 +918,7 @@
       <h2 class="card-title" id="czTitle">Source</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="recognizedContainer" tabindex="0" aria-label="Recognized text"></div>
+      <div class="log" id="recognizedContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Recognized text"></div>
     </div>
   </section>
 
@@ -926,7 +927,7 @@
       <h2 class="card-title" id="enTitle">Target A</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="translationEnContainer" tabindex="0" aria-label="Translation"></div>
+      <div class="log" id="translationEnContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Translation"></div>
     </div>
   </section>
 
@@ -935,7 +936,7 @@
       <h2 class="card-title" id="ruTitle">Target B</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="translationRuContainer" tabindex="0" aria-label="Translation"></div>
+      <div class="log" id="translationRuContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Translation"></div>
     </div>
   </section>
 {% endblock %}
@@ -945,6 +946,7 @@
     // --- DOM elements ---
     const engineSelect = document.getElementById('engineSelect');
     const startButton = document.getElementById('startButton');
+    const commitButton = document.getElementById('commitButton');
     const stopButton  = document.getElementById('stopButton');
     const statusIndicator = document.getElementById('statusIndicator');
     const uiMessage = document.getElementById('uiMessage');
@@ -1119,8 +1121,9 @@
     // no longer matches the live one belongs to a dead session and must drop its
     // event — otherwise a stale final leaks into the next session, or a zombie
     // mic/recognition pipeline starts on top of a different engine. The per-engine
-    // *SessionGen vars let handlers bound once (Web Speech, on the persistent
-    // recognition object) or built per session (local engines) compare against it.
+    // *SessionGen vars let handlers built per session compare against it. Web Speech
+    // additionally checks recognizer object identity, because Stop -> Start can make
+    // two numeric generations line up again while an old DOM event is already queued.
     let recordingGeneration = 0;
     let webSpeechSessionGen = -1;
     let localEngineSessionGen = -1;
@@ -1144,14 +1147,20 @@
 
     // ElevenLabs Scribe params
     let elevenlabsMode = 'server';   // 'server' | 'browser'
-    let elevenlabsApiKey = '';       // user-provided key for browser mode (localStorage only)
+    let elevenlabsApiKey = '';       // user-provided key for browser mode (memory only)
     let elevenlabsLanguage = '';
     let elevenlabsCommitStrategy = 'vad';
 
-    // Azure Speech params (browser-direct mode; values are localStorage-only).
+    // Azure Speech params (browser-direct mode; API key is memory-only).
     let azureRegion = '';
     let azureApiKey = '';
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
+    let _elManualStopPending = false;
+    let _elManualStopTimer = null;
+    // Server translation may legitimately consume its 10 s timeout. Keep the
+    // sockets alive slightly longer so Stop does not discard the committed final.
+    const _EL_MANUAL_STOP_TIMEOUT_MS = 12000;
+    const _AUDIO_WS_HIGH_WATER_BYTES = 1024 * 1024;
 
     // Whisper local (browser ONNX via Transformers.js)
     // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
@@ -1186,6 +1195,7 @@
     let czSegmentCount = 0;
     let enSegmentCount = 0;
     let ruSegmentCount = 0;
+    const _MAX_RENDERED_SEGMENTS = 500;
 
     // --- Stats / timing ---
     let _sessionStartPerf = 0;
@@ -1643,25 +1653,25 @@
       return found ? found.name : code;
     }
 
-    function applyRecognitionSettings() {
-      if (!recognition) {
+    function applyRecognitionSettings(target = recognition) {
+      if (!target) {
         return;
       }
       try {
-        recognition.lang = recognitionLang;
-        recognition.continuous = recognitionContinuous;
-        recognition.interimResults = recognitionInterimResults;
-        recognition.maxAlternatives = recognitionMaxAlternatives;
+        target.lang = recognitionLang;
+        target.continuous = recognitionContinuous;
+        target.interimResults = recognitionInterimResults;
+        target.maxAlternatives = recognitionMaxAlternatives;
 
-        if ('processLocally' in recognition) {
+        if ('processLocally' in target) {
           try {
-            recognition.processLocally = Boolean(recognitionProcessLocally);
+            target.processLocally = Boolean(recognitionProcessLocally);
           } catch (_e) {
             // ignore
           }
         }
 
-        if ('phrases' in recognition && typeof window.SpeechRecognitionPhrase === 'function') {
+        if ('phrases' in target && typeof window.SpeechRecognitionPhrase === 'function') {
           const phraseLines = String(recognitionPhrasesText || '')
             .split('\n')
             .map((s) => s.trim())
@@ -1684,7 +1694,7 @@
             .filter(Boolean);
 
           try {
-            recognition.phrases = phraseObjects;
+            target.phrases = phraseObjects;
           } catch (_e) {
             // ignore
           }
@@ -1730,6 +1740,7 @@
       if (statusIndicator) {
         statusIndicator.hidden = e === 'webspeech' || e === 'whisper' || e === 'nemotron' || e === 'parakeet';
       }
+      _updateCommitButton();
     }
 
     function applyThemePreference(value) {
@@ -2486,6 +2497,16 @@
         if (!parsed || typeof parsed !== 'object') {
           return;
         }
+        // Migrate older settings that persisted vendor credentials. Never retain
+        // secrets across page loads where any same-origin script could read them.
+        if (
+          Object.prototype.hasOwnProperty.call(parsed, 'elevenlabsApiKey') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'azureApiKey')
+        ) {
+          delete parsed.elevenlabsApiKey;
+          delete parsed.azureApiKey;
+          localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(parsed));
+        }
         if (typeof parsed.recognitionLang === 'string') {
           recognitionLang = parsed.recognitionLang;
         }
@@ -2540,9 +2561,6 @@
         if (typeof parsed.elevenlabsMode === 'string') {
           elevenlabsMode = parsed.elevenlabsMode === 'browser' ? 'browser' : 'server';
         }
-        if (typeof parsed.elevenlabsApiKey === 'string') {
-          elevenlabsApiKey = parsed.elevenlabsApiKey;
-        }
         if (typeof parsed.elevenlabsLanguage === 'string') {
           elevenlabsLanguage = parsed.elevenlabsLanguage;
         }
@@ -2551,9 +2569,6 @@
         }
         if (typeof parsed.azureRegion === 'string') {
           azureRegion = parsed.azureRegion;
-        }
-        if (typeof parsed.azureApiKey === 'string') {
-          azureApiKey = parsed.azureApiKey;
         }
         if (typeof parsed.whisperModel === 'string' && WHISPER_MODEL_KEYS.includes(parsed.whisperModel)) {
           whisperModel = parsed.whisperModel;
@@ -2594,11 +2609,9 @@
             deepgramInterimResults,
             deepgramPunctuate,
             elevenlabsMode,
-            elevenlabsApiKey,
             elevenlabsLanguage,
             elevenlabsCommitStrategy,
             azureRegion,
-            azureApiKey,
             whisperModel,
             whisperDevice,
             nemotronDevice,
@@ -2620,6 +2633,28 @@
     function closeSettings() {
       settingsModal.hidden = true;
       settingsButton.focus();
+    }
+
+    function trapModalFocus(modal, event) {
+      if (!modal || modal.hidden || event.key !== 'Tab') return;
+      const focusable = Array.from(modal.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
+        'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter((element) => !element.hidden && element.getAttribute('aria-hidden') !== 'true');
+      if (!focusable.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const activeOutside = !modal.contains(document.activeElement);
+      if (event.shiftKey && (document.activeElement === first || activeOutside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || activeOutside)) {
+        event.preventDefault();
+        first.focus();
+      }
     }
 
     function saveSettingsFromForm() {
@@ -2689,6 +2724,7 @@
       applySettingsToForm();
       applyRecognitionSettings();
       updateTranslationTitles();
+      _updateCommitButton();
 
       if (!String(translateDestB || '').trim()) {
         translationRuContainer.replaceChildren();
@@ -2722,12 +2758,18 @@
       }
     }
 
-    if (SpeechRecognition) {
-      recognition = new SpeechRecognition();
-      applyRecognitionSettings();
+    function _createWebSpeechRecognition(sessionGen) {
+      const recognizer = new SpeechRecognition();
+      const isActive = () => (
+        recognition === recognizer &&
+        currentEngine === 'webspeech' &&
+        recordingGeneration === sessionGen &&
+        webSpeechSessionGen === sessionGen
+      );
+      applyRecognitionSettings(recognizer);
 
-      recognition.onstart = () => {
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
+      recognizer.onstart = () => {
+        if (!isActive()) return;
         webSpeechLastFinalResultIndex = -1;
         webSpeechLastFinalText = '';
         webSpeechLastFinalAtMs = 0;
@@ -2745,25 +2787,25 @@
         });
       };
 
-      recognition.onaudiostart = () => {
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
+      recognizer.onaudiostart = () => {
+        if (!isActive()) return;
         // Best-effort utterance timing.
         if (_sttSegmentStartPerf == null) {
           _sttSegmentStartPerf = performance.now();
         }
       };
 
-      recognition.onspeechstart = () => {
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
+      recognizer.onspeechstart = () => {
+        if (!isActive()) return;
         _sttSegmentStartPerf = performance.now();
         _wsState = 'speech';
       };
 
-      recognition.onresult = (event) => {
-        // recognition is bound once and outlives a session; drop events from a
-        // session that was stopped or switched away (an onresult may already be
-        // queued when Stop aborts the session).
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+      recognizer.onresult = (event) => {
+        // A recognizer belongs to exactly one user recording. Checking the concrete
+        // object as well as the generation prevents an old queued event from becoming
+        // current again after a rapid Stop -> Start.
+        if (!isActive()) {
           return;
         }
         // Liveness: the service responded. Used to render the overlay "gap" metric and
@@ -2875,10 +2917,10 @@
         }
       };
 
-      recognition.onend = () => {
+      recognizer.onend = () => {
         // Drop end events from a stopped/switched-away session — don't auto-restart
         // recognition on top of whatever engine is active now.
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+        if (!isActive()) {
           dbg('webspeech:end (stale session, not restarting)');
           return;
         }
@@ -2886,6 +2928,13 @@
         if (stopButton.disabled) {
           dbg('webspeech:end (user stopped, not restarting)');
           _wsState = 'idle';
+          return;
+        }
+
+        if (!recognitionContinuous) {
+          dbg('webspeech:end (single-shot mode, stopping)');
+          removeInterimElement(recognizedContainer);
+          stopRecording();
           return;
         }
 
@@ -2915,26 +2964,25 @@
           // Back off to prevent flapping (rapid error→end→start loops).
           _wsState = 'backoff';
           dbg('webspeech:backoff', { delayMs: _WS_RESTART_BACKOFF_MS });
-          const backoffGen = webSpeechSessionGen;
           if (_wsBackoffId != null) clearTimeout(_wsBackoffId);
           _wsBackoffId = setTimeout(() => {
             _wsBackoffId = null;
             // Skip the deferred restart if Stop or an engine switch happened meanwhile.
-            if (currentEngine === 'webspeech' && recordingGeneration === backoffGen && !stopButton.disabled) {
-              _webSpeechSafeStart(1);
+            if (isActive() && !stopButton.disabled) {
+              _webSpeechSafeStart(1, recognizer, sessionGen);
             }
           }, _WS_RESTART_BACKOFF_MS);
           return;
         }
 
-        _webSpeechSafeStart(1);
+        _webSpeechSafeStart(1, recognizer, sessionGen);
       };
 
-      recognition.onerror = (event) => {
+      recognizer.onerror = (event) => {
         // Drop errors from a stopped/switched-away session: a stale not-allowed/
         // service-not-allowed would otherwise call stopRecording() below and tear
         // down whatever engine is running now.
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) {
+        if (!isActive()) {
           dbg('webspeech:error (stale session, ignored)', { error: event.error });
           return;
         }
@@ -2944,9 +2992,25 @@
         _wsState = 'error';
 
         // Fatal errors — stop recording and notify user.
-        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        if (event.error === 'not-allowed') {
           console.error('Speech recognition permission denied:', event.error);
           showMessage('Permission to use microphone is denied. Allow microphone access and try again.');
+          stopRecording();
+          return;
+        }
+        if (event.error === 'service-not-allowed') {
+          console.error('Speech recognition service unavailable:', event.error);
+          showMessage(
+            recognitionProcessLocally
+              ? 'On-device speech recognition is unavailable for this language. Install its model in Settings or disable "Process locally".'
+              : 'The browser speech-recognition service is unavailable. Check browser policy/settings and try again.'
+          );
+          stopRecording();
+          return;
+        }
+        if (event.error === 'audio-capture') {
+          console.error('Speech recognition could not capture audio:', event.error);
+          showMessage('No usable microphone is available. Check the selected input device and whether another app is using it.');
           stopRecording();
           return;
         }
@@ -2991,13 +3055,30 @@
         console.error('Speech recognition error:', event.error);
       };
 
-      recognition.onnomatch = (event) => {
-        if (currentEngine !== 'webspeech' || recordingGeneration !== webSpeechSessionGen) return;
+      recognizer.onnomatch = () => {
+        if (!isActive()) return;
         // Fired when speech was detected but not recognized with sufficient confidence.
         // This is normal for background noise, mumbling, etc.
         // onend fires after this and will restart the session.
         dbg('webspeech:nomatch (low confidence, will auto-restart)');
       };
+
+      return recognizer;
+    }
+
+    function _detachWebSpeechRecognition(recognizer) {
+      if (!recognizer) return;
+      try {
+        recognizer.onstart = null;
+        recognizer.onaudiostart = null;
+        recognizer.onspeechstart = null;
+        recognizer.onresult = null;
+        recognizer.onend = null;
+        recognizer.onerror = null;
+        recognizer.onnomatch = null;
+      } catch (_e) {
+        // no-op
+      }
     }
 
     // Helpers
@@ -3043,12 +3124,82 @@
       segmentDiv.appendChild(document.createTextNode(' ' + text));
 
       container.prepend(segmentDiv);
+      const renderedSegments = container.getElementsByClassName('segment');
+      while (renderedSegments.length > _MAX_RENDERED_SEGMENTS) {
+        renderedSegments[renderedSegments.length - 1].remove();
+      }
       updateStatsBar();
+    }
+
+    function _updateCommitButton() {
+      if (!commitButton) return;
+      const visible = currentEngine === 'elevenlabs' && elevenlabsCommitStrategy === 'manual';
+      const activeWs = elevenlabsMode === 'browser' ? _elBrowserWs : socket;
+      const ready = activeWs && activeWs.readyState === WebSocket.OPEN;
+      commitButton.hidden = !visible;
+      commitButton.disabled = !visible || !ready || stopButton.disabled || _elManualStopPending;
+    }
+
+    function _canSendAudio(ws) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      if (ws.bufferedAmount <= _AUDIO_WS_HIGH_WATER_BYTES) return true;
+      dbg('audio frame dropped (websocket backpressure)', { bufferedAmount: ws.bufferedAmount });
+      return false;
+    }
+
+    function _requestElevenLabsCommit() {
+      if (currentEngine !== 'elevenlabs' || elevenlabsCommitStrategy !== 'manual') return false;
+      try {
+        if (elevenlabsMode === 'browser') {
+          if (!_elBrowserWs || _elBrowserWs.readyState !== WebSocket.OPEN) return false;
+          _elBrowserWs.send(JSON.stringify({
+            message_type: 'input_audio_chunk',
+            audio_base_64: '',
+            commit: true,
+            sample_rate: 16000,
+          }));
+        } else {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+          socket.send(JSON.stringify({ type: 'commit' }));
+        }
+        if (commitButton) {
+          commitButton.disabled = true;
+          setTimeout(() => { if (!_elManualStopPending) _updateCommitButton(); }, 750);
+        }
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
+
+    function _finishManualCommitStop() {
+      if (!_elManualStopPending) return;
+      _elManualStopPending = false;
+      if (_elManualStopTimer != null) {
+        clearTimeout(_elManualStopTimer);
+        _elManualStopTimer = null;
+      }
+      stopRecording();
+    }
+
+    function requestStopRecording() {
+      if (_requestElevenLabsCommit()) {
+        _elManualStopPending = true;
+        // Stop producing new audio after the commit boundary, but keep both sockets
+        // alive long enough to receive and translate the committed transcript.
+        stopDeepgramPipeline();
+        stopButton.disabled = true;
+        _updateCommitButton();
+        _elManualStopTimer = setTimeout(_finishManualCommitStop, _EL_MANUAL_STOP_TIMEOUT_MS);
+        return;
+      }
+      stopRecording();
     }
 
     // Controls
     startButton.addEventListener('click', startRecording);
-    stopButton.addEventListener('click', stopRecording);
+    stopButton.addEventListener('click', requestStopRecording);
+    if (commitButton) commitButton.addEventListener('click', _requestElevenLabsCommit);
 
     function initEngineToggle() {
       let stored = null;
@@ -3082,23 +3233,6 @@
       lastInterimSentText = '';
       lastInterimSentAtMs = 0;
       _resetStats();
-    }
-
-    function applySocketLifecycleHandlers() {
-      if (!socket) return;
-      socket.onopen = () => {
-        console.log('WebSocket connected');
-        setStatus('connected');
-      };
-      socket.onclose = () => {
-        console.log('WebSocket closed');
-        setStatus('disconnected');
-      };
-      socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        setStatus('error');
-        showMessage('WebSocket error. Check your connection and try again.');
-      };
     }
 
     function handleTranslationMessage(data) {
@@ -3319,6 +3453,12 @@
           showMessage(String(data.error));
         }
         handleTranslationMessage(data);
+        if (
+          _elManualStopPending && currentEngine === 'elevenlabs' &&
+          elevenlabsMode === 'browser' && data.type === 'final'
+        ) {
+          _finishManualCommitStop();
+        }
       };
     }
 
@@ -3329,10 +3469,14 @@
     // recognition is NOT running and, left unhandled, would leave the UI claiming to
     // record while producing nothing — so retry once (guarded by generation), then fail
     // loudly instead of silently freezing.
-    function _webSpeechSafeStart(retriesLeft) {
-      if (!recognition) return;
+    function _webSpeechSafeStart(retriesLeft, recognizer = recognition, sessionGen = webSpeechSessionGen) {
+      if (
+        !recognizer || recognition !== recognizer ||
+        currentEngine !== 'webspeech' || recordingGeneration !== sessionGen ||
+        webSpeechSessionGen !== sessionGen || stopButton.disabled
+      ) return;
       try {
-        recognition.start();
+        recognizer.start();
       } catch (e) {
         const name = (e && e.name) ? e.name : String(e);
         if (name === 'InvalidStateError') {
@@ -3341,12 +3485,15 @@
         }
         dbg('webspeech:start failed', { error: name, retriesLeft });
         if (retriesLeft > 0) {
-          const gen = webSpeechSessionGen;
           if (_wsStartRetryId != null) clearTimeout(_wsStartRetryId);
           _wsStartRetryId = setTimeout(() => {
             _wsStartRetryId = null;
-            if (currentEngine === 'webspeech' && recordingGeneration === gen && !stopButton.disabled) {
-              _webSpeechSafeStart(retriesLeft - 1);
+            if (
+              recognition === recognizer && currentEngine === 'webspeech' &&
+              recordingGeneration === sessionGen && webSpeechSessionGen === sessionGen &&
+              !stopButton.disabled
+            ) {
+              _webSpeechSafeStart(retriesLeft - 1, recognizer, sessionGen);
             }
           }, 500);
         } else {
@@ -3357,7 +3504,7 @@
     }
 
     function startWebSpeechRecording() {
-      if (!webSpeechSupported || !recognition) {
+      if (!webSpeechSupported) {
         showMessage('Your browser does not support the Web Speech API. Switch to Deepgram.');
         return;
       }
@@ -3365,8 +3512,8 @@
       // Claim a new generation so stale onresult/onend events from a prior session
       // (or ones already queued when Stop aborted it) are ignored.
       webSpeechSessionGen = ++recordingGeneration;
-
-      applyRecognitionSettings();
+      const sessionGen = webSpeechSessionGen;
+      recognition = _createWebSpeechRecognition(sessionGen);
       updateTranslationTitles();
 
       clearMessage();
@@ -3395,7 +3542,7 @@
 
       // Guarded start: a prior session still tearing down (rapid Stop→Start) would make
       // a bare start() throw and leave the UI "recording" but dead.
-      _webSpeechSafeStart(1);
+      _webSpeechSafeStart(1, recognition, sessionGen);
       console.log('Recording started');
     }
 
@@ -3500,6 +3647,14 @@
       };
     }
 
+    function makeLocalStatusHandler(handler) {
+      const handlerGen = localEngineSessionGen;
+      return (status) => {
+        if (recordingGeneration !== handlerGen || localEngineSessionGen !== handlerGen) return;
+        handler(status);
+      };
+    }
+
     // Shared start flow for the browser-local engines (Whisper, Nemotron). Both do
     // STT on-device and send only recognized text to /ws, so the flow is identical
     // apart from which module/engine is loaded and how its active handle is tracked.
@@ -3519,6 +3674,10 @@
       // stopped engine can't leak into the next session. Complements the per-engine
       // getActive() !== engine guards below, which cover the startup await windows.
       localEngineSessionGen = ++recordingGeneration;
+      const sessionGen = localEngineSessionGen;
+      const isCurrentAttempt = () => (
+        recordingGeneration === sessionGen && localEngineSessionGen === sessionGen
+      );
 
       applyEngineUi(config.kind);
       applyRecognitionSettings();
@@ -3540,12 +3699,21 @@
           showMessage(loadingMessage);
         }
         engine = await config.createEngine();
+        if (!isCurrentAttempt()) {
+          try { engine.stop(); } catch (_e) { /* no-op */ }
+          try { if (typeof engine.dispose === 'function') await engine.dispose(); } catch (_e) { /* no-op */ }
+          return;
+        }
         config.setActive(engine);
 
         // Download/initialize the model BEFORE asking for the microphone, so the
         // mic indicator isn't lit for minutes during a first-run model download.
         await engine.load();
-        if (config.getActive() !== engine) return; // Stop pressed during load
+        if (!isCurrentAttempt() || config.getActive() !== engine) {
+          try { engine.stop(); } catch (_e) { /* no-op */ }
+          try { if (typeof engine.dispose === 'function') await engine.dispose(); } catch (_e) { /* no-op */ }
+          return;
+        }
 
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -3555,7 +3723,7 @@
           },
           video: false,
         });
-        if (config.getActive() !== engine) {
+        if (!isCurrentAttempt() || config.getActive() !== engine) {
           // Stopped while the permission prompt was open — release the fresh mic.
           try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
           return;
@@ -3563,7 +3731,10 @@
         config.setStream(stream);
 
         await engine.start(stream);
-        if (config.getActive() !== engine) return; // Stop pressed during start
+        if (!isCurrentAttempt() || config.getActive() !== engine) {
+          try { engine.stop(); } catch (_e) { /* no-op */ }
+          return;
+        }
 
         // Open the translate WS only after engine startup succeeded, so a failure
         // in import()/model-load/getUserMedia can't leave a socket open — and only
@@ -3597,12 +3768,12 @@
           // no-Cache-Control static response as heuristically fresh and keep
           // serving an old copy across reloads. Bump it whenever the engine or its
           // pinned ORT/transformers versions change.
-          const mod = await import('/static/whisper/whisper-engine.mjs?v=9');
+          const mod = await import('/static/whisper/whisper-engine.mjs?v=10');
           return new mod.WhisperLocalEngine({
             modelKey: whisperModel,
             device: whisperDevice,
             language: translateSrc || 'cs',
-            onStatus: (msg) => { if (msg) showMessage(msg); },
+            onStatus: makeLocalStatusHandler((msg) => { if (msg) showMessage(msg); }),
             onTranscript: makeLocalTranscriptHandler({ translateInterim: false }),
           });
         },
@@ -3622,12 +3793,12 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes (kept in sync with the CSP in main.py).
-          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=3');
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=4');
           return new mod.NemotronLocalEngine({
             device: nemotronDevice,
             language: translateSrc || 'cs',
             normalize: 'none',
-            onStatus: (status) => { handleLocalEngineStatus(status); },
+            onStatus: makeLocalStatusHandler((status) => { handleLocalEngineStatus(status); }),
             onTranscript: makeLocalTranscriptHandler({ translateInterim: true }),
           });
         },
@@ -3647,12 +3818,12 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes.
-          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=1');
+          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=2');
           return new mod.ParakeetLocalEngine({
             device: parakeetDevice,
             language: translateSrc || 'cs',
             normalize: 'none',
-            onStatus: (status) => { handleLocalEngineStatus(status); },
+            onStatus: makeLocalStatusHandler((status) => { handleLocalEngineStatus(status); }),
             onTranscript: makeLocalTranscriptHandler({ translateInterim: true }),
           });
         },
@@ -3676,24 +3847,26 @@
 
       resetSessionUi();
 
-      socket = new WebSocket(
+      const sessionSocket = new WebSocket(
         _wsUrl('/ws/deepgram')
       );
+      socket = sessionSocket;
 
-      applySocketLifecycleHandlers();
-      socket.onclose = () => {
+      sessionSocket.onclose = () => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         console.log('WebSocket closed');
         stopRecording();
       };
-      socket.onerror = (error) => {
+      sessionSocket.onerror = (error) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         console.error('WebSocket error:', error);
         setStatus('error');
         showMessage('WebSocket error. Check your connection and try again.');
         stopRecording();
       };
 
-      socket.onopen = async (event) => {
-        if (sessionGen !== recordingGeneration) {
+      sessionSocket.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
           try { event.target.close(); } catch (_e) { /* no-op */ }
           return;
         }
@@ -3712,7 +3885,7 @@
             translate: { src: translateSrc, dests: getTranslateDests() },
             translate_interim: Boolean(translateInterimEnabled),
           });
-          socket.send(
+          sessionSocket.send(
             JSON.stringify({
               type: 'config',
               deepgram: {
@@ -3740,7 +3913,7 @@
           });
           // Stop/engine-switch during the mic prompt — release the fresh mic and
           // don't build a zombie audio pipeline feeding a dead session.
-          if (sessionGen !== recordingGeneration) {
+          if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
             try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
@@ -3789,7 +3962,7 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) {
+            if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
               try { event.target.close(); } catch (_e) { /* no-op */ }
               return;
             }
@@ -3802,8 +3975,11 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
             });
 
             processor.port.onmessage = (event) => {
-              if (socket && socket.readyState === WebSocket.OPEN) {
-                socket.send(event.data);
+              if (
+                sessionGen === recordingGeneration && socket === sessionSocket &&
+                _canSendAudio(sessionSocket)
+              ) {
+                sessionSocket.send(event.data);
               }
             };
 
@@ -3824,18 +4000,22 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
             gainNode.connect(audioContext.destination);
 
             processor.onaudioprocess = (e) => {
-              if (socket && socket.readyState === WebSocket.OPEN) {
+              if (
+                sessionGen === recordingGeneration && socket === sessionSocket &&
+                _canSendAudio(sessionSocket)
+              ) {
                 const inputData = e.inputBuffer.getChannelData(0);
                 const int16Data = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
                   const s = Math.max(-1, Math.min(1, inputData[i]));
                   int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
-                socket.send(int16Data.buffer);
+                sessionSocket.send(int16Data.buffer);
               }
             };
           }
         } catch (err) {
+          if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
           console.error('Error accessing microphone:', err);
           setStatus('error');
           showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
@@ -3843,14 +4023,18 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
         }
       };
 
-      socket.onmessage = (event) => {
+      sessionSocket.onmessage = (event) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         let data;
         try { data = JSON.parse(event.data); } catch (_e) { return; }
         dbg('ws:/ws/deepgram recv', data);
         if (data.error) {
-          setStatus('error');
           showMessage('Server error: ' + data.error);
-          return;
+          if (!data.type) {
+            stopRecording();
+            setStatus('error');
+            return;
+          }
         }
 
         const nowPerf = performance.now();
@@ -3905,6 +4089,7 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
       clearMessage();
       startButton.disabled = true;
       stopButton.disabled = false;
+      _updateCommitButton();
       setStatus('connecting');
 
       resetSessionUi();
@@ -3932,10 +4117,12 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
           throw new Error('Empty token received');
         }
       } catch (err) {
+        if (sessionGen !== recordingGeneration) return;
         console.error('Failed to obtain ElevenLabs token:', err);
         showMessage('Failed to obtain ElevenLabs token: ' + (err && err.message ? err.message : String(err)));
         startButton.disabled = false;
         stopButton.disabled = true;
+        _updateCommitButton();
         setStatus('disconnected');
         return;
       }
@@ -3960,8 +4147,10 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
         elUrl += '&vad_silence_threshold_secs=1.5';
       }
 
+      let elSocket;
       try {
-        _elBrowserWs = new WebSocket(elUrl);
+        elSocket = new WebSocket(elUrl);
+        _elBrowserWs = elSocket;
       } catch (err) {
         console.error('Failed to connect to ElevenLabs WS:', err);
         showMessage('Failed to connect to ElevenLabs: ' + (err && err.message ? err.message : String(err)));
@@ -3969,8 +4158,10 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
         return;
       }
 
-      _elBrowserWs.onclose = () => {
+      elSocket.onclose = () => {
+        if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) return;
         dbg('elevenlabs-browser: WS closed');
+        _updateCommitButton();
         // If user hasn't pressed stop, treat as error.
         if (!stopButton.disabled) {
           showMessage('ElevenLabs connection closed unexpectedly.');
@@ -3978,11 +4169,13 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
         }
       };
 
-      _elBrowserWs.onerror = (error) => {
+      elSocket.onerror = (error) => {
+        if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) return;
         console.error('ElevenLabs WS error:', error);
       };
 
-      _elBrowserWs.onmessage = (event) => {
+      elSocket.onmessage = (event) => {
+        if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) return;
         let ev;
         try {
           ev = JSON.parse(event.data);
@@ -4059,23 +4252,30 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
         }
 
         // Error events from ElevenLabs.
-        if (['input_error', 'error', 'auth_error', 'transcriber_error', 'quota_exceeded'].includes(msgType)) {
+        if ([
+          'input_error', 'error', 'auth_error', 'transcriber_error', 'quota_exceeded',
+          'throttled', 'rate_limited', 'queue_overflow', 'resource_exhausted',
+          'session_time_limit_exceeded', 'chunk_size_exceeded',
+          'insufficient_audio_activity', 'unaccepted_terms',
+        ].includes(msgType)) {
           const errorMsg = ev.error || ev.message || JSON.stringify(ev);
           console.error('ElevenLabs error:', errorMsg);
-          showMessage('ElevenLabs error: ' + errorMsg);
+          stopRecording();
           setStatus('error');
+          showMessage('ElevenLabs error: ' + errorMsg);
           return;
         }
       };
 
       // 4. Once ElevenLabs WS is open, start audio capture.
-      _elBrowserWs.onopen = async (event) => {
-        if (sessionGen !== recordingGeneration) {
+      elSocket.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) {
           try { event.target.close(); } catch (_e) { /* no-op */ }
           return;
         }
         dbg('elevenlabs-browser: WS connected');
         setStatus('connected');
+        _updateCommitButton();
 
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
@@ -4088,7 +4288,7 @@ registerProcessor('int16-pcm-processor', Int16PCMProcessor);
           });
           // Stop/engine-switch during the mic prompt — release the fresh mic and
           // don't build a zombie audio pipeline feeding a dead session.
-          if (sessionGen !== recordingGeneration) {
+          if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
             try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
@@ -4142,7 +4342,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) {
+            if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) {
               try { event.target.close(); } catch (_e) { /* no-op */ }
               return;
             }
@@ -4155,9 +4355,12 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             });
 
             processor.port.onmessage = (event) => {
-              if (_elBrowserWs && _elBrowserWs.readyState === WebSocket.OPEN) {
+              if (
+                sessionGen === recordingGeneration && _elBrowserWs === elSocket &&
+                _canSendAudio(elSocket)
+              ) {
                 const audio_b64 = int16BufferToBase64(event.data);
-                _elBrowserWs.send(JSON.stringify({
+                elSocket.send(JSON.stringify({
                   message_type: 'input_audio_chunk',
                   audio_base_64: audio_b64,
                   commit: false,
@@ -4184,7 +4387,10 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             gainNode.connect(audioContext.destination);
 
             processor.onaudioprocess = (e) => {
-              if (_elBrowserWs && _elBrowserWs.readyState === WebSocket.OPEN) {
+              if (
+                sessionGen === recordingGeneration && _elBrowserWs === elSocket &&
+                _canSendAudio(elSocket)
+              ) {
                 const inputData = e.inputBuffer.getChannelData(0);
                 const int16Data = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
@@ -4192,7 +4398,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
                   int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
                 const audio_b64 = int16BufferToBase64(int16Data.buffer);
-                _elBrowserWs.send(JSON.stringify({
+                elSocket.send(JSON.stringify({
                   message_type: 'input_audio_chunk',
                   audio_base_64: audio_b64,
                   commit: false,
@@ -4202,6 +4408,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             };
           }
         } catch (err) {
+          if (sessionGen !== recordingGeneration || _elBrowserWs !== elSocket) return;
           console.error('Error accessing microphone:', err);
           setStatus('error');
           showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
@@ -4211,45 +4418,57 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
     }
 
     // --- ElevenLabs: server-side mode (audio → our server → ElevenLabs API) ---
-    async function startElevenLabsServerRecording() {
+    async function startElevenLabsServerRecording(reconnecting = false) {
       const sessionGen = ++recordingGeneration;
-      applyEngineUi('elevenlabs');
-      updateTranslationTitles();
-
-      clearMessage();
+      if (!reconnecting) {
+        applyEngineUi('elevenlabs');
+        updateTranslationTitles();
+        clearMessage();
+        resetSessionUi();
+      }
       startButton.disabled = true;
       stopButton.disabled = false;
+      _updateCommitButton();
       setStatus('connecting');
 
-      resetSessionUi();
+      const sessionSocket = new WebSocket(_wsUrl('/ws/elevenlabs'));
+      socket = sessionSocket;
 
-      socket = new WebSocket(_wsUrl('/ws/elevenlabs'));
-
-      socket.onclose = () => {
+      sessionSocket.onclose = () => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         console.log('WebSocket closed');
         _stopWsTimers();
+        _updateCommitButton();
+        // A full reconnect below creates a fresh mic graph. Tear the old one down
+        // first so its callback cannot feed the replacement socket or leak tracks.
+        stopDeepgramPipeline();
         if (!stopButton.disabled && _wsReconnectCount < _WS_RECONNECT_MAX) {
           _wsReconnectCount++;
           setStatus('connecting');
           dbg('ws reconnect (elevenlabs)', { attempt: _wsReconnectCount });
-          _wsReconnectTimeoutId = setTimeout(() => startElevenLabsRecording(), _WS_RECONNECT_DELAY_MS);
+          _wsReconnectTimeoutId = setTimeout(
+            () => startElevenLabsServerRecording(true),
+            _WS_RECONNECT_DELAY_MS
+          );
         } else if (!stopButton.disabled) {
           setStatus('error');
           showMessage('WebSocket connection lost. Press Stop and Start to try again.');
         }
       };
-      socket.onerror = (error) => {
+      sessionSocket.onerror = (error) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         console.error('WebSocket error:', error);
       };
 
-      socket.onopen = async (event) => {
-        if (sessionGen !== recordingGeneration) {
+      sessionSocket.onopen = async (event) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
           try { event.target.close(); } catch (_e) { /* no-op */ }
           return;
         }
         setStatus('connected');
         _wsReconnectCount = 0;
         _startWsKeepAlive();
+        _updateCommitButton();
 
         // Send session config.
         try {
@@ -4263,7 +4482,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
             translate_interim: Boolean(translateInterimEnabled),
           };
           dbg('ws:/ws/elevenlabs send', config);
-          socket.send(JSON.stringify(config));
+          sessionSocket.send(JSON.stringify(config));
         } catch (_e) {
           // no-op
         }
@@ -4280,7 +4499,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
           });
           // Stop/engine-switch during the mic prompt — release the fresh mic and
           // don't build a zombie audio pipeline feeding a dead session.
-          if (sessionGen !== recordingGeneration) {
+          if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* no-op */ }
             try { event.target.close(); } catch (_e) { /* no-op */ }
             return;
@@ -4324,7 +4543,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             // Stop/engine-switch during addModule() — bail before wiring nodes into
             // the graph. The stop path already closed the old AudioContext/mic; the
             // globals may now belong to a freshly started session, so don't touch them.
-            if (sessionGen !== recordingGeneration) {
+            if (sessionGen !== recordingGeneration || socket !== sessionSocket) {
               try { event.target.close(); } catch (_e) { /* no-op */ }
               return;
             }
@@ -4337,8 +4556,11 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             });
 
             processor.port.onmessage = (event) => {
-              if (socket && socket.readyState === WebSocket.OPEN) {
-                socket.send(event.data);
+              if (
+                sessionGen === recordingGeneration && socket === sessionSocket &&
+                _canSendAudio(sessionSocket)
+              ) {
+                sessionSocket.send(event.data);
               }
             };
 
@@ -4360,18 +4582,22 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             gainNode.connect(audioContext.destination);
 
             processor.onaudioprocess = (e) => {
-              if (socket && socket.readyState === WebSocket.OPEN) {
+              if (
+                sessionGen === recordingGeneration && socket === sessionSocket &&
+                _canSendAudio(sessionSocket)
+              ) {
                 const inputData = e.inputBuffer.getChannelData(0);
                 const int16Data = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
                   const s = Math.max(-1, Math.min(1, inputData[i]));
                   int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
-                socket.send(int16Data.buffer);
+                sessionSocket.send(int16Data.buffer);
               }
             };
           }
         } catch (err) {
+          if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
           console.error('Error accessing microphone:', err);
           setStatus('error');
           showMessage('Unable to access microphone: ' + (err && err.message ? err.message : String(err)));
@@ -4379,7 +4605,8 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         }
       };
 
-      socket.onmessage = (event) => {
+      sessionSocket.onmessage = (event) => {
+        if (sessionGen !== recordingGeneration || socket !== sessionSocket) return;
         let data;
         try { data = JSON.parse(event.data); } catch (_e) { return; }
         if (data.type === 'pong') {
@@ -4393,9 +4620,12 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         }
         dbg('ws:/ws/elevenlabs recv', data);
         if (data.error) {
-          setStatus('error');
           showMessage('Server error: ' + data.error);
-          return;
+          if (!data.type) {
+            stopRecording();
+            setStatus('error');
+            return;
+          }
         }
 
         const nowPerf = performance.now();
@@ -4430,6 +4660,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
           }
           handleTranslationMessage(data);
           updateStatsBar();
+          _finishManualCommitStop();
         }
       };
     }
@@ -4491,9 +4722,14 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         const s = document.createElement('script');
         s.src = `https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@${AZURE_SDK_VERSION}/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js`;
         s.async = true;
-        s.onload = () => window.SpeechSDK
-          ? resolve(window.SpeechSDK)
-          : reject(new Error('Azure SpeechSDK global missing after load'));
+        s.onload = () => {
+          if (window.SpeechSDK) {
+            resolve(window.SpeechSDK);
+          } else {
+            _azureSdkPromise = null;
+            reject(new Error('Azure SpeechSDK global missing after load'));
+          }
+        };
         s.onerror = () => { _azureSdkPromise = null; reject(new Error('Failed to load Azure SpeechSDK')); };
         document.head.appendChild(s);
       });
@@ -4614,6 +4850,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
           dbg('azure:canceled', { reason: String(e && e.reason), err: String((e && e.errorDetails) || '') });
           if (isErr) {
             showMessage('Azure recognition error: ' + ((e && e.errorDetails) || 'canceled'));
+            stopRecording();
             setStatus('error');
           }
         };
@@ -4621,6 +4858,9 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         reco.sessionStopped = () => {
           if (recordingGeneration !== gen) return;
           dbg('azure:sessionStopped');
+          showMessage('Azure recognition session stopped unexpectedly. Press Start to reconnect.');
+          stopRecording();
+          setStatus('error');
         };
 
         reco.startContinuousRecognitionAsync(
@@ -4676,6 +4916,11 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
     }
 
     function stopRecording() {
+      _elManualStopPending = false;
+      if (_elManualStopTimer != null) {
+        clearTimeout(_elManualStopTimer);
+        _elManualStopTimer = null;
+      }
       // Invalidate the current recording session up front: any in-flight async
       // callback (Web Speech onresult/onend, remote socket.onopen, local transcript
       // handler) will then see a changed generation and drop its event instead of
@@ -4693,14 +4938,18 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       // onend can't reset this after Stop (the generation is already bumped, so it
       // takes the stale-session branch), so reset the overlay state badge here.
       _wsState = 'idle';
+      hideLocalEngineProgress();
 
       if (recognition) {
+        const recognizer = recognition;
+        recognition = null;
+        _detachWebSpeechRecognition(recognizer);
         try {
           // abort(), not stop(): stop() keeps the session alive while the cloud
           // flushes a trailing final — on a rapid Stop→Start the generations
           // re-align and that stale final would leak into the fresh session.
           // abort() discards pending results and tears down immediately.
-          recognition.abort();
+          recognizer.abort();
         } catch (_e) {
           // no-op
         }
@@ -4735,6 +4984,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       startButton.disabled = false;
       stopButton.disabled = true;
+      _updateCommitButton();
       setStatus('disconnected');
       dbg('stopRecording', { engine: currentEngine });
       console.log('Recording stopped');
@@ -4751,6 +5001,13 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       }
     });
     document.addEventListener('keydown', (e) => {
+      const activeModal = !onboardingModal.hidden
+        ? onboardingModal
+        : (!settingsModal.hidden ? settingsModal : null);
+      if (activeModal && e.key === 'Tab') {
+        trapModalFocus(activeModal, e);
+        return;
+      }
       if (e.altKey && (e.ctrlKey || e.metaKey) && e.code === 'KeyD') {
         e.preventDefault();
         toggleDebugOverlay();
@@ -4836,6 +5093,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         const result = await SpeechRecognition.available({
           langs: [lang],
           processLocally: Boolean(processLocallyCheckbox.checked),
+          quality: 'dictation',
         });
         setWebSpeechLangStatus(`Availability for ${lang}: ${result}`);
         // The on-device model is fetched on demand — offer an explicit install so the
@@ -4861,7 +5119,11 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
       if (installWebSpeechModelButton) installWebSpeechModelButton.disabled = true;
       setWebSpeechLangStatus(`Installing on-device model for ${lang}… (large download)`);
       try {
-        const ok = await SpeechRecognition.install({ langs: [lang], processLocally: true });
+        const ok = await SpeechRecognition.install({
+          langs: [lang],
+          processLocally: true,
+          quality: 'dictation',
+        });
         if (ok) {
           setWebSpeechLangStatus(`On-device model ready for ${lang}. Enable "Process locally" to use it.`);
           _wsShowInstall(false, lang);
