@@ -960,3 +960,425 @@ def test_rendered_template_inline_javascript_parses(client, tmp_path):
         assert proc.returncode == 0, f"inline script block {index} is not valid JS:\n{proc.stderr}"
         checked += 1
     assert checked, "no non-empty inline script blocks were checked"
+
+
+# --- Wave A: env parsing / normalization helpers ---
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("5", 5), ("0", 0), ("-1", 7), ("abc", 7), ("", 7), ("1.5", 7)],
+)
+def test_env_int_falls_back_to_default_on_bad_input(monkeypatch, raw, expected):
+    monkeypatch.setenv("SRLT_TEST_INT", raw)
+    assert main._env_int("SRLT_TEST_INT", 7) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("2.5", 2.5), ("0", 7.0), ("-3", 7.0), ("abc", 7.0), ("", 7.0)],
+)
+def test_env_float_falls_back_to_default_on_bad_input(monkeypatch, raw, expected):
+    monkeypatch.setenv("SRLT_TEST_FLOAT", raw)
+    assert main._env_float("SRLT_TEST_FLOAT", 7.0) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("en", None),                      # not a list
+        (["en", "ru", "de"], ["en", "ru"]),  # capped at two
+        ([1, "en"], ["en"]),               # non-strings skipped
+        ([""], None),                      # blanks are not dests
+        (["  EN  "], ["en"]),              # trimmed + lowercased
+        (["en", "en"], ["en", "ru"]),      # duplicate pair rewritten
+        (["ru", "ru"], ["ru", "en"]),
+    ],
+)
+def test_normalize_translate_dests(value, expected):
+    assert main._normalize_translate_dests(value) == expected
+
+
+# --- Wave A: auth token internals ---
+
+
+def test_verify_auth_token_rejects_malformed_tokens(monkeypatch):
+    monkeypatch.setattr(main, "AUTH_SECRET", "unit-test-secret")
+
+    valid = main.create_auth_token()
+    payload_b64, sig_b64 = valid.split(".")
+    assert main.verify_auth_token(valid) is True
+
+    assert main.verify_auth_token(None) is False
+    assert main.verify_auth_token("") is False
+    assert main.verify_auth_token("no-dot") is False
+    assert main.verify_auth_token("a.b.c") is False
+    assert main.verify_auth_token(f"{payload_b64}.{sig_b64}x") is False  # bad signature
+
+    # Correctly signed, but the payload is not decodable JSON.
+    junk = main._b64url_encode(b"not-json")
+    assert main.verify_auth_token(f"{junk}.{main._sign(junk)}") is False
+
+    # Correctly signed JSON, but `exp` is not an int.
+    bad_exp = main._b64url_encode(b'{"exp":"soon"}')
+    assert main.verify_auth_token(f"{bad_exp}.{main._sign(bad_exp)}") is False
+
+
+def test_signing_without_a_secret_never_validates(monkeypatch):
+    monkeypatch.setattr(main, "AUTH_SECRET", "")
+    assert main._sign("payload") == ""
+    assert main.verify_auth_token("payload.signature") is False
+
+
+def test_is_origin_allowed_uses_allowlist_when_configured(monkeypatch):
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://a.example, https://b.example")
+    assert main.is_origin_allowed("https://a.example", "anything") is True
+    assert main.is_origin_allowed("https://b.example", "anything") is True
+    assert main.is_origin_allowed("https://evil.example", "anything") is False
+
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    # Without an allowlist the origin host must match the Host header.
+    assert main.is_origin_allowed("https://host.example", "host.example") is True
+    assert main.is_origin_allowed("https://other.example", "host.example") is False
+    assert main.is_origin_allowed(None, "host.example") is False
+    assert main.is_origin_allowed("https://host.example", None) is False
+
+
+# --- Wave A: /login and unconfigured-server paths ---
+
+
+def test_login_rejects_cross_origin_post(client):
+    resp = client.post(
+        "/login",
+        data={"password": "test-password", "next": "/"},
+        headers={"origin": "https://evil.example"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403
+
+
+def test_login_rejects_cross_origin_referer(client):
+    resp = client.post(
+        "/login",
+        data={"password": "test-password", "next": "/"},
+        headers={"referer": "https://evil.example/page"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403
+
+
+def test_login_without_app_password_is_a_server_error(client, monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "")
+    resp = client.post("/login", data={"password": "x"}, follow_redirects=False)
+    assert resp.status_code == 500
+
+
+def test_index_without_app_password_is_a_server_error(client, monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "")
+    resp = client.get("/")
+    assert resp.status_code == 500
+
+
+def test_translate_languages_without_app_password_is_a_server_error(client, monkeypatch):
+    monkeypatch.setattr(main, "APP_PASSWORD", "")
+    resp = client.get("/api/translate/languages")
+    assert resp.status_code == 500
+
+
+def test_translate_languages_falls_back_when_googletrans_lacks_languages(client, monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "googletrans", types.SimpleNamespace())
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.get("/api/translate/languages")
+    assert resp.status_code == 200
+    assert resp.json() == {"languages": []}
+
+
+# --- Wave A: parakeet static cache headers (mirrors the nemotron pair) ---
+
+
+def test_missing_parakeet_model_assets_are_not_cached_immutably(client):
+    resp = client.get("/static/parakeet/models/__missing_model_asset__.json")
+    assert resp.status_code == 404
+    assert resp.headers.get("cache-control") == "no-store"
+
+
+def test_existing_parakeet_model_assets_cached_immutably(client):
+    path = Path("app/static/parakeet/models/__cache_test__.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("ok")
+    try:
+        resp = client.get("/static/parakeet/models/__cache_test__.txt")
+    finally:
+        path.unlink(missing_ok=True)
+
+    assert resp.status_code == 200
+    assert resp.headers.get("cache-control") == "public, max-age=31536000, immutable"
+
+
+def test_parakeet_engine_module_is_revalidated(client):
+    resp = client.get("/static/parakeet/parakeet-engine.mjs")
+    assert resp.status_code == 200
+    assert resp.headers.get("cache-control") == "no-cache"
+
+
+# --- Wave A: queue micro-branches ---
+
+
+def test_latest_transcript_queue_serves_and_clears_a_lone_interim():
+    async def scenario():
+        queue = main.LatestTranscriptQueue()
+        assert queue.empty() is True
+        queue.put({"transcript": "interim", "is_final": False})
+        assert queue.empty() is False
+        assert (await queue.get())["transcript"] == "interim"
+        assert queue.empty() is True
+
+    asyncio.run(scenario())
+
+
+def test_latest_interim_queue_rejects_puts_after_close():
+    async def scenario():
+        queue = main.LatestInterimQueue()
+        queue.close()
+        assert queue.put(main.TranslationWork("a", "final", "cs", ["en"])) is False
+        assert await queue.get() is None
+
+    asyncio.run(scenario())
+
+
+def test_latest_interim_queue_rejects_finals_past_the_cap():
+    async def scenario():
+        queue = main.LatestInterimQueue(max_finals=1)
+        assert queue.put(main.TranslationWork("keep", "final", "cs", ["en"])) is True
+        assert queue.put(main.TranslationWork("reject", "final", "cs", ["en"])) is False
+        assert (await queue.get()).text == "keep"
+
+    asyncio.run(scenario())
+
+
+# --- Wave A: POST /api/azure/token ---
+
+
+def _fake_httpx_post(monkeypatch, handler):
+    """Route httpx.AsyncClient(...).post through `handler(url, **kwargs)`."""
+    import httpx
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, url, **kwargs):
+            return handler(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kw: FakeAsyncClient())
+
+
+class _FakeTextResponse:
+    def __init__(self, text="", status_code=200):
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        pass
+
+
+def test_azure_token_requires_auth(client):
+    assert client.post("/api/azure/token", json={}).status_code == 401
+
+
+def test_azure_token_returns_404_when_engine_disabled(client, monkeypatch):
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech"})
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+    assert client.post("/api/azure/token", json={}).status_code == 404
+
+
+def test_azure_token_uses_env_key_and_region(client, monkeypatch):
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "env-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "westeurope")
+    seen = {}
+
+    def handler(url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers", {})
+        return _FakeTextResponse("tok-from-azure")
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"token": "tok-from-azure", "region": "westeurope"}
+    assert seen["url"] == "https://westeurope.api.cognitive.microsoft.com/sts/v1.0/issueToken"
+    assert seen["headers"]["Ocp-Apim-Subscription-Key"] == "env-key"
+
+
+def test_azure_token_prefers_client_supplied_key_and_region(client, monkeypatch):
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "env-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "westeurope")
+    seen = {}
+
+    def handler(url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers", {})
+        return _FakeTextResponse("tok-client")
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={"api_key": "my-key", "region": "northeurope"})
+    assert resp.status_code == 200
+    assert resp.json() == {"token": "tok-client", "region": "northeurope"}
+    assert seen["url"].startswith("https://northeurope.")
+    assert seen["headers"]["Ocp-Apim-Subscription-Key"] == "my-key"
+
+
+def test_azure_token_without_configuration_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "")
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={})
+    assert resp.status_code == 400
+    assert "not configured" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("region", ["west europe", "west_europe", "we!", "a" * 41, "../evil"])
+def test_azure_token_rejects_regions_outside_the_charset(client, monkeypatch, region):
+    """The region is interpolated into the upstream URL — it must not inject a host."""
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "env-key")
+
+    def handler(url, **_kwargs):
+        raise AssertionError(f"upstream must not be called for region {region!r} (url={url})")
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={"region": region})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Invalid Azure region"
+
+
+def test_azure_token_passes_through_upstream_status(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "bad-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "westeurope")
+
+    def handler(url, **_kwargs):
+        response = httpx.Response(401, request=httpx.Request("POST", url))
+        raise httpx.HTTPStatusError("unauthorized", request=response.request, response=response)
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={})
+    assert resp.status_code == 401
+    assert "401" in resp.json()["detail"]
+
+
+def test_azure_token_maps_network_failure_to_502(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(main, "AZURE_SPEECH_KEY", "env-key")
+    monkeypatch.setattr(main, "AZURE_SPEECH_REGION", "westeurope")
+
+    def handler(_url, **_kwargs):
+        raise httpx.ConnectError("dns failure")
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/azure/token", json={})
+    assert resp.status_code == 502
+    assert "Failed to create Azure token" in resp.json()["detail"]
+
+
+# --- Wave A: /ws translation failure + ElevenLabs token error paths ---
+
+
+def test_ws_translation_failure_reports_error_and_recreates_the_translator(client, monkeypatch):
+    """A failed translation must not silently drop the final or reuse a stale session."""
+    created = []
+
+    class BrokenTranslator:
+        def __init__(self):
+            created.append(self)
+
+        async def translate(self, *_args, **_kwargs):
+            raise RuntimeError("upstream refused")
+
+    monkeypatch.setattr(main, "Translator", BrokenTranslator)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["type"] == "final"
+    assert data["error"] == "translation_failed"
+    assert data["original"] == "Ahoj"
+    assert data["translations"] == {"en": ""}
+    # The stale HTTP session is dropped and a fresh Translator built for the retry.
+    assert len(created) >= 2
+
+
+def test_elevenlabs_token_rejects_a_non_json_upstream_body(client, monkeypatch):
+    """A 200 whose body isn't JSON must not surface as a token-shaped success."""
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "xi-env-key")
+
+    class FakeResponse:
+        status_code = 200
+        text = "definitely not json"
+
+        def json(self):
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            pass
+
+    _fake_httpx_post(monkeypatch, lambda _url, **_kw: FakeResponse())
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/elevenlabs/token", json={})
+    assert resp.status_code == 502
+    assert "Failed to create token" in resp.json()["detail"]
+
+
+def test_elevenlabs_token_passes_through_upstream_status(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "xi-env-key")
+
+    def handler(url, **_kwargs):
+        response = httpx.Response(429, json={"detail": "quota"}, request=httpx.Request("POST", url))
+        raise httpx.HTTPStatusError("too many", request=response.request, response=response)
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/elevenlabs/token", json={})
+    assert resp.status_code == 429
+    # The upstream's own detail is preferred over the generic message.
+    assert resp.json()["detail"] == "quota"
+
+
+def test_elevenlabs_token_maps_network_failure_to_502(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "xi-env-key")
+
+    def handler(_url, **_kwargs):
+        raise httpx.ConnectError("dns failure")
+
+    _fake_httpx_post(monkeypatch, handler)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    resp = client.post("/api/elevenlabs/token", json={})
+    assert resp.status_code == 502
