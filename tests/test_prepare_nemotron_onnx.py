@@ -1,3 +1,4 @@
+import pytest
 import re
 import sys
 import types
@@ -80,3 +81,41 @@ def test_nemotron_sweeps_temporaries_and_the_fp32_working_copy(tmp_path, monkeyp
     assert not stale_tmp.exists()
     assert not workdir.exists()
     assert keeper.read_bytes() == b"{}"
+
+
+def test_atomic_write_commits_only_a_complete_file(tmp_path):
+    destination = tmp_path / "asset.bin"
+    destination.write_bytes(b"previous-complete")
+
+    def failing_write(temporary):
+        temporary.write_bytes(b"partial")
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        prepare._atomic_write(destination, failing_write)
+
+    # The previous asset survives and no debris is left behind.
+    assert destination.read_bytes() == b"previous-complete"
+    assert not destination.with_name(destination.name + ".tmp").exists()
+
+    prepare._atomic_write(destination, lambda temporary: temporary.write_bytes(b"new"))
+    assert destination.read_bytes() == b"new"
+    assert not destination.with_name(destination.name + ".tmp").exists()
+
+
+def test_download_rejects_an_empty_cached_file(tmp_path, monkeypatch):
+    snapshot = tmp_path / "snapshot"
+    (snapshot / prepare.SUBDIR).mkdir(parents=True)
+    for name in prepare.FILES:
+        (snapshot / prepare.SUBDIR / name).write_bytes(b"x")
+    # A truncated entry in the HF cache must fail here, not inside onnx.load.
+    (snapshot / prepare.SUBDIR / prepare.FILES[1]).write_bytes(b"")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kw: str(snapshot)),
+    )
+
+    with pytest.raises(SystemExit, match="missing or empty"):
+        prepare.download()

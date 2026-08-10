@@ -1220,6 +1220,21 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             # Queue pro předávání výsledků mezi vlákny
             result_queue = LatestTranscriptQueue(max_finals=DEEPGRAM_RESULT_QUEUE_SIZE)
             queue_overflowed = False
+            # Notifications posted from the listener thread run detached. Hold a
+            # strong reference so they cannot be garbage-collected mid-flight, and
+            # discard on completion so the set does not grow.
+            _background_tasks: set[asyncio.Task] = set()
+
+            def _notify_browser_detached(payload: dict) -> None:
+                async def _send() -> None:
+                    try:
+                        await _send_browser(payload)
+                    except Exception as send_err:
+                        logging.debug(f"Nelze poslat Deepgram notifikaci: {send_err}")
+
+                task = asyncio.create_task(_send())
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
 
             # Grace window to drain final results after shutdown.
             shutdown_deadline: float | None = None
@@ -1263,9 +1278,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                                     logging.error("Deepgram final transcript queue is full")
                                     stop_event.set()
                                     async_stop_event.set()
-                                    asyncio.create_task(
-                                        _send_browser({"error": "transcript_queue_full"})
-                                    )
+                                    _notify_browser_detached({"error": "transcript_queue_full"})
 
                                 event_loop.call_soon_threadsafe(_enqueue)
                 except Exception as e:
@@ -1277,13 +1290,9 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
 
                 def _notify() -> None:
                     async_stop_event.set()
-                    async def _send() -> None:
-                        try:
-                            await _send_browser({"error": str(error)})
-                        except Exception as send_err:
-                            logging.debug(f"Nelze poslat Deepgram error: {send_err}")
-
-                    asyncio.create_task(_send())
+                    # Vendor-supplied text: safe to forward, and it is what makes a
+                    # Deepgram-side failure diagnosable in the browser.
+                    _notify_browser_detached({"error": str(error)})
 
                 event_loop.call_soon_threadsafe(_notify)
             
@@ -1298,26 +1307,19 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             dg_socket.on(EventType.CLOSE, on_close)
             
             # Spustit poslouchání v samostatném vlákně
-            def _notify_listener_failure(message: str) -> None:
+            def _notify_listener_failure() -> None:
                 async_stop_event.set()
-
-                async def _send() -> None:
-                    try:
-                        await _send_browser({"error": f"Deepgram listener stopped: {message}"})
-                    except Exception as send_err:
-                        logging.debug(f"Nelze poslat Deepgram listener error: {send_err}")
-
-                asyncio.create_task(_send())
+                _notify_browser_detached({"error": "deepgram_listener_failed"})
 
             def listen_thread_func():
                 try:
                     dg_socket.start_listening()
                 except Exception as e:
-                    logging.error(f"Listen thread error: {e}")
+                    logging.exception("Listen thread error: %s", e)
                     stop_event.set()
                     # Tell the browser too. Without this the session just goes quiet:
                     # no transcripts, no error, and the UI keeps claiming to record.
-                    event_loop.call_soon_threadsafe(_notify_listener_failure, str(e))
+                    event_loop.call_soon_threadsafe(_notify_listener_failure)
             
             listen_thread = threading.Thread(target=listen_thread_func, daemon=True)
             listen_thread.start()
@@ -1434,20 +1436,26 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             process_task = asyncio.create_task(process_results())
             
             # Přijímání audio dat z prohlížeče
+            # Created once, not per frame: audio arrives ~30x/s and a fresh pair of
+            # tasks each time is pure churn.
+            upstream_stop_task = asyncio.create_task(async_stop_event.wait())
             try:
                 if first_audio:
                     await asyncio.to_thread(dg_socket.send_media, first_audio)
                 while not stop_event.is_set():
                     receive_task = asyncio.create_task(websocket.receive())
-                    upstream_stop_task = asyncio.create_task(async_stop_event.wait())
                     done, pending = await asyncio.wait(
                         {receive_task, upstream_stop_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for pending_task in pending:
-                        pending_task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
                     if upstream_stop_task in done:
+                        # Consume the frame's result too when both finished in the
+                        # same turn, or its exception is never retrieved.
+                        if receive_task in done:
+                            receive_task.exception()
+                        else:
+                            receive_task.cancel()
+                            await asyncio.gather(receive_task, return_exceptions=True)
                         break
                     msg = receive_task.result()
                     if msg.get("type") == "websocket.disconnect":
@@ -1460,6 +1468,8 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             except (WebSocketDisconnect, EndOfStream):
                 logging.info("Klient odpojen")
             finally:
+                upstream_stop_task.cancel()
+                await asyncio.gather(upstream_stop_task, return_exceptions=True)
                 stop_event.set()
                 async_stop_event.set()
                 try:
@@ -1485,9 +1495,12 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, EndOfStream):
         logging.info("Deepgram WebSocket odpojen klientem.")
     except Exception as e:
-        logging.error(f"Deepgram chyba: {str(e)}")
+        # Generic code to the browser, detail to the log: an unexpected exception
+        # here is a bug or a config problem, and its message can carry paths and
+        # SDK internals. Vendor-sent errors keep their text (see on_error).
+        logging.exception("Deepgram chyba: %s", e)
         try:
-            await _send_browser({"error": str(e)})
+            await _send_browser({"error": "server_error"})
         except Exception as send_err:
             logging.debug(f"Nelze poslat Deepgram error: {send_err}")
     finally:
@@ -1827,9 +1840,10 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, EndOfStream):
         logging.info("ElevenLabs WebSocket odpojen klientem.")
     except Exception as e:
-        logging.error(f"ElevenLabs chyba: {str(e)}")
+        # Same reasoning as /ws/deepgram: generic code out, detail to the log.
+        logging.exception("ElevenLabs chyba: %s", e)
         try:
-            await websocket.send_json({"error": str(e)})
+            await websocket.send_json({"error": "server_error"})
         except Exception as send_err:
             logging.debug(f"Nelze poslat ElevenLabs error: {send_err}")
     finally:

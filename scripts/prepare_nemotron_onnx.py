@@ -151,13 +151,7 @@ def _write_concat_limited_encoder_variants(model) -> None:
     for max_storage_buffers, filename in ENCODER_CONCAT_VARIANTS:
         variant = copy.deepcopy(model)
         rewritten = _split_large_concat_nodes(variant, max_storage_buffers=max_storage_buffers)
-        destination = OUT_DIR / filename
-        temporary = destination.with_name(destination.name + ".tmp")
-        try:
-            onnx.save_model(variant, str(temporary))
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _atomic_write(OUT_DIR / filename, lambda tmp, v=variant: onnx.save_model(v, str(tmp)))
         print(
             f"      wrote {filename} for WebGPU storage-buffer limit {max_storage_buffers} "
             f"({rewritten} Concat node(s) split)"
@@ -204,8 +198,10 @@ def download() -> Path:
     src = Path(local) / SUBDIR
     for f in FILES:
         p = src / f
-        if not p.exists():
-            sys.exit(f"  ! missing expected file: {p}")
+        # Zero-length counts as missing: a truncated cache entry would otherwise
+        # only surface later as a confusing onnx.load failure.
+        if not _is_nonempty_file(p):
+            sys.exit(f"  ! missing or empty file: {p}")
         print(f"      {f:24s} {_human(p.stat().st_size)}")
     return src
 
@@ -326,12 +322,8 @@ def convert_encoder_fp16(src: Path) -> None:
     finally:
         data_temporary.unlink(missing_ok=True)
 
-    graph_temporary = out_onnx.with_name(out_onnx.name + ".tmp")
-    try:
-        onnx.save_model(model, str(graph_temporary))  # graph + small inline tensors; refs our .data
-        os.replace(graph_temporary, out_onnx)
-    finally:
-        graph_temporary.unlink(missing_ok=True)
+    # graph + small inline tensors; references the .data written above
+    _atomic_write(out_onnx, lambda tmp: onnx.save_model(model, str(tmp)))
     print("      writing Concat-limited encoder graph variants for lower WebGPU limits…")
     _write_concat_limited_encoder_variants(model)
 
@@ -348,13 +340,7 @@ def convert_encoder_fp16(src: Path) -> None:
 
     # decoder_joint stays fp32 (small; runs on WASM per-token).
     for source_name in ("decoder_joint.onnx", "config.json"):
-        destination = OUT_DIR / source_name
-        temporary = destination.with_name(destination.name + ".tmp")
-        try:
-            shutil.copy2(src / source_name, temporary)
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _atomic_write(OUT_DIR / source_name, lambda tmp, n=source_name: shutil.copy2(src / n, tmp))
     print(f"      copied decoder_joint.onnx ({_human((OUT_DIR / 'decoder_joint.onnx').stat().st_size)}) + config.json")
 
 
@@ -364,17 +350,30 @@ def extract_vocab(src: Path) -> None:
     print("\n[4/4] Extracting vocab.json from tokenizer.model…")
     sp = spm.SentencePieceProcessor(model_file=str(src / "tokenizer.model"))
     pieces = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
-    destination = OUT_DIR / "vocab.json"
-    temporary = destination.with_name(destination.name + ".tmp")
-    try:
-        temporary.write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _atomic_write(
+        OUT_DIR / "vocab.json",
+        lambda tmp: tmp.write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8"),
+    )
     cfg = json.loads((src / "config.json").read_text())
     print(f"      sentencepiece pieces: {len(pieces)}  (config vocab_size={cfg.get('vocab_size')}, "
           f"blank_id={cfg.get('blank_id')})")
     print(f"      sample pieces: {pieces[:5]} … unk={sp.id_to_piece(sp.unk_id())!r}")
+
+
+def _atomic_write(destination: Path, write_fn) -> None:
+    """Write through `<destination>.tmp`, then rename into place.
+
+    A crash therefore never leaves a half-written asset where a complete one is
+    expected — the rename is the commit point. Callers that also need power-loss
+    durability fsync inside `write_fn` before it returns (the multi-GB weights
+    writer does); rename alone only orders the visibility, not the flush.
+    """
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        write_fn(temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _sweep_stale_temporaries() -> None:

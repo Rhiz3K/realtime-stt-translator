@@ -69,7 +69,7 @@ def test_nemotron_template_exposes_local_engine_progress_status():
     assert 'id="localEngineProgress"' in html
     assert 'function showLocalEngineProgress' in html
     assert "handleLocalEngineStatus(status)" in html
-    assert "nemotron-engine.mjs?v=5" in html
+    assert "nemotron-engine.mjs?v=6" in html
 
 
 def test_nemotron_template_exposes_webgpu_debug_panel():
@@ -280,3 +280,33 @@ def test_template_releases_engine_sessions_on_every_stop():
     stop_helper = html.split("function stopLocalEnginePipeline")[1].split("function stopWhisperPipeline")[0]
     assert "engine.stop()" in stop_helper
     assert "engine.dispose()" in stop_helper
+
+
+@requires_node
+def test_nemotron_aborts_encoder_work_when_the_engine_is_stopped():
+    """A stop during a long final must not keep dispatching encoder sub-chunks."""
+    script = """
+        import { NemotronModel } from './app/static/nemotron/nemotron-engine.mjs';
+
+        const model = Object.create(NemotronModel.prototype);
+        let encoded = 0;
+        model._assembleChunk = () => ({ chunk: new Float32Array(1), P: 1 });
+        model._encodeOne = async () => { encoded += 1; return { encoded: new Float32Array(1), Tout: 1 }; };
+        model.decoder = { decode: async () => {} };
+
+        // 10 sub-chunks worth of frames, aborted after the second.
+        const consumed = await model.pushFrames(
+          new Float32Array(1), 1, 0, 56 * 10, 0, () => {}, () => encoded >= 2,
+        );
+
+        if (encoded !== 2) throw new Error(`kept encoding after abort: ${encoded}`);
+        if (consumed !== 56 * 2) throw new Error(`reported wrong consumed count: ${consumed}`);
+
+        // Without the abort callback it runs to completion and reports every frame.
+        encoded = 0;
+        const all = await model.pushFrames(new Float32Array(1), 1, 0, 56 * 3, 0, () => {});
+        if (encoded !== 3 || all !== 56 * 3) {
+          throw new Error(`unaborted run: encoded=${encoded} consumed=${all}`);
+        }
+    """
+    run_node(script)

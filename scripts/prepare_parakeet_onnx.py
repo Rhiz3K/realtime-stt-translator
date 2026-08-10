@@ -149,7 +149,11 @@ def main() -> None:
 
     src = download(ALL_FILES)
     inspect(src)
-    install(src)
+    try:
+        install(src)
+    except RuntimeError as exc:
+        # Same clean one-line failure as download()'s sys.exit, without a traceback.
+        sys.exit(f"  ! {exc}")
     print("\nDone. Set ENABLED_ENGINES to include 'parakeet' to expose the engine.")
 
 

@@ -60,7 +60,8 @@ export const WHISPER_MODELS = {
     label: 'large-v3-turbo (top quality, WebGPU only)',
     multilingual: true,
     webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
-    wasm: 'q8',
+    // No `wasm` entry on purpose: load() rejects this model without WebGPU, so a
+    // CPU dtype here would only suggest a path that does not exist.
   },
 };
 

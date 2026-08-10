@@ -29,6 +29,12 @@ function emitStatus(onStatus, text, progress, indeterminate = false) {
   onStatus({ text, progress, indeterminate });
 }
 
+// Transient notice rather than load progress: same object shape, different field,
+// so the UI can show it without disturbing the progress bar.
+function emitNotice(onStatus, message) {
+  onStatus({ message: String(message) });
+}
+
 export function parakeetModelAssetUrl(dir, file) {
   const sep = String(dir).includes("?") ? "&" : "?";
   return `${dir}/${file}${sep}v=${PARAKEET_MODEL_ASSET_VERSION}`;
@@ -204,6 +210,9 @@ export class ParakeetLocalEngine {
 
   stop() {
     this._lifecycle++;
+    // Detach the handler before anything else: AudioContext.close() is async, so a
+    // frame already in flight would otherwise mutate freshly reset capture state.
+    try { if (this._node) this._node.port.onmessage = null; } catch (_e) {}
     try { if (this._node) this._node.disconnect(); } catch (_e) {}
     try { if (this._ctx) this._ctx.close(); } catch (_e) {}
     try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
@@ -265,7 +274,7 @@ export class ParakeetLocalEngine {
         this._finalJobs.push(audio);
         if (this._finalJobs.length > MAX_PENDING_FINALS) {
           this._finalJobs.shift();
-          this.onStatus("Parakeet can't keep up — dropped the oldest buffered final segment");
+          emitNotice(this.onStatus, "Parakeet can't keep up — dropped the oldest buffered final segment");
         }
       }
     } else {
@@ -295,7 +304,7 @@ export class ParakeetLocalEngine {
       try {
         await this._process(audio, isFinal);
       } catch (e) {
-        this.onStatus("Parakeet error: " + (e && e.message ? e.message : e));
+        emitNotice(this.onStatus, "Parakeet error: " + (e && e.message ? e.message : e));
       }
       if (lifecycle !== this._lifecycle) return;
     }

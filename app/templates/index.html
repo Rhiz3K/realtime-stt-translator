@@ -918,7 +918,7 @@
       <h2 class="card-title" id="czTitle">Source</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="recognizedContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Recognized text"></div>
+      <div class="log" id="recognizedContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions" aria-label="Recognized text"></div>
     </div>
   </section>
 
@@ -927,7 +927,7 @@
       <h2 class="card-title" id="enTitle">Target A</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="translationEnContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Translation"></div>
+      <div class="log" id="translationEnContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions" aria-label="Translation"></div>
     </div>
   </section>
 
@@ -936,7 +936,7 @@
       <h2 class="card-title" id="ruTitle">Target B</h2>
     </div>
     <div class="card-body">
-      <div class="log" id="translationRuContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Translation"></div>
+      <div class="log" id="translationRuContainer" tabindex="0" role="log" aria-live="polite" aria-relevant="additions" aria-label="Translation"></div>
     </div>
   </section>
 {% endblock %}
@@ -1157,6 +1157,7 @@
     let _elBrowserWs = null;         // direct ElevenLabs WS in browser mode
     let _elManualStopPending = false;
     let _elManualStopTimer = null;
+    let _elManualStopClientIdFloor = 0; // finals below this predate the commit
     // Server translation may legitimately consume its 10 s timeout. Keep the
     // sockets alive slightly longer so Stop does not discard the committed final.
     const _EL_MANUAL_STOP_TIMEOUT_MS = 12000;
@@ -1357,11 +1358,17 @@
 
     function handleLocalEngineStatus(status) {
       if (!status) return;
-      if (typeof status === 'object') {
-        showLocalEngineProgress(status);
+      // Whisper reports plain strings; Nemotron/Parakeet send {text,progress,...}
+      // for load progress and {message} for transient notices.
+      if (typeof status === 'string') {
+        showMessage(status);
         return;
       }
-      showMessage(String(status));
+      if (typeof status.message === 'string') {
+        showMessage(status.message);
+        return;
+      }
+      showLocalEngineProgress(status);
     }
 
     function setStatus(state) {
@@ -3109,6 +3116,10 @@
       // Insert <div class="interim">...</div> at the top (prepend).
       const interimDiv = document.createElement('div');
       interimDiv.classList.add('interim');
+      // Hidden from the live region: interims are removed and re-prepended several
+      // times per second, which would make a screen reader announce every partial
+      // hypothesis. Committed segments still get announced.
+      interimDiv.setAttribute('aria-hidden', 'true');
       interimDiv.textContent = text;
       container.prepend(interimDiv);
     }
@@ -3209,12 +3220,20 @@
     }
 
     function requestStopRecording() {
+      // Already waiting on a committed transcript and the user pressed Stop again:
+      // treat it as "stop now, I don't want to wait" rather than ignoring the click.
+      if (_elManualStopPending) {
+        _finishManualCommitStop();
+        return;
+      }
       if (_requestElevenLabsCommit()) {
         _elManualStopPending = true;
+        // Only a final produced *after* this commit ends the wait — an in-flight
+        // translation of an earlier utterance must not cut the committed one off.
+        _elManualStopClientIdFloor = _trNextClientId;
         // Stop producing new audio after the commit boundary, but keep both sockets
         // alive long enough to receive and translate the committed transcript.
         stopDeepgramPipeline();
-        stopButton.disabled = true;
         _updateCommitButton();
         _elManualStopTimer = setTimeout(_finishManualCommitStop, _EL_MANUAL_STOP_TIMEOUT_MS);
         return;
@@ -3489,7 +3508,8 @@
         }
         if (
           _elManualStopPending && currentEngine === 'elevenlabs' &&
-          elevenlabsMode === 'browser' && data.type === 'final'
+          elevenlabsMode === 'browser' && data.type === 'final' &&
+          (typeof data.client_id !== 'number' || data.client_id >= _elManualStopClientIdFloor)
         ) {
           _finishManualCommitStop();
         }
@@ -3809,7 +3829,7 @@
           // no-Cache-Control static response as heuristically fresh and keep
           // serving an old copy across reloads. Bump it whenever the engine or its
           // pinned ORT/transformers versions change.
-          const mod = await import('/static/whisper/whisper-engine.mjs?v=11');
+          const mod = await import('/static/whisper/whisper-engine.mjs?v=12');
           return new mod.WhisperLocalEngine({
             modelKey: whisperModel,
             device: whisperDevice,
@@ -3834,7 +3854,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes (kept in sync with the CSP in main.py).
-          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=5');
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=6');
           return new mod.NemotronLocalEngine({
             device: nemotronDevice,
             language: translateSrc || 'cs',
@@ -3859,7 +3879,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes.
-          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=3');
+          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=4');
           return new mod.ParakeetLocalEngine({
             device: parakeetDevice,
             language: translateSrc || 'cs',

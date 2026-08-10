@@ -296,7 +296,8 @@ def test_ws_deepgram_init_failure_sends_error(client, monkeypatch):
         ws.send_json({"type": "config", "deepgram": {"language": "cs"}})
         payload = ws.receive_json()
 
-    assert payload == {"error": "boom"}
+    # Generic code out; the exception detail stays in the server log.
+    assert payload == {"error": "server_error"}
 
 
 def test_ws_deepgram_missing_sdk_returns_error(client, monkeypatch):
@@ -1826,4 +1827,4 @@ def test_ws_deepgram_listener_crash_is_reported_to_the_browser(client, monkeypat
 
     # Typeless error -> the browser stops the session instead of hanging.
     assert "type" not in data
-    assert "listener died" in data["error"]
+    assert data["error"] == "deepgram_listener_failed"

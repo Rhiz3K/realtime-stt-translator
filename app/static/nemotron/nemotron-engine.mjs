@@ -38,6 +38,12 @@ function emitStatus(onStatus, text, progress, indeterminate = false) {
   onStatus({ text, progress, indeterminate });
 }
 
+// Transient notice rather than load progress: same object shape, different field,
+// so the UI can show it without disturbing the progress bar.
+function emitNotice(onStatus, message) {
+  onStatus({ message: String(message) });
+}
+
 async function fetchJson(url, label) {
   const res = await fetch(url);
   if (!res.ok) {
@@ -247,16 +253,21 @@ export class NemotronModel {
    * into CHUNK_FRAMES steps so each encoder call matches the export's streaming
    * chunk. Caches + decoder state persist across calls (continuous stream).
    * @param {(id:number)=>void} emit per emitted token id
+   * @param {() => boolean} [shouldAbort] checked between sub-chunks, so a stop
+   *   during a long final does not keep dispatching encoder work at a dead engine
+   * @returns {Promise<number>} mel frames actually consumed (< count if aborted)
    */
-  async pushFrames(melData, T, fromFrame, count, promptIndex, emit) {
+  async pushFrames(melData, T, fromFrame, count, promptIndex, emit, shouldAbort) {
     let off = 0;
     while (off < count) {
+      if (shouldAbort && shouldAbort()) break;
       const n = Math.min(CHUNK_FRAMES, count - off);
       const { chunk, P } = this._assembleChunk(melData, T, fromFrame + off, n);
       const { encoded, Tout } = await this._encodeOne(chunk, P, promptIndex);
       await this.decoder.decode(encoded, Tout, emit);
       off += n;
     }
+    return off;
   }
 
   /** Convenience for offline/whole-buffer use (PoC): mel a full clip, decode it. */
@@ -357,6 +368,9 @@ export class NemotronLocalEngine {
 
   stop() {
     this._lifecycle++;
+    // Detach the handler before anything else: AudioContext.close() is async, so a
+    // frame already in flight would otherwise mutate freshly reset capture state.
+    try { if (this._node) this._node.port.onmessage = null; } catch (_e) {}
     try { if (this._node) this._node.disconnect(); } catch (_e) {}
     try { if (this._ctx) this._ctx.close(); } catch (_e) {}
     try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
@@ -436,7 +450,7 @@ export class NemotronLocalEngine {
           // nothing and the segments behind them would inherit stale stream state.
           // The push above guarantees at least one audio job, so the index is valid.
           this._finalJobs.splice(this._finalJobs.findIndex((job) => job !== DISCARD_DECODE), 1);
-          this.onStatus("Nemotron can't keep up — dropped the oldest buffered final segment");
+          emitNotice(this.onStatus, "Nemotron can't keep up — dropped the oldest buffered final segment");
         }
       }
     } else {
@@ -469,7 +483,7 @@ export class NemotronLocalEngine {
       try {
         await this._process(audio, isFinal);
       } catch (e) {
-        this.onStatus("Nemotron error: " + (e && e.message ? e.message : e));
+        emitNotice(this.onStatus, "Nemotron error: " + (e && e.message ? e.message : e));
       } finally {
         // A failed final must not leak decoder/cache state into the next
         // utterance. Capture state is independent and may already contain new
@@ -491,12 +505,18 @@ export class NemotronLocalEngine {
   }
 
   async _process(audio, isFinal) {
+    const lifecycle = this._lifecycle;
     const { data, nFrames } = computeLogMel(audio, { normalize: this.normalize });
     const avail = nFrames - this._consumed;
     const count = isFinal ? avail : Math.floor((avail - EDGE_MARGIN_FRAMES) / CHUNK_FRAMES) * CHUNK_FRAMES;
     if (count > 0) {
-      await this._model.pushFrames(data, nFrames, this._consumed, count, this._promptIndex, (id) => this._uttTokens.push(id));
-      this._consumed += count;
+      const consumed = await this._model.pushFrames(
+        data, nFrames, this._consumed, count, this._promptIndex,
+        (id) => this._uttTokens.push(id),
+        () => lifecycle !== this._lifecycle,
+      );
+      this._consumed += consumed;
+      if (consumed < count) return; // stopped mid-utterance; nothing to emit
     } else if (!isFinal) {
       return;
     }
