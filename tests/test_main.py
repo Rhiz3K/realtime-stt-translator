@@ -1,3 +1,6 @@
+import types
+import base64
+import json
 import asyncio
 from pathlib import Path
 import re
@@ -1382,3 +1385,407 @@ def test_elevenlabs_token_maps_network_failure_to_502(client, monkeypatch):
 
     resp = client.post("/api/elevenlabs/token", json={})
     assert resp.status_code == 502
+
+
+# --- Wave B: audio forwarding, interim translation, worker failure ---
+
+
+def test_ws_elevenlabs_forwards_audio_commit_and_ping(client, monkeypatch):
+    """_forward_audio: browser PCM -> base64 chunks, plus the commit/ping commands."""
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    upstream_sent = []
+
+    class GatedElevenSocket:
+        def __init__(self):
+            self.committed = asyncio.Event()
+            self.closed = False
+            self._done = False
+
+        async def recv(self):
+            return '{"message_type":"session_started","session_id":"session-1"}'
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            # Keep the upstream open until the client commits.
+            await self.committed.wait()
+            self._done = True
+            return '{"message_type":"committed_transcript","text":"ahoj"}'
+
+        async def send(self, payload):
+            message = json.loads(payload)
+            upstream_sent.append(message)
+            if message.get("commit"):
+                self.committed.set()
+
+        async def close(self):
+            self.closed = True
+
+    upstream = GatedElevenSocket()
+    _connect_fake_elevenlabs(monkeypatch, upstream)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"]}})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "ping"})
+        pong = ws.receive_json()
+        ws.send_json({"type": "commit"})
+        final = ws.receive_json()
+
+    assert pong == {"type": "pong"}
+    assert final["type"] == "final"
+    assert final["translations"] == {"en": "en:ahoj"}
+
+    audio = [m for m in upstream_sent if m.get("audio_base_64")]
+    assert audio, f"no audio forwarded: {upstream_sent}"
+    assert base64.b64decode(audio[0]["audio_base_64"]) == b"\x00\x01\x02\x03"
+    assert audio[0]["commit"] is False
+    assert audio[0]["sample_rate"] == 16000
+
+    commits = [m for m in upstream_sent if m.get("commit")]
+    assert commits and commits[-1]["audio_base_64"] == ""
+
+
+def test_ws_deepgram_translates_interim_when_requested(client, monkeypatch):
+    """translate_interim=true routes interims through the translator too."""
+    monkeypatch.setattr(main, "DEEPGRAM_API_KEY", "test-key")
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    class FakeAlt:
+        def __init__(self, transcript):
+            self.transcript = transcript
+
+    class FakeChannel:
+        def __init__(self, transcript):
+            self.alternatives = [FakeAlt(transcript)]
+
+    class FakeResults:
+        def __init__(self, transcript, is_final):
+            self.channel = FakeChannel(transcript)
+            self.is_final = is_final
+
+    interim_delivered = threading.Event()
+
+    class FakeDgSocket:
+        def __init__(self):
+            self._handlers = {}
+
+        def on(self, event_type, callback):
+            self._handlers[event_type] = callback
+
+        def start_listening(self):
+            msg_cb = self._handlers.get(main.EventType.MESSAGE)
+            msg_cb(FakeResults("prubezne", False))
+            # Hold the final back so the interim cannot be coalesced away — the
+            # point of this test is the interim translation branch.
+            interim_delivered.wait(timeout=10)
+            msg_cb(FakeResults("finalni", True))
+
+        def send_media(self, data):
+            pass
+
+        def send_finalize(self, _message=None):
+            pass
+
+        def send_close_stream(self, _message=None):
+            pass
+
+    fake_socket = FakeDgSocket()
+
+    class _FakeSocketIterator:
+        def __init__(self):
+            self._sent = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._sent:
+                raise StopIteration
+            self._sent = True
+            return fake_socket
+
+        def close(self):
+            pass
+
+    fake_iter = _FakeSocketIterator()
+
+    class FakeDeepgramClient:
+        def __init__(self, api_key):
+            class _V1:
+                def connect(self, **_kwargs):
+                    return fake_iter
+
+            class _Listen:
+                v1 = _V1()
+
+            self.listen = _Listen()
+
+    monkeypatch.setattr(main, "DeepgramClient", FakeDeepgramClient)
+    client.post("/login", data={"password": "test-password", "next": "/deepgram"}, follow_redirects=False)
+
+    try:
+        with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
+            ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"]}, "translate_interim": True})
+            ws.send_bytes(b"\x00\x01")
+            interim = ws.receive_json()
+            interim_delivered.set()
+            final = ws.receive_json()
+    finally:
+        interim_delivered.set()
+
+    assert interim["type"] == "interim"
+    assert interim["original"] == "prubezne"
+    assert interim["translations"] == {"en": "en:prubezne"}
+    assert final["type"] == "final"
+    assert final["translations"] == {"en": "en:finalni"}
+
+
+def test_ws_unexpected_worker_error_reports_server_error_and_closes_1011(client, monkeypatch):
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("payload construction failed")
+
+    monkeypatch.setattr(main, "_translation_payload", boom)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+        # Typeless error -> terminal, and the server closes with 1011.
+        assert data == {"error": "server_error"}
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_json()
+
+    assert excinfo.value.code == 1011
+
+
+def _deepgram_client_for(fake_socket):
+    """Wrap a fake socket in the v3-style iterator/client the endpoint expects."""
+
+    class _FakeSocketIterator:
+        def __init__(self):
+            self._sent = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._sent:
+                raise StopIteration
+            self._sent = True
+            return fake_socket
+
+        def close(self):
+            pass
+
+    iterator = _FakeSocketIterator()
+
+    class FakeDeepgramClient:
+        def __init__(self, api_key):
+            class _V1:
+                def connect(self, **_kwargs):
+                    return iterator
+
+            class _Listen:
+                v1 = _V1()
+
+            self.listen = _Listen()
+
+    return FakeDeepgramClient
+
+
+def test_ws_deepgram_upstream_error_is_forwarded_and_stops_the_session(client, monkeypatch):
+    monkeypatch.setattr(main, "DEEPGRAM_API_KEY", "test-key")
+
+    class FakeDgSocket:
+        def __init__(self):
+            self._handlers = {}
+            self.closed = False
+
+        def on(self, event_type, callback):
+            self._handlers[event_type] = callback
+
+        def start_listening(self):
+            self._handlers[main.EventType.ERROR]("upstream exploded")
+
+        def send_media(self, data):
+            pass
+
+        def send_finalize(self, _message=None):
+            pass
+
+        def send_close_stream(self, _message=None):
+            self.closed = True
+
+    monkeypatch.setattr(main, "DeepgramClient", _deepgram_client_for(FakeDgSocket()))
+    client.post("/login", data={"password": "test-password", "next": "/deepgram"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws/deepgram", headers={"origin": "http://testserver"}) as ws:
+        ws.send_bytes(b"\x00\x01")
+        data = ws.receive_json()
+
+    # Typeless error -> the browser tears the session down.
+    assert "type" not in data
+    assert data["error"] == "upstream exploded"
+
+
+def test_ws_elevenlabs_untranslated_interim_still_reaches_the_browser(client, monkeypatch):
+    """translate_interim defaults off: interims are forwarded with empty translations."""
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    upstream = _elevenlabs_socket_emitting(
+        [
+            '{"message_type":"partial_transcript","text":"ah"}',
+            '{"message_type":"committed_transcript","text":"ahoj"}',
+        ]
+    )
+    _connect_fake_elevenlabs(monkeypatch, upstream)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json(
+            {
+                "type": "config",
+                "translate": {"src": "cs", "dests": ["en"]},
+                "translate_interim": False,
+            }
+        )
+        messages = []
+        for _ in range(2):
+            message = ws.receive_json()
+            messages.append(message)
+            if message["type"] == "final":
+                break
+
+    final = messages[-1]
+    assert final["type"] == "final"
+    assert final["translations"] == {"en": "en:ahoj"}
+    for interim in messages[:-1]:
+        assert interim["type"] == "interim"
+        # Untranslated: the text is forwarded, the translation slot stays empty.
+        assert interim["original"] == "ah"
+        assert interim["translations"] == {"en": ""}
+
+
+# --- Wave C: small helpers that are cheaper to test than to exempt ---
+
+
+def test_close_translator_tolerates_missing_and_failing_clients():
+    async def scenario():
+        await main._close_translator(None)  # no translator at all
+
+        class Closed:
+            def __init__(self):
+                self.calls = 0
+
+            async def aclose(self):
+                self.calls += 1
+
+        client = Closed()
+        await main._close_translator(types.SimpleNamespace(client=client))
+        assert client.calls == 1
+
+        class Broken:
+            async def aclose(self):
+                raise RuntimeError("already closed")
+
+        # A failing close must not propagate — it runs on teardown paths.
+        await main._close_translator(types.SimpleNamespace(client=Broken()))
+        await main._close_translator(types.SimpleNamespace(client=object()))
+
+    asyncio.run(scenario())
+
+
+def test_cookie_secure_follows_scheme_unless_overridden(monkeypatch):
+    class FakeUrl:
+        def __init__(self, scheme):
+            self.scheme = scheme
+
+    class FakeRequest:
+        def __init__(self, scheme):
+            self.url = FakeUrl(scheme)
+
+    monkeypatch.delenv("AUTH_COOKIE_SECURE", raising=False)
+    assert main._cookie_secure_for_request(FakeRequest("https")) is True
+    assert main._cookie_secure_for_request(FakeRequest("http")) is False
+
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+    assert main._cookie_secure_for_request(FakeRequest("http")) is True
+
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "no")
+    assert main._cookie_secure_for_request(FakeRequest("https")) is False
+
+
+def test_ws_echoes_client_correlation_fields(client, monkeypatch):
+    """client_id/client_sent_ms round-trip so the browser can measure latency."""
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json(
+            {
+                "type": "final",
+                "text": "Ahoj",
+                "src": "cs",
+                "dests": ["en"],
+                "client_id": 42,
+                "client_sent_ms": 123.5,
+            }
+        )
+        data = ws.receive_json()
+
+    assert data["client_id"] == 42
+    assert data["client_sent_ms"] == 123.5
+
+
+def test_ws_supports_a_synchronous_translator(client, monkeypatch):
+    """googletrans ships both sync and async variants; the sync one is offloaded."""
+    calls = []
+
+    class SyncTranslator:
+        def translate(self, text, src, dest):
+            calls.append((text, src, dest, threading.current_thread().name))
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", SyncTranslator)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["translations"] == {"en": "en:Ahoj"}
+    assert calls and calls[0][:3] == ("Ahoj", "cs", "en")

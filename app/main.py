@@ -440,7 +440,7 @@ def is_origin_allowed(origin: str | None, host: str | None) -> bool:
         return False
     try:
         parsed = urlparse(origin)
-    except Exception:
+    except Exception:  # pragma: no cover - urlparse practically never raises on a str
         return False
     return parsed.netloc == host
 
@@ -563,10 +563,10 @@ def _deepgram_send_finalize(dg_socket) -> None:
 
             dg_socket.send_finalize(ListenV1Finalize(type="Finalize"))
             return
-        except Exception:
+        except Exception:  # pragma: no cover - depends on installed deepgram-sdk version
             pass
 
-    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:
+    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:  # pragma: no cover
         try:
             dg_socket.send_control(ListenV1ControlMessage(type="Finalize"))
         except Exception:
@@ -582,10 +582,10 @@ def _deepgram_send_close_stream(dg_socket) -> None:
 
             dg_socket.send_close_stream(ListenV1CloseStream(type="CloseStream"))
             return
-        except Exception:
+        except Exception:  # pragma: no cover - depends on installed deepgram-sdk version
             pass
 
-    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:
+    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:  # pragma: no cover
         try:
             dg_socket.send_control(ListenV1ControlMessage(type="CloseStream"))
         except Exception:

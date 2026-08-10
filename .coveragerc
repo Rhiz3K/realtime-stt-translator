@@ -1,0 +1,11 @@
+[run]
+source = app
+omit =
+    # Dev-only tools, not part of the served app: a reference implementation used
+    # to validate mel.js numerically, and a static-file server for the PoC page.
+    scripts/nemotron_reference.py
+    scripts/serve_poc.py
+
+[report]
+exclude_also =
+    if __name__ == .__main__.:
