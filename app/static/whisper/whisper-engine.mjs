@@ -409,6 +409,19 @@ export class WhisperLocalEngine {
     this._resetVad();
   }
 
+  /**
+   * Release the transcriber. index.html drops the engine on every stop, and the
+   * Transformers.js pipeline holds its own ORT session — GC alone won't free it.
+   * Call after stop(); the engine is not reusable afterwards.
+   */
+  async dispose() {
+    const transcriber = this._transcriber;
+    this._transcriber = null;
+    if (transcriber && typeof transcriber.dispose === "function") {
+      try { await transcriber.dispose(); } catch (_e) { /* ignore */ }
+    }
+  }
+
   _resetVad() {
     this._speechFrames = [];
     this._inSpeech = false;

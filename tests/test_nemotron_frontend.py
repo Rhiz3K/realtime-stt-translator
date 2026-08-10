@@ -69,7 +69,7 @@ def test_nemotron_template_exposes_local_engine_progress_status():
     assert 'id="localEngineProgress"' in html
     assert 'function showLocalEngineProgress' in html
     assert "handleLocalEngineStatus(status)" in html
-    assert "nemotron-engine.mjs?v=4" in html
+    assert "nemotron-engine.mjs?v=5" in html
 
 
 def test_nemotron_template_exposes_webgpu_debug_panel():
@@ -223,3 +223,60 @@ def test_whisper_large_model_cannot_fall_through_to_wasm():
 
     assert "this.modelKey === 'large-v3-turbo' && !wantsWebGpu" in source
     assert "large-v3-turbo requires WebGPU" in source
+
+
+def test_template_defers_single_shot_stop_until_final_translation():
+    html = (ROOT / "app/templates/index.html").read_text()
+
+    assert "let _pendingFinalClientId = null" in html
+    assert "if (msgType === 'final') _pendingFinalClientId = clientId;" in html
+    assert "function _finishSingleShotStop()" in html
+    assert "_singleShotStopTimer = setTimeout(_finishSingleShotStop, _SINGLE_SHOT_STOP_TIMEOUT_MS)" in html
+    # Single-shot onend must not stop while that final is still unanswered.
+    assert "webspeech:end (single-shot mode, waiting for final translation)" in html
+
+
+@requires_node
+def test_local_engines_release_onnx_sessions_on_dispose():
+    """Every stop drops the engine; without release() the ORT memory is stranded."""
+    script = """
+        import { NemotronLocalEngine, NemotronModel } from './app/static/nemotron/nemotron-engine.mjs';
+        import { ParakeetLocalEngine, ParakeetModel } from './app/static/parakeet/parakeet-engine.mjs';
+
+        for (const [name, Model] of [['nemotron', NemotronModel], ['parakeet', ParakeetModel]]) {
+          // Object.create skips the constructor (it needs real ORT sessions + config).
+          const model = Object.create(Model.prototype);
+          const released = [];
+          model.enc = { release: async () => { released.push('encoder'); } };
+          model.decoder = { session: { release: async () => { released.push('decoder'); } } };
+
+          await model.dispose();
+
+          if (released.length !== 2) {
+            throw new Error(`${name}: released ${JSON.stringify(released)}, expected both sessions`);
+          }
+          if (model.enc !== null || model.decoder.session !== null) {
+            throw new Error(`${name}: dispose kept a session reference`);
+          }
+        }
+
+        for (const [name, Engine] of [['nemotron', NemotronLocalEngine], ['parakeet', ParakeetLocalEngine]]) {
+          const engine = new Engine({ onStatus: () => {} });
+          let disposed = 0;
+          engine._model = { dispose: async () => { disposed += 1; } };
+
+          await engine.dispose();
+
+          if (disposed !== 1) throw new Error(`${name}: model dispose count ${disposed}`);
+          if (engine._model !== null) throw new Error(`${name}: engine kept the model`);
+        }
+    """
+    run_node(script)
+
+
+def test_template_releases_engine_sessions_on_every_stop():
+    html = (ROOT / "app/templates/index.html").read_text()
+
+    stop_helper = html.split("function stopLocalEnginePipeline")[1].split("function stopWhisperPipeline")[0]
+    assert "engine.stop()" in stop_helper
+    assert "engine.dispose()" in stop_helper

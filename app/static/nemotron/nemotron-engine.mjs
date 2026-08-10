@@ -185,6 +185,20 @@ export class NemotronModel {
     return d.auto ?? 0;
   }
 
+  /**
+   * Release the ORT sessions. index.html drops the engine on every stop, but the
+   * wasm/WebGPU allocations behind these sessions are not reclaimed by GC, so
+   * without this every start/stop cycle strands another ~1.2 GB.
+   */
+  async dispose() {
+    const sessions = [this.enc, this.decoder && this.decoder.session];
+    this.enc = null;
+    if (this.decoder) this.decoder.session = null;
+    for (const session of sessions) {
+      try { if (session && session.release) await session.release(); } catch (_e) { /* ignore */ }
+    }
+  }
+
   /** Reset cache + decoder state. Call at the start of each utterance. */
   resetStream() {
     const cs = this.cacheShapes;
@@ -348,6 +362,15 @@ export class NemotronLocalEngine {
     try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
     this._node = this._ctx = this._stream = null;
     this._resetUtterance();
+  }
+
+  /** Release the model's ORT sessions. Call after stop(); not reusable afterwards. */
+  async dispose() {
+    const model = this._model;
+    this._model = null;
+    if (model) {
+      try { await model.dispose(); } catch (_e) { /* ignore */ }
+    }
   }
 
   _onFrame(int16) {

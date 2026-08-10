@@ -207,6 +207,20 @@ DEEPGRAM_RESULT_QUEUE_SIZE = _env_int("DEEPGRAM_RESULT_QUEUE_SIZE", 100)
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
+# Upstream Scribe error types that end the session — nothing sent afterwards can
+# succeed, so the endpoint stops and the browser tears the session down.
+ELEVENLABS_FATAL_ERRORS = frozenset({
+    "auth_error", "quota_exceeded", "session_time_limit_exceeded", "unaccepted_terms",
+    "transcriber_error", "resource_exhausted", "queue_overflow", "error",
+})
+# ...and the ones the session survives. `insufficient_audio_activity` in particular
+# is routine: it fires whenever a manual commit lands during silence. These are
+# reported as {"type": "warning", ...} so the browser shows them without stopping.
+ELEVENLABS_TRANSIENT_ERRORS = frozenset({
+    "input_error", "throttled", "rate_limited", "chunk_size_exceeded",
+    "insufficient_audio_activity",
+})
+
 # Azure AI Speech (browser-direct mode): the server only mints a short-lived
 # auth token; the browser SpeechSDK does the streaming. Region must match the
 # resource (e.g. "westeurope"). Free F0 tier gives ~5 audio hours/month.
@@ -1695,16 +1709,16 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
                             await _send_browser({"error": "translation_queue_full"})
                             break
 
-                    elif msg_type in (
-                        "input_error", "error", "auth_error", "transcriber_error",
-                        "quota_exceeded", "throttled", "rate_limited", "queue_overflow",
-                        "resource_exhausted", "session_time_limit_exceeded",
-                        "chunk_size_exceeded", "insufficient_audio_activity", "unaccepted_terms",
-                    ):
+                    elif msg_type in ELEVENLABS_FATAL_ERRORS or msg_type in ELEVENLABS_TRANSIENT_ERRORS:
                         error_msg = ev.get("error", ev.get("message", str(ev)))
-                        logging.error(f"ElevenLabs error: {error_msg}")
-                        await _send_browser({"error": f"ElevenLabs: {error_msg}"})
-                        break
+                        fatal = msg_type in ELEVENLABS_FATAL_ERRORS
+                        logging.error(f"ElevenLabs error ({msg_type}, fatal={fatal}): {error_msg}")
+                        payload = {"error": f"ElevenLabs: {error_msg}"}
+                        if not fatal:
+                            payload["type"] = "warning"  # keeps the browser session alive
+                        await _send_browser(payload)
+                        if fatal:
+                            break
 
             except Exception as e:
                 if not stop_event.is_set():

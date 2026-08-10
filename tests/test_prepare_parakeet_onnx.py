@@ -1,3 +1,6 @@
+import re
+import sys
+import types
 import shutil
 from pathlib import Path
 
@@ -47,5 +50,46 @@ def test_parakeet_install_keeps_previous_asset_when_copy_fails(tmp_path, monkeyp
     with pytest.raises(OSError, match="disk full"):
         prepare.install(source)
 
+    assert destination.read_bytes() == b"previous-complete-model"
+    assert not (output / f"{prepare.ENCODER}.tmp").exists()
+
+
+def test_parakeet_download_pins_the_model_revision(tmp_path, monkeypatch):
+    """The auto-prepare path must not follow whatever HEAD upstream happens to be."""
+    assert re.fullmatch(r"[0-9a-f]{40}", prepare.REVISION), prepare.REVISION
+
+    source = tmp_path / "snapshot"
+    _write_source_assets(source)
+    seen = {}
+
+    def fake_snapshot_download(repo_id, revision, allow_patterns):
+        seen.update(repo_id=repo_id, revision=revision, allow_patterns=allow_patterns)
+        return str(source)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    assert prepare.download([prepare.VOCAB]) == source
+    assert seen["revision"] == prepare.REVISION
+    assert seen["repo_id"] == prepare.REPO_ID
+
+
+def test_parakeet_install_rejects_an_empty_downloaded_asset(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _write_source_assets(source)
+    (source / prepare.ENCODER).write_bytes(b"")
+    output.mkdir()
+    destination = output / prepare.ENCODER
+    destination.write_bytes(b"previous-complete-model")
+    monkeypatch.setattr(prepare, "OUT_DIR", output)
+
+    with pytest.raises(RuntimeError, match="empty"):
+        prepare.install(source)
+
+    # The good copy survives a truncated download.
     assert destination.read_bytes() == b"previous-complete-model"
     assert not (output / f"{prepare.ENCODER}.tmp").exists()

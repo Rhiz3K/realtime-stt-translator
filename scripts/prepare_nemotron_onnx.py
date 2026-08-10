@@ -27,6 +27,11 @@ import sys
 from pathlib import Path
 
 REPO_ID = "altunenes/parakeet-rs"
+# Pinned: this is a community repo, and the Dockerfile auto-prepares on container
+# start, so an upstream force-push would silently change the weights served to every
+# browser — and could break the hand-verified ONNX I/O the engine is written against.
+# To move: `HfApi().repo_info(REPO_ID).sha`, bump, then re-run and re-verify.
+REVISION = "a61d2818df4659c956b9661a9447f46e98c15126"
 SUBDIR = "nemotron-3.5-asr-streaming-0.6b-onnx"
 FILES = ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model", "config.json"]
 ENCODER_BASE = "encoder_fp16.onnx"
@@ -195,7 +200,7 @@ def download() -> Path:
     from huggingface_hub import snapshot_download
 
     print(f"[1/4] Downloading {REPO_ID}/{SUBDIR}/* (~2.6 GB, cached after first run)…")
-    local = snapshot_download(repo_id=REPO_ID, allow_patterns=[f"{SUBDIR}/*"])
+    local = snapshot_download(repo_id=REPO_ID, revision=REVISION, allow_patterns=[f"{SUBDIR}/*"])
     src = Path(local) / SUBDIR
     for f in FILES:
         p = src / f

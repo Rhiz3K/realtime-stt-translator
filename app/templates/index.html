@@ -1161,6 +1161,12 @@
     // sockets alive slightly longer so Stop does not discard the committed final.
     const _EL_MANUAL_STOP_TIMEOUT_MS = 12000;
     const _AUDIO_WS_HIGH_WATER_BYTES = 1024 * 1024;
+    // Same problem in single-shot Web Speech: recognition ends right after the final,
+    // but that final's translation is still in flight on /ws.
+    let _singleShotStopPending = false;
+    let _singleShotStopTimer = null;
+    const _SINGLE_SHOT_STOP_TIMEOUT_MS = 12000;
+    let _pendingFinalClientId = null; // last final sent to /ws and not yet answered
 
     // Whisper local (browser ONNX via Transformers.js)
     // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
@@ -2932,9 +2938,19 @@
         }
 
         if (!recognitionContinuous) {
-          dbg('webspeech:end (single-shot mode, stopping)');
           removeInterimElement(recognizedContainer);
-          stopRecording();
+          if (_pendingFinalClientId == null) {
+            dbg('webspeech:end (single-shot mode, stopping)');
+            stopRecording();
+            return;
+          }
+          // The final left for /ws milliseconds ago; stopping now would close the
+          // socket before its 1-3 s translation comes back and the user would be
+          // left with source text and no translation.
+          dbg('webspeech:end (single-shot mode, waiting for final translation)');
+          _singleShotStopPending = true;
+          stopButton.disabled = true;
+          _singleShotStopTimer = setTimeout(_finishSingleShotStop, _SINGLE_SHOT_STOP_TIMEOUT_MS);
           return;
         }
 
@@ -3172,6 +3188,16 @@
       }
     }
 
+    function _finishSingleShotStop() {
+      if (!_singleShotStopPending) return;
+      _singleShotStopPending = false;
+      if (_singleShotStopTimer != null) {
+        clearTimeout(_singleShotStopTimer);
+        _singleShotStopTimer = null;
+      }
+      stopRecording();
+    }
+
     function _finishManualCommitStop() {
       if (!_elManualStopPending) return;
       _elManualStopPending = false;
@@ -3338,6 +3364,7 @@
       _trPending.set(clientId, nowPerf);
       try {
         socket.send(JSON.stringify({ type: msgType, text: t, client_id: clientId, client_sent_ms: nowPerf }));
+        if (msgType === 'final') _pendingFinalClientId = clientId;
       } catch (_e) {
         _trPending.delete(clientId);
       }
@@ -3454,6 +3481,13 @@
         }
         handleTranslationMessage(data);
         if (
+          data.type === 'final' && _pendingFinalClientId != null &&
+          (typeof data.client_id !== 'number' || data.client_id === _pendingFinalClientId)
+        ) {
+          _pendingFinalClientId = null;
+          _finishSingleShotStop(); // no-op unless single-shot is waiting on this final
+        }
+        if (
           _elManualStopPending && currentEngine === 'elevenlabs' &&
           elevenlabsMode === 'browser' && data.type === 'final'
         ) {
@@ -3566,6 +3600,13 @@
     function stopLocalEnginePipeline(engine, stream) {
       if (engine) {
         try { engine.stop(); } catch (_e) { /* no-op */ }
+        // Each stop discards the engine and each start builds a new one, so the ORT
+        // sessions must be released explicitly — GC does not reclaim their wasm/WebGPU
+        // allocations (~1.2 GB Nemotron, ~930 MB Parakeet). Fire-and-forget: the UI
+        // must not wait on teardown.
+        try {
+          if (typeof engine.dispose === 'function') Promise.resolve(engine.dispose()).catch(() => {});
+        } catch (_e) { /* no-op */ }
       }
       if (stream) {
         try { stream.getTracks().forEach((track) => track.stop()); } catch (_e) { /* no-op */ }
@@ -3768,7 +3809,7 @@
           // no-Cache-Control static response as heuristically fresh and keep
           // serving an old copy across reloads. Bump it whenever the engine or its
           // pinned ORT/transformers versions change.
-          const mod = await import('/static/whisper/whisper-engine.mjs?v=10');
+          const mod = await import('/static/whisper/whisper-engine.mjs?v=11');
           return new mod.WhisperLocalEngine({
             modelKey: whisperModel,
             device: whisperDevice,
@@ -3793,7 +3834,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes (kept in sync with the CSP in main.py).
-          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=4');
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=5');
           return new mod.NemotronLocalEngine({
             device: nemotronDevice,
             language: translateSrc || 'cs',
@@ -3818,7 +3859,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes.
-          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=2');
+          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=3');
           return new mod.ParakeetLocalEngine({
             device: parakeetDevice,
             language: translateSrc || 'cs',
@@ -4626,6 +4667,9 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
             setStatus('error');
             return;
           }
+          // Transient upstream notice (e.g. commit during silence): no transcript
+          // rides along, so don't let it start the TTFB clock.
+          if (data.type === 'warning') return;
         }
 
         const nowPerf = performance.now();
@@ -4921,6 +4965,12 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         clearTimeout(_elManualStopTimer);
         _elManualStopTimer = null;
       }
+      _singleShotStopPending = false;
+      if (_singleShotStopTimer != null) {
+        clearTimeout(_singleShotStopTimer);
+        _singleShotStopTimer = null;
+      }
+      _pendingFinalClientId = null;
       // Invalidate the current recording session up front: any in-flight async
       // callback (Web Speech onresult/onend, remote socket.onopen, local transcript
       // handler) will then see a changed generation and drop its event instead of

@@ -25,6 +25,10 @@ import sys
 from pathlib import Path
 
 REPO_ID = "nasedkinpv/parakeet-tdt-0.6b-v3-onnx-int8"
+# Pinned for the same reason as the Nemotron prep script: a community repo feeding
+# an auto-prepare path must not change under us. To move the pin:
+# `HfApi().repo_info(REPO_ID).sha`, bump, then re-run `--inspect` and re-verify I/O.
+REVISION = "f27d0efd32282dcb8124a4ddd2e09ce42eca03c6"
 ENCODER = "encoder-int8.onnx"
 ENCODER_DATA = "encoder-int8.onnx.data"
 DECODER = "decoder_joint-int8.onnx"
@@ -62,7 +66,7 @@ def download(patterns: list[str]) -> Path:
     from huggingface_hub import snapshot_download
 
     print(f"[1/3] Downloading {REPO_ID} ({', '.join(patterns)}; cached after first run)…")
-    local = snapshot_download(repo_id=REPO_ID, allow_patterns=patterns)
+    local = snapshot_download(repo_id=REPO_ID, revision=REVISION, allow_patterns=patterns)
     src = Path(local)
     for f in patterns:
         p = src / f

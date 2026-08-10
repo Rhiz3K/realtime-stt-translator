@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import threading
 
 import pytest
@@ -491,6 +493,101 @@ def test_ws_elevenlabs_happy_path_translates_final_without_blocking_receiver(cli
     assert upstream.closed is True
 
 
+def _elevenlabs_socket_emitting(events):
+    """Fake Scribe upstream that replays `events` (raw JSON strings) once."""
+
+    class FakeElevenSocket:
+        def __init__(self):
+            self.events = iter(events)
+            self.closed = False
+
+        async def recv(self):
+            return '{"message_type":"session_started","session_id":"session-1"}'
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def send(self, _payload):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+    return FakeElevenSocket()
+
+
+def _connect_fake_elevenlabs(monkeypatch, upstream):
+    async def fake_connect(_url, additional_headers):
+        return upstream
+
+    monkeypatch.setattr(main.ws_lib, "connect", fake_connect)
+
+
+def test_ws_elevenlabs_transient_error_warns_without_ending_session(client, monkeypatch):
+    """A commit during silence must not tear down the whole STT session."""
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+
+    upstream = _elevenlabs_socket_emitting(
+        [
+            '{"message_type":"insufficient_audio_activity","error":"no speech detected"}',
+            '{"message_type":"committed_transcript","text":"ahoj"}',
+        ]
+    )
+    _connect_fake_elevenlabs(monkeypatch, upstream)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"]}})
+        warning = ws.receive_json()
+        final = ws.receive_json()
+
+    # Typed payload -> the browser shows it but keeps recording.
+    assert warning["type"] == "warning"
+    assert warning["error"] == "ElevenLabs: no speech detected"
+    # The session survived: the transcript after the warning still arrives.
+    assert final["type"] == "final"
+    assert final["original"] == "ahoj"
+    assert final["translations"] == {"en": "en:ahoj"}
+
+
+def test_ws_elevenlabs_fatal_error_ends_session(client, monkeypatch):
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+
+    upstream = _elevenlabs_socket_emitting(
+        [
+            '{"message_type":"quota_exceeded","error":"out of credits"}',
+            '{"message_type":"committed_transcript","text":"nikdy"}',
+        ]
+    )
+    _connect_fake_elevenlabs(monkeypatch, upstream)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"]}})
+        error = ws.receive_json()
+
+    # Typeless error -> terminal by convention: the browser stops the session on it.
+    assert "type" not in error
+    assert error["error"] == "ElevenLabs: out of credits"
+    # The server stopped reading upstream, so the transcript queued behind the error
+    # was never processed. (The socket itself stays open until the client leaves —
+    # teardown is client-driven, which is what the typeless-error convention buys.)
+    assert next(upstream.events, None) is not None
+    assert upstream.closed is True
+
+
 # --- /api/elevenlabs/token tests ---
 
 
@@ -838,3 +935,28 @@ def test_login_rate_limiting(client, monkeypatch):
         follow_redirects=False,
     )
     assert resp.status_code == 429
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_rendered_template_inline_javascript_parses(client, tmp_path):
+    """index.html is ~5k lines of inline JS that nothing else syntax-checks.
+
+    Parsing the *rendered* output (not the raw template) is what makes this
+    possible — Jinja placeholders would otherwise break the parse.
+    """
+    client.post("/login", data={"password": "test-password", "next": "/"})
+    html = client.get("/").text
+
+    blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+    assert blocks, "no inline <script> blocks found in the rendered page"
+
+    checked = 0
+    for index, block in enumerate(blocks):
+        if not block.strip():
+            continue
+        path = tmp_path / f"block_{index}.js"
+        path.write_text(block)
+        proc = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
+        assert proc.returncode == 0, f"inline script block {index} is not valid JS:\n{proc.stderr}"
+        checked += 1
+    assert checked, "no non-empty inline script blocks were checked"
