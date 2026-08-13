@@ -19,7 +19,7 @@ import websockets as ws_lib
 from anyio import EndOfStream
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from googletrans import Translator
@@ -58,9 +58,22 @@ templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
+_MODEL_ASSET_PREFIXES = ("/static/nemotron/models/", "/static/parakeet/models/")
+
+
+def _is_model_asset_path(path: str) -> bool:
+    return path.startswith(_MODEL_ASSET_PREFIXES)
+
+
 # --- Security middleware: Content-Security-Policy ---
 class _CSPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # The model weights are hundreds of MB to ~1.2 GB each and StaticFiles has
+        # no auth of its own, so an unauthenticated scraper could pull them at will.
+        # The browser fetches them same-origin, so the auth cookie rides along.
+        if _is_model_asset_path(request.url.path) and AUTH_ENABLED:
+            if not APP_PASSWORD or not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
+                return PlainTextResponse("unauthorized", status_code=401)
         response: StarletteResponse = await call_next(request)
         # Inline scripts/styles are used throughout; connect-src must allow
         # ElevenLabs WS for browser mode.
@@ -873,6 +886,109 @@ async def _require_ws_engine(websocket: WebSocket, engine: str) -> bool:
     return False
 
 
+class TranslationSession:
+    """Reader/worker pair around a `LatestInterimQueue`.
+
+    `/ws` and `/ws/elevenlabs` both feed transcripts in from a reader task and
+    translate them in a worker task, with identical supersede/shield/recycle
+    semantics. Keeping one implementation means a fix to this subtle cancellation
+    logic cannot land on only one of them — which is exactly what had happened.
+    """
+
+    def __init__(self, inbox: LatestInterimQueue, send, *, log_label: str) -> None:
+        self.inbox = inbox
+        self.send = send
+        self.log_label = log_label
+        self.translator = _new_translator()
+        self.current_interim_task: asyncio.Future | None = None
+        self.superseded_interim_tasks: set[asyncio.Future] = set()
+
+    def supersede_interim(self) -> None:
+        """Drop the in-flight interim translation.
+
+        A newer hypothesis or a committed final makes it useless, and cancelling
+        also lets a final bypass a slow request. The task is marked before being
+        cancelled so the worker can tell this apart from its own teardown.
+        """
+        task = self.current_interim_task
+        if task is not None and not task.done():
+            self.superseded_interim_tasks.add(task)
+            task.cancel()
+
+    async def aclose(self) -> None:
+        if self.current_interim_task is not None:
+            self.current_interim_task.cancel()
+        await _close_translator(self.translator)
+
+    async def run(self) -> None:
+        while True:
+            work = await self.inbox.get()
+            if work is None:
+                return
+            if work.msg_type == "interim":
+                # Give the reader one event-loop turn to consume a burst's newer
+                # hypothesis/final before starting network work for this interim.
+                await asyncio.sleep(INTERIM_COALESCE_DELAY_SECONDS)
+                if work.revision != self.inbox.revision:
+                    continue
+            started = time.perf_counter()
+            # Held explicitly: cancelling the gather future once it has already
+            # completed (which is what a failure does) is a no-op, so the only way
+            # to stop the surviving siblings is to keep their tasks.
+            children = [
+                asyncio.ensure_future(
+                    _translate(self.translator, work.text, src=work.src, dest=dest)
+                )
+                for dest in work.dests
+            ]
+            task = asyncio.gather(*children)
+            if work.msg_type == "interim":
+                self.current_interim_task = task
+            try:
+                # Shield lets us distinguish an explicitly superseded child
+                # translation from cancellation of this worker itself. The reader
+                # marks the former before cancelling it.
+                results = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Only swallow the cancellation the reader caused by superseding
+                # this interim. If the inbox is already closed we are being torn
+                # down, so honour our own cancellation instead of looping.
+                if task in self.superseded_interim_tasks and not self.inbox.closed:
+                    continue
+                for child in children:
+                    child.cancel()
+                raise
+            except Exception as exc:
+                logging.error("%s: %s", self.log_label, exc)
+                # gather() does not cancel its siblings on the first failure, so a
+                # slow dest would still be using the translator we are about to
+                # close. Stop them before swapping it out.
+                for child in children:
+                    child.cancel()
+                await asyncio.gather(*children, return_exceptions=True)
+                old_translator = self.translator
+                self.translator = _new_translator()
+                await _close_translator(old_translator)
+                response = _translation_payload(
+                    work,
+                    {dest: "" for dest in work.dests},
+                    error="translation_failed",
+                )
+            else:
+                response = _translation_payload(
+                    work,
+                    {dest: (result.text if result else "") for dest, result in zip(work.dests, results)},
+                    translate_ms=int((time.perf_counter() - started) * 1000),
+                )
+            finally:
+                self.superseded_interim_tasks.discard(task)
+                if self.current_interim_task is task:
+                    self.current_interim_task = None
+            if work.msg_type == "interim" and work.revision != self.inbox.revision:
+                continue
+            await self.send(response)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Translate browser STT text while coalescing superseded interim hypotheses."""
@@ -882,20 +998,19 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logging.info("WebSocket /ws připojen")
 
-    translator = _new_translator()
     session_src_lang = "cs"
     session_dest_langs: list[str] = ["en", "ru"]
     inbox = LatestInterimQueue()
     send_lock = asyncio.Lock()
-    current_interim_task: asyncio.Future | None = None
-    superseded_interim_tasks: set[asyncio.Future] = set()
 
     async def _send(payload: dict) -> None:
         async with send_lock:
             await websocket.send_json(payload)
 
+    session = TranslationSession(inbox, _send, log_label="Překlad selhal")
+
     async def _reader() -> None:
-        nonlocal session_src_lang, session_dest_langs, current_interim_task
+        nonlocal session_src_lang, session_dest_langs
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -954,6 +1069,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
                 if not text or len(text) > MAX_TEXT_LENGTH:
+                    # Still supersedes: a rejected final (e.g. a trailing empty one
+                    # from the engine) makes the interim before it obsolete, and
+                    # letting that translation land afterwards reorders the UI.
+                    session.supersede_interim()
                     empty_work = TranslationWork(
                         text="",
                         msg_type=msg_type,
@@ -972,11 +1091,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     continue
 
-                # A newer hypothesis or a committed final makes in-flight interim
-                # work useless. Cancellation also lets a final bypass a slow request.
-                if current_interim_task is not None and not current_interim_task.done():
-                    superseded_interim_tasks.add(current_interim_task)
-                    current_interim_task.cancel()
+                session.supersede_interim()
                 if not inbox.put(work):
                     await _send({"error": "translation_queue_full"})
                     await websocket.close(code=1013, reason="Translation queue full")
@@ -986,76 +1101,8 @@ async def websocket_endpoint(websocket: WebSocket):
         finally:
             inbox.close()
 
-    async def _worker() -> None:
-        nonlocal translator, current_interim_task
-        while True:
-            work = await inbox.get()
-            if work is None:
-                return
-            if work.msg_type == "interim":
-                # Give the reader one event-loop turn to consume a burst's newer
-                # hypothesis/final before starting network work for this interim.
-                await asyncio.sleep(INTERIM_COALESCE_DELAY_SECONDS)
-                if work.revision != inbox.revision:
-                    continue
-            started = time.perf_counter()
-            # Held explicitly: cancelling the gather future once it has already
-            # completed (which is what a failure does) is a no-op, so the only way
-            # to stop the surviving siblings is to keep their tasks.
-            children = [
-                asyncio.ensure_future(_translate(translator, work.text, src=work.src, dest=dest))
-                for dest in work.dests
-            ]
-            task = asyncio.gather(*children)
-            if work.msg_type == "interim":
-                current_interim_task = task
-            try:
-                # Shield lets us distinguish an explicitly superseded child
-                # translation from cancellation of this worker itself. The
-                # reader marks the former before cancelling it.
-                results = await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # Only swallow the cancellation the reader caused by superseding
-                # this interim. If the inbox is already closed we are being torn
-                # down, so honour our own cancellation instead of looping.
-                if task in superseded_interim_tasks and not inbox.closed:
-                    continue
-                for child in children:
-                    child.cancel()
-                raise
-            except Exception as exc:
-                logging.error("Překlad selhal: %s", exc)
-                # gather() does not cancel its siblings on the first failure, so a
-                # slow dest would still be using the translator we are about to
-                # close. Stop them before swapping it out.
-                for child in children:
-                    child.cancel()
-                await asyncio.gather(*children, return_exceptions=True)
-                old_translator = translator
-                translator = _new_translator()
-                await _close_translator(old_translator)
-                response = _translation_payload(
-                    work,
-                    {dest: "" for dest in work.dests},
-                    error="translation_failed",
-                )
-            else:
-                translate_ms = int((time.perf_counter() - started) * 1000)
-                response = _translation_payload(
-                    work,
-                    {dest: (result.text if result else "") for dest, result in zip(work.dests, results)},
-                    translate_ms=translate_ms,
-                )
-            finally:
-                superseded_interim_tasks.discard(task)
-                if current_interim_task is task:
-                    current_interim_task = None
-            if work.msg_type == "interim" and work.revision != inbox.revision:
-                continue
-            await _send(response)
-
     reader_task = asyncio.create_task(_reader())
-    worker_task = asyncio.create_task(_worker())
+    worker_task = asyncio.create_task(session.run())
     try:
         done, pending = await asyncio.wait(
             {reader_task, worker_task},
@@ -1083,9 +1130,7 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
     finally:
         inbox.close()
-        if current_interim_task is not None:
-            current_interim_task.cancel()
-        await _close_translator(translator)
+        await session.aclose()
 
 
 @app.websocket("/ws/deepgram")
@@ -1598,7 +1643,6 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
 
     if len(translate_dests) == 2 and translate_dests[0] == translate_dests[1]:
         translate_dests[1] = "ru" if translate_dests[0] != "ru" else "en"
-    translator = _new_translator()
 
     # Build ElevenLabs WS URL with encoded query parameters.
     el_params = {
@@ -1637,12 +1681,14 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
     stop_event = asyncio.Event()
     transcript_inbox = LatestInterimQueue()
     browser_send_lock = asyncio.Lock()
-    current_el_interim_task: asyncio.Future | None = None
-    superseded_el_interim_tasks: set[asyncio.Future] = set()
 
     async def _send_browser(payload: dict) -> None:
         async with browser_send_lock:
             await websocket.send_json(payload)
+
+    session = TranslationSession(
+        transcript_inbox, _send_browser, log_label="ElevenLabs translation error"
+    )
 
     try:
         el_ws = await ws_lib.connect(
@@ -1708,7 +1754,6 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
 
         async def _receive_transcripts():
             """Read upstream continuously and enqueue translation outside this loop."""
-            nonlocal current_el_interim_task
             try:
                 async for raw in el_ws:
                     if stop_event.is_set():
@@ -1725,9 +1770,7 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
                         if not text:
                             continue
                         if translate_interim:
-                            if current_el_interim_task is not None and not current_el_interim_task.done():
-                                superseded_el_interim_tasks.add(current_el_interim_task)
-                                current_el_interim_task.cancel()
+                            session.supersede_interim()
                             transcript_inbox.put(
                                 TranslationWork(
                                     text=text,
@@ -1750,9 +1793,7 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
                         text = ev.get("text", "").strip()
                         if not text:
                             continue
-                        if current_el_interim_task is not None and not current_el_interim_task.done():
-                            superseded_el_interim_tasks.add(current_el_interim_task)
-                            current_el_interim_task.cancel()
+                        session.supersede_interim()
                         accepted = transcript_inbox.put(
                             TranslationWork(
                                 text=text,
@@ -1783,58 +1824,11 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
                 transcript_inbox.close()
                 stop_event.set()
 
-        async def _translate_transcripts():
-            nonlocal translator, current_el_interim_task
-            while True:
-                work = await transcript_inbox.get()
-                if work is None:
-                    return
-                if work.msg_type == "interim":
-                    await asyncio.sleep(INTERIM_COALESCE_DELAY_SECONDS)
-                    if work.revision != transcript_inbox.revision:
-                        continue
-                started = time.perf_counter()
-                task = asyncio.gather(
-                    *[_translate(translator, work.text, src=work.src, dest=dest) for dest in work.dests]
-                )
-                if work.msg_type == "interim":
-                    current_el_interim_task = task
-                try:
-                    results = await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    if task in superseded_el_interim_tasks:
-                        continue
-                    task.cancel()
-                    raise
-                except Exception as exc:
-                    logging.error("ElevenLabs translation error: %s", exc)
-                    old_translator = translator
-                    translator = _new_translator()
-                    await _close_translator(old_translator)
-                    response = _translation_payload(
-                        work,
-                        {dest: "" for dest in work.dests},
-                        error="translation_failed",
-                    )
-                else:
-                    response = _translation_payload(
-                        work,
-                        {dest: (result.text if result else "") for dest, result in zip(work.dests, results)},
-                        translate_ms=int((time.perf_counter() - started) * 1000),
-                    )
-                finally:
-                    superseded_el_interim_tasks.discard(task)
-                    if current_el_interim_task is task:
-                        current_el_interim_task = None
-                if work.msg_type == "interim" and work.revision != transcript_inbox.revision:
-                    continue
-                await _send_browser(response)
-
         # Keep reading upstream while translation runs independently. If upstream
         # closes, drain already-queued finals before tearing down the browser socket.
         forward_task = asyncio.create_task(_forward_audio())
         receive_task = asyncio.create_task(_receive_transcripts())
-        translate_task = asyncio.create_task(_translate_transcripts())
+        translate_task = asyncio.create_task(session.run())
 
         done, pending_io = await asyncio.wait(
             {forward_task, receive_task},
@@ -1869,9 +1863,7 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
             logging.debug(f"Nelze poslat ElevenLabs error: {send_err}")
     finally:
         transcript_inbox.close()
-        if current_el_interim_task is not None:
-            current_el_interim_task.cancel()
-        await _close_translator(translator)
+        await session.aclose()
         if el_ws:
             try:
                 await el_ws.close()

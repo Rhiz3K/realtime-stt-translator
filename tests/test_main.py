@@ -830,6 +830,7 @@ def test_static_nemotron_engine_served(client):
 
 
 def test_missing_nemotron_model_assets_are_not_cached_immutably(client):
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
     # A user can hit Nemotron before the background prepare job finishes. Never
     # let a browser pin that transient 404 as an immutable model response.
     resp = client.get("/static/nemotron/models/__missing_model_asset__.json")
@@ -838,6 +839,7 @@ def test_missing_nemotron_model_assets_are_not_cached_immutably(client):
 
 
 def test_existing_nemotron_model_assets_cached_immutably(client):
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
     path = Path("app/static/nemotron/models/__cache_test__.txt")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("ok")
@@ -1111,12 +1113,14 @@ def test_translate_languages_falls_back_when_googletrans_lacks_languages(client,
 
 
 def test_missing_parakeet_model_assets_are_not_cached_immutably(client):
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
     resp = client.get("/static/parakeet/models/__missing_model_asset__.json")
     assert resp.status_code == 404
     assert resp.headers.get("cache-control") == "no-store"
 
 
 def test_existing_parakeet_model_assets_cached_immutably(client):
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
     path = Path("app/static/parakeet/models/__cache_test__.txt")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("ok")
@@ -1876,3 +1880,71 @@ def test_ws_translation_failure_cancels_siblings_before_closing_the_translator(c
     assert events.index("sibling-cancelled") < events.index("translator-closed"), (
         f"translator closed while a sibling was still using it: {events}"
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/static/nemotron/models/encoder_fp16.onnx", "/static/parakeet/models/encoder-int8.onnx"],
+)
+def test_model_weights_are_not_downloadable_without_auth(client, path):
+    """Hundreds of MB per file, served by StaticFiles, which has no auth of its own."""
+    resp = client.get(path)
+    assert resp.status_code == 401
+
+
+def test_model_weights_are_served_without_auth_when_auth_is_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "AUTH_ENABLED", False)
+    monkeypatch.setattr(main, "ENABLED_ENGINES", {"nemotron"})
+    path = Path("app/static/nemotron/models/__auth_test__.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("ok")
+    try:
+        resp = TestClient(main.app).get("/static/nemotron/models/__auth_test__.txt")
+    finally:
+        path.unlink(missing_ok=True)
+
+    assert resp.status_code == 200
+    assert resp.text == "ok"
+
+
+def test_ws_elevenlabs_translation_failure_reports_and_recycles(client, monkeypatch):
+    """ElevenLabs runs the same TranslationSession as /ws, so it inherits the
+    failure handling that used to live only in /ws."""
+    monkeypatch.setattr(main, "ELEVENLABS_API_KEY", "test-key")
+    created = []
+
+    class BrokenTranslator:
+        def __init__(self):
+            created.append(self)
+
+        async def translate(self, *_args, **_kwargs):
+            raise RuntimeError("upstream refused")
+
+    monkeypatch.setattr(main, "Translator", BrokenTranslator)
+
+    upstream = _elevenlabs_socket_emitting(
+        ['{"message_type":"committed_transcript","text":"ahoj"}']
+    )
+    _connect_fake_elevenlabs(monkeypatch, upstream)
+    client.post("/login", data={"password": "test-password", "next": "/"})
+
+    with client.websocket_connect("/ws/elevenlabs", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"]}})
+        data = ws.receive_json()
+
+    assert data["type"] == "final"
+    assert data["error"] == "translation_failed"
+    assert data["original"] == "ahoj"
+    assert data["translations"] == {"en": ""}
+    assert len(created) >= 2  # stale HTTP session dropped, fresh Translator built
+
+
+def test_translation_session_is_used_by_both_websocket_endpoints():
+    """Guards the extraction: a future edit must not fork the logic again."""
+    source = Path("app/main.py").read_text()
+    assert source.count("TranslationSession(") == 2  # constructed once per endpoint
+    assert 'log_label="Překlad selhal"' in source
+    assert 'log_label="ElevenLabs translation error"' in source
+    # The forked copies are gone, not merely unused.
+    assert "_translate_transcripts" not in source
+    assert "superseded_el_interim_tasks" not in source
