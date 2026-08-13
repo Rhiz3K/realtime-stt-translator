@@ -268,19 +268,46 @@ def _to_fp16_uniform(model) -> None:
             vi.type.tensor_type.elem_type = F16
 
 
+# Peak usage: the ~2.3 GB fp32 working copy plus the ~1.3 GB of fp16 output, with
+# the graph variants and tmp files on top.
+REQUIRED_FREE_BYTES = 5 * 1024 ** 3
+
+
+def _require_free_space(directory: Path) -> None:
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:  # pragma: no cover - unreadable mount point
+        return
+    if free < REQUIRED_FREE_BYTES:
+        sys.exit(
+            f"  ! not enough free space in {directory}: {_human(free)} available, "
+            f"~{_human(REQUIRED_FREE_BYTES)} needed for the fp32 working copy + fp16 output"
+        )
+
+
 def convert_encoder_fp16(src: Path) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _require_free_space(OUT_DIR)
+    tmp = OUT_DIR / "_fp32tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        _convert_encoder_fp16(src, tmp)
+    finally:
+        # Also on failure: ENOSPC is exactly the case where leaving a 2.3 GB working
+        # copy behind makes the retry fail too.
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _convert_encoder_fp16(src: Path, tmp: Path) -> None:
     import onnx
     import onnxruntime as ort
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_onnx = OUT_DIR / ENCODER_BASE
     out_data = ENCODER_DATA
 
     print("\n[3/4] Converting encoder fp32 -> fp16 (uniform, in-house)…")
     # The HF cache stores encoder.onnx.data as a symlink to a blob, which onnx's
     # external-data loader rejects. Materialise real copies into a temp dir first.
-    tmp = OUT_DIR / "_fp32tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
     print("      materialising real fp32 files (resolving HF symlinks)…")
     shutil.copy2(src / "encoder.onnx", tmp / "encoder.onnx")
     shutil.copy2(src / "encoder.onnx.data", tmp / "encoder.onnx.data")
@@ -335,8 +362,6 @@ def convert_encoder_fp16(src: Path) -> None:
     print(f"        inputs : {itypes}")
     print(f"        outputs: {otypes}")
     print("      => uniform fp16 I/O (JS feeds fp16 via f16.js; encoded cast to fp32 for the decoder)")
-
-    shutil.rmtree(tmp, ignore_errors=True)  # drop the 2.3 GB fp32 working copy
 
     # decoder_joint stays fp32 (small; runs on WASM per-token).
     for source_name in ("decoder_joint.onnx", "config.json"):

@@ -14,8 +14,8 @@ export class Tokenizer {
     this.pieces = pieces; // id -> piece
   }
 
-  static async load(url) {
-    const res = await fetch(url);
+  static async load(url, { signal } = {}) {
+    const res = await fetch(url, { signal });
     if (!res.ok) {
       throw new Error(`vocab fetch failed: ${res.status}. Parakeet model assets are not ready on the server yet.`);
     }

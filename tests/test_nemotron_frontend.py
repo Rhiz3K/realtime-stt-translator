@@ -69,7 +69,7 @@ def test_nemotron_template_exposes_local_engine_progress_status():
     assert 'id="localEngineProgress"' in html
     assert 'function showLocalEngineProgress' in html
     assert "handleLocalEngineStatus(status)" in html
-    assert "nemotron-engine.mjs?v=6" in html
+    assert "nemotron-engine.mjs?v=7" in html
 
 
 def test_nemotron_template_exposes_webgpu_debug_panel():
@@ -307,6 +307,25 @@ def test_nemotron_aborts_encoder_work_when_the_engine_is_stopped():
         const all = await model.pushFrames(new Float32Array(1), 1, 0, 56 * 3, 0, () => {});
         if (encoded !== 3 || all !== 56 * 3) {
           throw new Error(`unaborted run: encoded=${encoded} consumed=${all}`);
+        }
+    """
+    run_node(script)
+
+
+@requires_node
+def test_local_engines_abort_asset_fetches_on_stop():
+    """The weights download inside InferenceSession.create() cannot be cancelled,
+    but the small config/vocab fetches can — and must be, or a stop during load
+    leaves them running."""
+    script = """
+        import { NemotronLocalEngine } from './app/static/nemotron/nemotron-engine.mjs';
+        import { ParakeetLocalEngine } from './app/static/parakeet/parakeet-engine.mjs';
+
+        for (const [name, Engine] of [['nemotron', NemotronLocalEngine], ['parakeet', ParakeetLocalEngine]]) {
+          const engine = new Engine({ onStatus: () => {} });
+          if (engine._abort.signal.aborted) throw new Error(`${name}: aborted before start`);
+          engine.stop();
+          if (!engine._abort.signal.aborted) throw new Error(`${name}: stop did not abort the fetches`);
         }
     """
     run_node(script)

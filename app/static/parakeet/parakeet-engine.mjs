@@ -53,9 +53,9 @@ export class ParakeetModel {
     });
   }
 
-  static async load(ort, { dir = "/static/parakeet/models", device = "auto", normalize = "none", onStatus = () => {} } = {}) {
+  static async load(ort, { dir = "/static/parakeet/models", device = "auto", normalize = "none", onStatus = () => {}, signal } = {}) {
     emitStatus(onStatus, "Checking Parakeet model assets...", 10, true);
-    const tokenizer = await Tokenizer.load(parakeetModelAssetUrl(dir, VOCAB_FILE));
+    const tokenizer = await Tokenizer.load(parakeetModelAssetUrl(dir, VOCAB_FILE), { signal });
     emitStatus(onStatus, "Parakeet model assets found", 25);
 
     const encOptions = {
@@ -165,6 +165,10 @@ export class ParakeetLocalEngine {
     this._node = null;
     this._stream = null;
     this._lifecycle = 0;
+    // Aborts the small asset fetches on stop(). The multi-hundred-MB weights
+    // download happens inside InferenceSession.create(), which ORT gives us no
+    // way to cancel — that one still runs to completion in the background.
+    this._abort = new AbortController();
     this._resetUtterance();
   }
 
@@ -193,7 +197,10 @@ export class ParakeetLocalEngine {
       typeof self !== "undefined" && self.crossOriginIsolated
         ? Math.max(1, Math.min(hardwareConcurrency, 8))
         : 1;
-    this._model = await ParakeetModel.load(ort, { device: this.device, normalize: this.normalize, onStatus: this.onStatus });
+    this._model = await ParakeetModel.load(ort, {
+      device: this.device, normalize: this.normalize, onStatus: this.onStatus,
+      signal: this._abort.signal,
+    });
   }
 
   async start(stream) {
@@ -210,6 +217,7 @@ export class ParakeetLocalEngine {
 
   stop() {
     this._lifecycle++;
+    try { this._abort.abort(); } catch (_e) {}
     // Detach the handler before anything else: AudioContext.close() is async, so a
     // frame already in flight would otherwise mutate freshly reset capture state.
     try { if (this._node) this._node.port.onmessage = null; } catch (_e) {}

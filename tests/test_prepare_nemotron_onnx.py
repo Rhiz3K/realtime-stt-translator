@@ -119,3 +119,37 @@ def test_download_rejects_an_empty_cached_file(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit, match="missing or empty"):
         prepare.download()
+
+
+def test_fp32_working_copy_is_removed_even_when_conversion_fails(tmp_path, monkeypatch):
+    """The working copy is ~2.3 GB; leaving it behind makes an ENOSPC retry fail too."""
+    monkeypatch.setattr(prepare, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(prepare, "_require_free_space", lambda _d: None)
+    seen = {}
+
+    def failing_convert(_src, tmp):
+        seen["tmp"] = tmp
+        (tmp / "encoder.onnx").write_bytes(b"2.3 GB stand-in")
+        raise RuntimeError("conversion blew up")
+
+    monkeypatch.setattr(prepare, "_convert_encoder_fp16", failing_convert)
+
+    with pytest.raises(RuntimeError, match="conversion blew up"):
+        prepare.convert_encoder_fp16(tmp_path / "src")
+
+    assert seen["tmp"].name == "_fp32tmp"
+    assert not seen["tmp"].exists()
+
+
+def test_conversion_refuses_to_start_without_free_space(tmp_path, monkeypatch):
+    monkeypatch.setattr(prepare, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(
+        prepare.shutil, "disk_usage", lambda _p: types.SimpleNamespace(free=1024)
+    )
+    monkeypatch.setattr(
+        prepare, "_convert_encoder_fp16",
+        lambda *_a: pytest.fail("must not start without space"),
+    )
+
+    with pytest.raises(SystemExit, match="not enough free space"):
+        prepare.convert_encoder_fp16(tmp_path / "src")

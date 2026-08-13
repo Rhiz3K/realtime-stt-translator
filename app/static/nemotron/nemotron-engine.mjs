@@ -44,8 +44,8 @@ function emitNotice(onStatus, message) {
   onStatus({ message: String(message) });
 }
 
-async function fetchJson(url, label) {
-  const res = await fetch(url);
+async function fetchJson(url, label, signal) {
+  const res = await fetch(url, { signal });
   if (!res.ok) {
     throw new Error(`${label} fetch failed: ${res.status}. Nemotron model assets are not ready on the server yet.`);
   }
@@ -132,11 +132,11 @@ export class NemotronModel {
     this.resetStream();
   }
 
-  static async load(ort, { dir = "/static/nemotron/models", device = "auto", normalize = "none", onStatus = () => {} } = {}) {
+  static async load(ort, { dir = "/static/nemotron/models", device = "auto", normalize = "none", onStatus = () => {}, signal } = {}) {
     emitStatus(onStatus, "Checking Nemotron model assets...", 10, true);
     const [config, tokenizer] = await Promise.all([
-      fetchJson(nemotronModelAssetUrl(dir, "config.json"), "config"),
-      Tokenizer.load(nemotronModelAssetUrl(dir, "vocab.json")),
+      fetchJson(nemotronModelAssetUrl(dir, "config.json"), "config", signal),
+      Tokenizer.load(nemotronModelAssetUrl(dir, "vocab.json"), { signal }),
     ]);
     emitStatus(onStatus, "Nemotron model assets found", 25);
 
@@ -314,6 +314,10 @@ export class NemotronLocalEngine {
     this._node = null;
     this._stream = null;
     this._lifecycle = 0;
+    // Aborts the small asset fetches on stop(). The multi-hundred-MB weights
+    // download happens inside InferenceSession.create(), which ORT gives us no
+    // way to cancel — that one still runs to completion in the background.
+    this._abort = new AbortController();
     this._resetUtterance();
   }
 
@@ -350,7 +354,10 @@ export class NemotronLocalEngine {
       typeof self !== "undefined" && self.crossOriginIsolated
         ? Math.max(1, Math.min(hardwareConcurrency, 8))
         : 1;
-    this._model = await NemotronModel.load(ort, { device: this.device, normalize: this.normalize, onStatus: this.onStatus });
+    this._model = await NemotronModel.load(ort, {
+      device: this.device, normalize: this.normalize, onStatus: this.onStatus,
+      signal: this._abort.signal,
+    });
     this._promptIndex = this._model.promptIndex(this.language);
   }
 
@@ -368,6 +375,7 @@ export class NemotronLocalEngine {
 
   stop() {
     this._lifecycle++;
+    try { this._abort.abort(); } catch (_e) {}
     // Detach the handler before anything else: AudioContext.close() is async, so a
     // frame already in flight would otherwise mutate freshly reset capture state.
     try { if (this._node) this._node.port.onmessage = null; } catch (_e) {}

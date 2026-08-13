@@ -3829,7 +3829,7 @@
           // no-Cache-Control static response as heuristically fresh and keep
           // serving an old copy across reloads. Bump it whenever the engine or its
           // pinned ORT/transformers versions change.
-          const mod = await import('/static/whisper/whisper-engine.mjs?v=12');
+          const mod = await import('/static/whisper/whisper-engine.mjs?v=13');
           return new mod.WhisperLocalEngine({
             modelKey: whisperModel,
             device: whisperDevice,
@@ -3854,7 +3854,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes (kept in sync with the CSP in main.py).
-          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=6');
+          const mod = await import('/static/nemotron/nemotron-engine.mjs?v=7');
           return new mod.NemotronLocalEngine({
             device: nemotronDevice,
             language: translateSrc || 'cs',
@@ -3879,7 +3879,7 @@
         createEngine: async () => {
           // ?v= cache-busts the engine module — bump when the engine or its pinned
           // onnxruntime-web version changes.
-          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=4');
+          const mod = await import('/static/parakeet/parakeet-engine.mjs?v=5');
           return new mod.ParakeetLocalEngine({
             device: parakeetDevice,
             language: translateSrc || 'cs',
