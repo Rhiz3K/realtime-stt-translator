@@ -1828,3 +1828,51 @@ def test_ws_deepgram_listener_crash_is_reported_to_the_browser(client, monkeypat
     # Typeless error -> the browser stops the session instead of hanging.
     assert "type" not in data
     assert data["error"] == "deepgram_listener_failed"
+
+
+def test_latest_interim_queue_exposes_closed_state():
+    queue = main.LatestInterimQueue()
+    assert queue.closed is False
+    queue.close()
+    assert queue.closed is True
+
+
+def test_ws_translation_failure_cancels_siblings_before_closing_the_translator(client, monkeypatch):
+    """gather() leaves siblings running after the first failure. They must be
+    cancelled *before* the error path closes the translator they are still using —
+    asserting only that they end up cancelled would pass either way, since endpoint
+    teardown cancels them anyway."""
+    events = []
+    real_close = main._close_translator
+
+    async def recording_close(translator):
+        events.append("translator-closed")
+        return await real_close(translator)
+
+    class PartiallyFailingTranslator:
+        async def translate(self, text, src, dest):
+            if dest == "en":
+                await asyncio.sleep(0.05)  # let the sibling get going first
+                raise RuntimeError("en upstream refused")
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                events.append("sibling-cancelled")
+                raise
+            events.append("sibling-completed")
+            return _FakeTranslation("late")
+
+    monkeypatch.setattr(main, "Translator", PartiallyFailingTranslator)
+    monkeypatch.setattr(main, "_close_translator", recording_close)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en", "ru"]})
+        data = ws.receive_json()
+
+    assert data["error"] == "translation_failed"
+    assert "sibling-completed" not in events
+    assert "sibling-cancelled" in events, f"sibling was never cancelled: {events}"
+    assert events.index("sibling-cancelled") < events.index("translator-closed"), (
+        f"translator closed while a sibling was still using it: {events}"
+    )

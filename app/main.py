@@ -342,6 +342,12 @@ class LatestInterimQueue:
     def revision(self) -> int:
         return self._revision
 
+    @property
+    def closed(self) -> bool:
+        """True once the reader is done — the worker uses this to tell its own
+        cancellation apart from a reader-driven supersede."""
+        return self._closed
+
     async def get(self) -> TranslationWork | None:
         while True:
             if self._finals:
@@ -993,9 +999,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 if work.revision != inbox.revision:
                     continue
             started = time.perf_counter()
-            task = asyncio.gather(
-                *[_translate(translator, work.text, src=work.src, dest=dest) for dest in work.dests]
-            )
+            # Held explicitly: cancelling the gather future once it has already
+            # completed (which is what a failure does) is a no-op, so the only way
+            # to stop the surviving siblings is to keep their tasks.
+            children = [
+                asyncio.ensure_future(_translate(translator, work.text, src=work.src, dest=dest))
+                for dest in work.dests
+            ]
+            task = asyncio.gather(*children)
             if work.msg_type == "interim":
                 current_interim_task = task
             try:
@@ -1004,12 +1015,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 # reader marks the former before cancelling it.
                 results = await asyncio.shield(task)
             except asyncio.CancelledError:
-                if task in superseded_interim_tasks:
+                # Only swallow the cancellation the reader caused by superseding
+                # this interim. If the inbox is already closed we are being torn
+                # down, so honour our own cancellation instead of looping.
+                if task in superseded_interim_tasks and not inbox.closed:
                     continue
-                task.cancel()
+                for child in children:
+                    child.cancel()
                 raise
             except Exception as exc:
                 logging.error("Překlad selhal: %s", exc)
+                # gather() does not cancel its siblings on the first failure, so a
+                # slow dest would still be using the translator we are about to
+                # close. Stop them before swapping it out.
+                for child in children:
+                    child.cancel()
+                await asyncio.gather(*children, return_exceptions=True)
                 old_translator = translator
                 translator = _new_translator()
                 await _close_translator(old_translator)
