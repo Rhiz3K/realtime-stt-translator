@@ -142,7 +142,7 @@ def main() -> int:
     except RuntimeError as exc:
         logging.error("%s", exc)
         return 1
-    except Exception as exc:
+    except Exception:
         logging.exception("Nemotron asset preparation failed")
         return 1
     return 0
