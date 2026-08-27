@@ -1841,6 +1841,58 @@ def test_latest_interim_queue_exposes_closed_state():
     assert queue.closed is True
 
 
+def test_worker_drains_queued_final_after_supersede_when_inbox_closed(monkeypatch):
+    """Upstream (ElevenLabs) can end — closing the inbox — right after a committed
+    final is queued behind a superseded interim. The worker must translate and
+    send that final, not raise its own CancelledError and drop it. `inbox.closed`
+    is not the teardown signal; only the worker task being cancelled is."""
+    sent = []
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowTranslator:
+            async def translate(self, text, src, dest):
+                if text == "interim":
+                    started.set()
+                    await release.wait()
+                return _FakeTranslation(f"{dest}:{text}")
+
+        monkeypatch.setattr(main, "Translator", SlowTranslator)
+
+        queue = main.LatestInterimQueue()
+
+        async def send(payload):
+            sent.append(payload)
+
+        session = main.TranslationSession(queue, send, log_label="test")
+        worker = asyncio.create_task(session.run())
+        try:
+            queue.put(main.TranslationWork("interim", "interim", "cs", ["en"]))
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            # Final supersedes the interim; the upstream then ends and closes the
+            # inbox, all before the interim's cancellation lands on the worker.
+            session.supersede_interim()
+            assert queue.put(main.TranslationWork("final", "final", "cs", ["en"]))
+            queue.close()
+            release.set()
+
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            if not worker.done():
+                worker.cancel()
+            await session.aclose()
+
+    asyncio.run(scenario())
+
+    finals = [p for p in sent if p.get("type") == "final"]
+    assert len(finals) == 1, f"final was dropped: {sent}"
+    assert finals[0]["original"] == "final"
+    assert finals[0]["translations"] == {"en": "en:final"}
+
+
 def test_ws_translation_failure_cancels_siblings_before_closing_the_translator(client, monkeypatch):
     """gather() leaves siblings running after the first failure. They must be
     cancelled *before* the error path closes the translator they are still using —

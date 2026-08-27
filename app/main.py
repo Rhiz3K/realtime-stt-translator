@@ -365,8 +365,8 @@ class LatestInterimQueue:
 
     @property
     def closed(self) -> bool:
-        """True once the reader is done — the worker uses this to tell its own
-        cancellation apart from a reader-driven supersede."""
+        """True once close() has been called. Queued finals still drain from
+        get() first; only then does get() return None."""
         return self._closed
 
     async def get(self) -> TranslationWork | None:
@@ -958,10 +958,17 @@ class TranslationSession:
                 # marks the former before cancelling it.
                 results = await asyncio.shield(task)
             except asyncio.CancelledError:
-                # Only swallow the cancellation the reader caused by superseding
-                # this interim. If the inbox is already closed we are being torn
-                # down, so honour our own cancellation instead of looping.
-                if task in self.superseded_interim_tasks and not self.inbox.closed:
+                # Swallow only the cancellation the reader caused by superseding
+                # this interim, and keep looping so the final it queued behind the
+                # interim still drains. `inbox.closed` is not a safe proxy for "we
+                # are being torn down": the upstream can end (closing the inbox)
+                # with a committed final still queued. current_task().cancelling()
+                # is >0 only when this worker task was itself cancelled — the real
+                # teardown signal — so honour our own cancellation in that case.
+                if (
+                    task in self.superseded_interim_tasks
+                    and asyncio.current_task().cancelling() == 0
+                ):
                     continue
                 for child in children:
                     child.cancel()
