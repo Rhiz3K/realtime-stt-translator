@@ -10,12 +10,14 @@ import json
 import logging
 import os
 import posixpath
+import re
 import secrets
 import threading
 import time
 from typing import TypedDict
 from urllib.parse import urlencode, urlparse
 
+import httpx
 import websockets as ws_lib
 from anyio import EndOfStream
 from dotenv import load_dotenv
@@ -273,6 +275,92 @@ if "azure" in ENABLED_ENGINES and not (AZURE_SPEECH_KEY and AZURE_SPEECH_REGION)
 MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH", 5000)
 TRANSLATE_TIMEOUT_SECONDS = _env_float("TRANSLATE_TIMEOUT_SECONDS", 10.0)
 INTERIM_COALESCE_DELAY_SECONDS = 0.02
+
+# --- Translation providers ---
+# googletrans (free, keyless, unofficial — Google throttles it per IP) is always
+# available; DeepL joins the pool when DEEPL_API_KEY is set. TRANSLATE_PROVIDER
+# is "auto" (try providers in _ALL_TRANSLATE_PROVIDERS order, skipping any that
+# hit a rate limit recently), a single provider name (never switch), or an
+# explicit comma-separated preference order such as "deepl,google".
+_ALL_TRANSLATE_PROVIDERS = ("google", "deepl")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
+DEEPL_API_URL = os.getenv("DEEPL_API_URL", "").strip()
+TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "auto").strip().lower() or "auto"
+TRANSLATE_FALLBACK_COOLDOWN_SECONDS = _env_float("TRANSLATE_FALLBACK_COOLDOWN_SECONDS", 600.0)
+# Provider name -> time.monotonic() deadline until which auto mode skips it.
+# Process-wide on purpose: Google's 429 is per server IP and DeepL's quota per
+# key, so one session hitting the limit should steer every session.
+_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+
+
+def available_translate_providers() -> list[str]:
+    """Providers this server can use, in _ALL_TRANSLATE_PROVIDERS order."""
+    names = ["google"]
+    if DEEPL_API_KEY:
+        names.append("deepl")
+    return names
+
+
+def _parse_translate_provider_order(raw: str, available: list[str], *, warn: bool = False) -> list[str]:
+    """Turn a TRANSLATE_PROVIDER value into a preference list over configured providers.
+
+    "auto" (or empty) = every configured provider in _ALL_TRANSLATE_PROVIDERS
+    order; a single name = that provider only (no fallback); "a,b" = explicit
+    order. Unknown or unconfigured names are dropped (logged once at startup).
+    """
+    names = [name.strip().lower() for name in raw.split(",") if name.strip()]
+    if names in ([], ["auto"]):
+        return list(available)
+    order: list[str] = []
+    for name in names:
+        if name not in _ALL_TRANSLATE_PROVIDERS:
+            if warn:
+                logging.warning("TRANSLATE_PROVIDER: unknown provider %r ignored.", name)
+        elif name not in available:
+            if warn:
+                logging.warning(
+                    "TRANSLATE_PROVIDER: %r is not configured (missing API key); ignored.", name
+                )
+        elif name not in order:
+            order.append(name)
+    if not order:
+        if warn:
+            logging.warning(
+                "TRANSLATE_PROVIDER=%r selects nothing usable; using %r.", raw, available[0]
+            )
+        return [available[0]]
+    return order
+
+
+def _translate_provider_order(requested: str | None = None) -> list[str]:
+    """Preference order for one request: a session's pinned provider, else the server's."""
+    available = available_translate_providers()
+    if requested and requested != "auto" and requested in available:
+        return [requested]
+    return _parse_translate_provider_order(TRANSLATE_PROVIDER, available)
+
+
+def _translate_provider_ui_default() -> str:
+    """What the Settings dialog preselects: a single pinned provider, otherwise "auto"."""
+    names = [name.strip().lower() for name in TRANSLATE_PROVIDER.split(",") if name.strip()]
+    order = _translate_provider_order()
+    if len(names) == 1 and names != ["auto"] and len(order) == 1:
+        return order[0]
+    return "auto"
+
+
+def _normalize_translate_provider(value: object) -> str | None:
+    """Validate a client's `translate.provider`: "auto" or a configured provider name."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized == "auto" or normalized in available_translate_providers():
+        return normalized
+    return None
+
+
+# Surface a misconfigured TRANSLATE_PROVIDER once, at startup, not on every call.
+_parse_translate_provider_order(TRANSLATE_PROVIDER, available_translate_providers(), warn=True)
 
 # --- Simple in-memory rate limiter for /login ---
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
@@ -543,12 +631,222 @@ async def _translate(translator: Translator, text: str, *, src: str, dest: str):
     return _validate_translation_result(result)
 
 
+class TranslationRateLimited(Exception):
+    """A provider refused for rate/quota reasons (HTTP 429, DeepL's 456).
+
+    Kept distinct from other failures so the router can hand the request to the
+    next provider instead of reporting `translation_failed`.
+    """
+
+
+_RATE_LIMIT_MESSAGE_RE = re.compile(r'(?:status code|HTTP)\s*"?(?:429|456)\b')
+
+
+def _looks_rate_limited(exc: BaseException) -> bool:
+    """Duck-type a rate-limit failure across googletrans versions.
+
+    googletrans 4.x raises a bare Exception that only mentions the status code
+    in its message, `_validate_translation_result` reports "HTTP 429", and an
+    httpx error carries the response object itself.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status in (429, 456)
+    return bool(_RATE_LIMIT_MESSAGE_RE.search(str(exc)))
+
+
+class GoogleTranslateProvider:
+    """googletrans: free and keyless, but an unofficial API Google throttles per IP."""
+
+    name = "google"
+
+    def __init__(self) -> None:
+        self.translator = _new_translator()
+
+    async def translate(self, text: str, *, src: str, dest: str) -> str:
+        try:
+            result = await _translate(self.translator, text, src=src, dest=dest)
+        except Exception as exc:
+            if _looks_rate_limited(exc):
+                raise TranslationRateLimited(f"google: {exc}") from exc
+            raise
+        return result.text if result else ""
+
+    async def recycle(self) -> None:
+        # The library's HTTP session goes stale after a failure; build a fresh one.
+        old = self.translator
+        self.translator = _new_translator()
+        await _close_translator(old)
+
+    async def aclose(self) -> None:
+        await _close_translator(self.translator)
+
+
+_DEEPL_FREE_URL = "https://api-free.deepl.com/v2/translate"
+_DEEPL_PRO_URL = "https://api.deepl.com/v2/translate"
+# Languages DeepL accepts as a source (base codes). Anything else is sent without
+# source_lang so DeepL auto-detects instead of rejecting the request outright.
+_DEEPL_SOURCE_LANGS = frozenset(
+    "ar bg cs da de el en es et fi fr he hu id it ja ko lt lv nb nl pl pt ro ru sk sl sv th tr uk vi zh".split()
+)
+# googletrans-style codes -> DeepL target codes where they differ. DeepL wants a
+# regional variant for English/Portuguese/Chinese targets (plain EN/PT are deprecated).
+_DEEPL_TARGET_ALIASES = {
+    "en": "EN-US",
+    "pt": "PT-PT",
+    "zh": "ZH-HANS",
+    "zh-cn": "ZH-HANS",
+    "zh-tw": "ZH-HANT",
+    "no": "NB",
+    "iw": "HE",
+}
+
+
+def _deepl_source_lang(code: str) -> str | None:
+    base = code.strip().lower().split("-", 1)[0]
+    base = {"iw": "he", "no": "nb"}.get(base, base)
+    return base.upper() if base in _DEEPL_SOURCE_LANGS else None
+
+
+def _deepl_target_lang(code: str) -> str:
+    normalized = code.strip().lower()
+    return _DEEPL_TARGET_ALIASES.get(normalized) or normalized.upper()
+
+
+class DeepLTranslateProvider:
+    """DeepL REST API. Free keys end with ":fx" and must use the api-free host."""
+
+    name = "deepl"
+
+    def __init__(
+        self, api_key: str, *, api_url: str = "", client: httpx.AsyncClient | None = None
+    ) -> None:
+        self.api_key = api_key
+        self.api_url = api_url or (_DEEPL_FREE_URL if api_key.endswith(":fx") else _DEEPL_PRO_URL)
+        self._client = client or httpx.AsyncClient(timeout=TRANSLATE_TIMEOUT_SECONDS)
+
+    async def translate(self, text: str, *, src: str, dest: str) -> str:
+        body: dict = {"text": [text], "target_lang": _deepl_target_lang(dest)}
+        source = _deepl_source_lang(src)
+        if source:
+            body["source_lang"] = source
+        try:
+            response = await asyncio.wait_for(
+                self._client.post(
+                    self.api_url,
+                    json=body,
+                    headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+                ),
+                timeout=TRANSLATE_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"DeepL request failed: {exc}") from exc
+        if response.status_code in (429, 456):
+            # 429 = too many requests, 456 = the plan's character quota is used up.
+            raise TranslationRateLimited(f"deepl: HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"DeepL HTTP {response.status_code}: {response.text[:200]}")
+        try:
+            return str(response.json()["translations"][0]["text"])
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("DeepL returned an unexpected response body") from exc
+
+    async def recycle(self) -> None:
+        """Nothing to refresh: plain HTTPS requests, httpx reconnects on its own."""
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+def _build_translate_providers() -> dict:
+    providers: dict = {"google": GoogleTranslateProvider()}
+    if DEEPL_API_KEY:
+        providers["deepl"] = DeepLTranslateProvider(DEEPL_API_KEY, api_url=DEEPL_API_URL)
+    return providers
+
+
+class TranslationRouter:
+    """Per-session translation providers behind one `translate()` call.
+
+    Which provider serves a request is decided per call: a session may pin one
+    ("google"/"deepl") or leave it on "auto", where the server's preference
+    order applies and a provider that answered with a rate-limit error is
+    skipped for TRANSLATE_FALLBACK_COOLDOWN_SECONDS. The cooldown table is
+    process-wide (see _PROVIDER_COOLDOWN_UNTIL) while the provider objects —
+    googletrans HTTP session, httpx client — are per session so their lifetime
+    stays tied to the WebSocket.
+    """
+
+    def __init__(self, providers: dict | None = None, *, cooldown: dict[str, float] | None = None) -> None:
+        self.providers = providers if providers is not None else _build_translate_providers()
+        self._cooldown = _PROVIDER_COOLDOWN_UNTIL if cooldown is None else cooldown
+
+    def candidates(self, requested: str | None) -> list:
+        """Providers to try for one request, in order.
+
+        Those not cooling down come first, in preference order; the rest follow
+        with the oldest block first, so a limit that has lifted is rediscovered
+        by the next request that needs it rather than by a separate probe.
+        """
+        order = [name for name in _translate_provider_order(requested) if name in self.providers]
+        if not order:
+            order = list(self.providers)
+        now = time.monotonic()
+        ready = [name for name in order if self._cooldown.get(name, 0.0) <= now]
+        cooling = sorted(
+            (name for name in order if name not in ready),
+            key=lambda name: self._cooldown.get(name, 0.0),
+        )
+        return [self.providers[name] for name in ready + cooling]
+
+    def mark_rate_limited(self, name: str) -> None:
+        already_cooling = self._cooldown.get(name, 0.0) > time.monotonic()
+        self._cooldown[name] = time.monotonic() + TRANSLATE_FALLBACK_COOLDOWN_SECONDS
+        log = logging.debug if already_cooling else logging.warning
+        log(
+            "Translation provider %r is rate limited; auto mode skips it for %.0f s.",
+            name,
+            TRANSLATE_FALLBACK_COOLDOWN_SECONDS,
+        )
+
+    async def translate(self, requested: str | None, text: str, *, src: str, dest: str) -> tuple[str, str]:
+        """Translate with the first candidate that is not rate limited.
+
+        Returns (translation, provider name). A pinned provider is the only
+        candidate, so a rate limit there surfaces as a failure — never a switch.
+        """
+        last_error: TranslationRateLimited | None = None
+        for provider in self.candidates(requested):
+            try:
+                return await provider.translate(text, src=src, dest=dest), provider.name
+            except TranslationRateLimited as exc:
+                self.mark_rate_limited(provider.name)
+                last_error = exc
+        raise RuntimeError(f"all translation providers are rate limited ({last_error})")
+
+    async def recycle(self) -> None:
+        for provider in self.providers.values():
+            await provider.recycle()
+
+    async def aclose(self) -> None:
+        for provider in self.providers.values():
+            await provider.aclose()
+
+
+def _providers_used(results) -> str | None:
+    """Name the provider(s) behind one message's per-dest results, for the payload."""
+    names = sorted({name for _text, name in results if name})
+    return ",".join(names) or None
+
+
 def _translation_payload(
     work: TranslationWork,
     translations: dict[str, str],
     *,
     error: str | None = None,
     translate_ms: int = 0,
+    provider: str | None = None,
 ) -> dict:
     if not work.typed:
         payload: dict = {
@@ -571,6 +869,8 @@ def _translation_payload(
         payload["client_id"] = work.client_id
     if work.client_sent_ms is not None:
         payload["client_sent_ms"] = work.client_sent_ms
+    if provider:
+        payload["provider"] = provider
     if error:
         payload["error"] = error
     return payload
@@ -672,6 +972,10 @@ def _index_context() -> dict:
     """Template context shared by all routes that render index.html."""
     return {
         "enabled_engines": sorted(ENABLED_ENGINES),
+        # Translation providers the server can use and what the Settings dialog
+        # preselects ("auto" = server order with rate-limit fallback).
+        "translate_providers": available_translate_providers(),
+        "translate_provider_default": _translate_provider_ui_default(),
     }
 
 
@@ -903,11 +1207,15 @@ class TranslationSession:
     logic cannot land on only one of them — which is exactly what had happened.
     """
 
-    def __init__(self, inbox: LatestInterimQueue, send, *, log_label: str) -> None:
+    def __init__(
+        self, inbox: LatestInterimQueue, send, *, log_label: str, provider: str = "auto"
+    ) -> None:
         self.inbox = inbox
         self.send = send
         self.log_label = log_label
-        self.translator = _new_translator()
+        self.router = TranslationRouter()
+        # "auto" or a provider name; the reader may change it from a config message.
+        self.provider = provider
         self.current_interim_task: asyncio.Future | None = None
         self.superseded_interim_tasks: set[asyncio.Future] = set()
 
@@ -926,7 +1234,7 @@ class TranslationSession:
     async def aclose(self) -> None:
         if self.current_interim_task is not None:
             self.current_interim_task.cancel()
-        await _close_translator(self.translator)
+        await self.router.aclose()
 
     async def run(self) -> None:
         while True:
@@ -945,7 +1253,7 @@ class TranslationSession:
             # to stop the surviving siblings is to keep their tasks.
             children = [
                 asyncio.ensure_future(
-                    _translate(self.translator, work.text, src=work.src, dest=dest)
+                    self.router.translate(self.provider, work.text, src=work.src, dest=dest)
                 )
                 for dest in work.dests
             ]
@@ -981,9 +1289,7 @@ class TranslationSession:
                 for child in children:
                     child.cancel()
                 await asyncio.gather(*children, return_exceptions=True)
-                old_translator = self.translator
-                self.translator = _new_translator()
-                await _close_translator(old_translator)
+                await self.router.recycle()
                 response = _translation_payload(
                     work,
                     {dest: "" for dest in work.dests},
@@ -992,8 +1298,9 @@ class TranslationSession:
             else:
                 response = _translation_payload(
                     work,
-                    {dest: (result.text if result else "") for dest, result in zip(work.dests, results)},
+                    {dest: text for dest, (text, _provider) in zip(work.dests, results)},
                     translate_ms=int((time.perf_counter() - started) * 1000),
+                    provider=_providers_used(results),
                 )
             finally:
                 self.superseded_interim_tasks.discard(task)
@@ -1055,6 +1362,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             dests_norm = _normalize_translate_dests(tr_cfg.get("dests"))
                             if dests_norm:
                                 session_dest_langs = dests_norm
+                            provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
+                            if provider_norm:
+                                session.provider = provider_norm
                         continue
                     if parsed.get("type") == "ping":
                         await _send({"type": "pong"})
@@ -1199,6 +1509,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
     translate_src = "cs"
     translate_dests: list[str] = ["en", "ru"]
     translate_interim = False
+    translate_provider = "auto"
 
     first_audio: bytes | None = None
 
@@ -1234,6 +1545,10 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                         if dests_norm:
                             translate_dests = dests_norm
 
+                        provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
+                        if provider_norm:
+                            translate_provider = provider_norm
+
                     if isinstance(cfg.get("translate_interim"), bool):
                         translate_interim = cfg["translate_interim"]
             elif first.get("bytes"):
@@ -1245,7 +1560,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
 
     if len(translate_dests) == 2 and translate_dests[0] == translate_dests[1]:
         translate_dests[1] = "ru" if translate_dests[0] != "ru" else "en"
-    translator = _new_translator()
+    router = TranslationRouter()
 
     def _dg_payload(
         *,
@@ -1254,6 +1569,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
         translations: dict[str, str],
         error: str | None = None,
         timing: dict[str, int] | None = None,
+        provider: str | None = None,
     ) -> dict:
         payload: dict = {
             "type": msg_type,
@@ -1268,6 +1584,8 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             payload["ru"] = translations["ru"]
         if timing:
             payload["timing"] = timing
+        if provider:
+            payload["provider"] = provider
         if error:
             payload["error"] = error
         return payload
@@ -1406,10 +1724,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
             listen_thread.start()
 
             async def refresh_translator() -> None:
-                nonlocal translator
-                old_translator = translator
-                translator = _new_translator()
-                await _close_translator(old_translator)
+                await router.recycle()
             
             # Coroutine pro zpracování výsledků
             async def process_results():
@@ -1430,8 +1745,8 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                                 start_t = time.perf_counter()
                                 results = await asyncio.gather(
                                     *[
-                                        _translate(
-                                            translator,
+                                        router.translate(
+                                            translate_provider,
                                             transcript,
                                             src=translate_src,
                                             dest=dest,
@@ -1441,14 +1756,15 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                                 )
                                 translate_ms = int((time.perf_counter() - start_t) * 1000)
                                 translations = {
-                                    dest: (res.text if res else "")
-                                    for dest, res in zip(translate_dests, results)
+                                    dest: text
+                                    for dest, (text, _provider) in zip(translate_dests, results)
                                 }
                                 response = _dg_payload(
                                     msg_type="final",
                                     original=transcript,
                                     translations=translations,
                                     timing={"translate_ms": translate_ms},
+                                    provider=_providers_used(results),
                                 )
                             except Exception as translate_err:
                                 logging.error(f"Chyba při překladu: {translate_err}")
@@ -1466,8 +1782,8 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                                     start_t = time.perf_counter()
                                     results = await asyncio.gather(
                                         *[
-                                            _translate(
-                                                translator,
+                                            router.translate(
+                                                translate_provider,
                                                 transcript,
                                                 src=translate_src,
                                                 dest=dest,
@@ -1477,14 +1793,15 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
                                     )
                                     translate_ms = int((time.perf_counter() - start_t) * 1000)
                                     translations = {
-                                        dest: (res.text if res else "")
-                                        for dest, res in zip(translate_dests, results)
+                                        dest: text
+                                        for dest, (text, _provider) in zip(translate_dests, results)
                                     }
                                     response = _dg_payload(
                                         msg_type="interim",
                                         original=transcript,
                                         translations=translations,
                                         timing={"translate_ms": translate_ms},
+                                        provider=_providers_used(results),
                                     )
                                 except Exception as translate_err:
                                     logging.error(f"Chyba při překladu interim: {translate_err}")
@@ -1585,7 +1902,7 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
         except Exception as send_err:
             logging.debug(f"Nelze poslat Deepgram error: {send_err}")
     finally:
-        await _close_translator(translator)
+        await router.aclose()
 
 
 @app.websocket("/ws/elevenlabs")
@@ -1613,6 +1930,7 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
     translate_src = "cs"
     translate_dests: list[str] = ["en", "ru"]
     translate_interim = True
+    translate_provider = "auto"
     el_language_code = ""
     el_commit_strategy = "vad"
 
@@ -1647,6 +1965,10 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
                         if dests_norm:
                             translate_dests = dests_norm
 
+                        provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
+                        if provider_norm:
+                            translate_provider = provider_norm
+
                     if isinstance(cfg.get("translate_interim"), bool):
                         translate_interim = cfg["translate_interim"]
             elif first.get("bytes"):
@@ -1679,6 +2001,7 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
         translations: dict[str, str],
         error: str | None = None,
         timing: dict[str, int] | None = None,
+        provider: str | None = None,
     ) -> dict:
         payload: dict = {
             "type": msg_type,
@@ -1688,6 +2011,8 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
         }
         if timing:
             payload["timing"] = timing
+        if provider:
+            payload["provider"] = provider
         if error:
             payload["error"] = error
         return payload
@@ -1702,7 +2027,10 @@ async def elevenlabs_websocket_endpoint(websocket: WebSocket):
             await websocket.send_json(payload)
 
     session = TranslationSession(
-        transcript_inbox, _send_browser, log_label="ElevenLabs translation error"
+        transcript_inbox,
+        _send_browser,
+        log_label="ElevenLabs translation error",
+        provider=translate_provider,
     )
 
     try:

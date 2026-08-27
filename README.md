@@ -55,7 +55,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by seven interchang
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
   | **Azure AI Speech** | Browser → Azure | Required | Browser-direct Speech SDK connection using a short-lived token |
 
-- **Real-time translation** into two configurable target languages (powered by [googletrans](https://github.com/ssut/py-googletrans))
+- **Real-time translation** into two configurable target languages -- [googletrans](https://github.com/ssut/py-googletrans) by default, optional [DeepL](https://www.deepl.com/pro-api) with automatic switch-over while Google rate-limits the server (or pick one provider in Settings)
 - **Interim + final results** -- partial transcriptions shown live before the utterance is committed
 - **Interim throttling** -- server-side message versioning skips stale translations to prevent queue buildup
 - **Password-protected** -- cookie-based auth with HMAC-signed tokens (can be disabled for VPN/proxy setups)
@@ -199,7 +199,11 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `MAX_TEXT_LENGTH` | No | `5000` | Maximum accepted input text length per WebSocket message. |
-| `TRANSLATE_TIMEOUT_SECONDS` | No | `10` | Timeout for a single googletrans call (seconds). |
+| `TRANSLATE_TIMEOUT_SECONDS` | No | `10` | Timeout for a single translation call (seconds). |
+| `DEEPL_API_KEY` | No | -- | Adds [DeepL](https://www.deepl.com/pro-api) as a translation provider (free keys end with `:fx`, 500k chars/month). |
+| `DEEPL_API_URL` | No | derived from key | Override the DeepL translate endpoint (`api-free.deepl.com` for `:fx` keys, else `api.deepl.com`). |
+| `TRANSLATE_PROVIDER` | No | `auto` | `auto` = googletrans first, switch to DeepL while Google answers HTTP 429; `google` / `deepl` pins one (never switches); `deepl,google` = explicit order. Users can override per session in Settings. |
+| `TRANSLATE_FALLBACK_COOLDOWN_SECONDS` | No | `600` | How long `auto` skips a provider after a rate-limit answer. |
 | `NEMOTRON_MODEL_DIR` | No | `app/static/nemotron/models` | Read by `scripts/prepare_nemotron_onnx.py` only — where to write the generated assets. |
 | `PARAKEET_MODEL_DIR` | No | `app/static/parakeet/models` | Read by `scripts/prepare_parakeet_onnx.py` only — where to write the downloaded assets. |
 
@@ -428,7 +432,7 @@ These items would improve the project but are not blocking. They make great firs
   - Browser-driven Web Speech lifecycle behavior across supported Chrome/Edge versions
   - Real vendor reconnect/error matrices for Deepgram, ElevenLabs, and Azure
 - [ ] **Extract duplicated AudioWorklet PCM processor** code into a shared JavaScript constant -- the same processor is currently inlined in three places (Deepgram, ElevenLabs server mode, ElevenLabs browser mode)
-- [ ] **Consider `google-cloud-translate` or `deepl` for production translation** -- the current `googletrans` library uses an unofficial API that can be slow (1--3 s per call) and occasionally breaks; a paid translation API would be more reliable for production deployments
+- [x] **Second translation provider** -- DeepL is available via `DEEPL_API_KEY`; `TRANSLATE_PROVIDER=auto` switches to it while `googletrans` (unofficial API, per-IP HTTP 429) is rate limited, and the Settings dialog can pin either. Another provider (e.g. `google-cloud-translate`, Azure Translator) slots into `TranslationRouter` the same way
 
 ## Contributing
 

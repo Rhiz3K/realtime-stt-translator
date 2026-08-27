@@ -7,7 +7,9 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -21,6 +23,11 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "AUTH_SECRET", "test-secret")
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
     monkeypatch.setattr(main, "ENABLED_ENGINES", {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure"})
+    # Translation-provider state is process-wide (rate-limit cooldowns); give every
+    # test a clean, googletrans-only default so switch-over tests opt in explicitly.
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    monkeypatch.setattr(main, "_PROVIDER_COOLDOWN_UNTIL", {})
     return TestClient(main.app)
 
 
@@ -2021,3 +2028,430 @@ def test_translation_session_is_used_by_both_websocket_endpoints():
     # The forked copies are gone, not merely unused.
     assert "_translate_transcripts" not in source
     assert "superseded_el_interim_tasks" not in source
+
+
+# --- Translation providers: preference parsing, router, DeepL, config plumbing ---
+
+
+class _FakeProvider:
+    def __init__(self, name, behaviour):
+        self.name = name
+        self.behaviour = behaviour  # callable(text, src, dest) -> str, or raises
+        self.calls = []
+        self.recycled = 0
+        self.closed = 0
+
+    async def translate(self, text, *, src, dest):
+        self.calls.append((text, src, dest))
+        return self.behaviour(text, src, dest)
+
+    async def recycle(self):
+        self.recycled += 1
+
+    async def aclose(self):
+        self.closed += 1
+
+
+def _rate_limited(*_args):
+    raise main.TranslationRateLimited("google: HTTP 429")
+
+
+class _FakeDeepL:
+    """Stands in for DeepLTranslateProvider inside TranslationRouter (per session)."""
+
+    name = "deepl"
+    instances: list = []
+
+    def __init__(self, api_key, *, api_url=""):
+        self.api_key = api_key
+        self.api_url = api_url
+        self.calls = []
+        _FakeDeepL.instances.append(self)
+
+    async def translate(self, text, *, src, dest):
+        self.calls.append((text, src, dest))
+        return f"deepl:{dest}:{text}"
+
+    async def recycle(self):
+        pass
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "raw, deepl_key, expected",
+    [
+        ("auto", "k:fx", ["google", "deepl"]),
+        ("", "k:fx", ["google", "deepl"]),
+        ("auto", "", ["google"]),
+        ("deepl,google", "k:fx", ["deepl", "google"]),
+        ("deepl", "k:fx", ["deepl"]),
+        ("google", "k:fx", ["google"]),
+        ("deepl", "", ["google"]),  # pinned but unconfigured -> the only usable one
+        ("bogus,deepl", "k:fx", ["deepl"]),  # unknown names dropped
+        ("GOOGLE, deepl", "k:fx", ["google", "deepl"]),
+    ],
+)
+def test_translate_provider_order_parsing(monkeypatch, raw, deepl_key, expected):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", deepl_key)
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", raw)
+    assert main._translate_provider_order() == expected
+
+
+def test_translate_provider_order_honours_a_session_pin(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    assert main._translate_provider_order("deepl") == ["deepl"]
+    assert main._translate_provider_order("google") == ["google"]
+    assert main._translate_provider_order("auto") == ["google", "deepl"]
+    # A pin on an unconfigured provider falls back to the server order.
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "")
+    assert main._translate_provider_order("deepl") == ["google"]
+
+
+@pytest.mark.parametrize(
+    "raw, deepl_key, expected",
+    [
+        ("auto", "k:fx", "auto"),
+        ("deepl", "k:fx", "deepl"),
+        ("google,deepl", "k:fx", "auto"),
+        ("deepl", "", "google"),  # pinned to something unconfigured -> the one that works
+    ],
+)
+def test_translate_provider_ui_default(monkeypatch, raw, deepl_key, expected):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", deepl_key)
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", raw)
+    assert main._translate_provider_ui_default() == expected
+
+
+def test_normalize_translate_provider(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    assert main._normalize_translate_provider("deepl") == "deepl"
+    assert main._normalize_translate_provider(" Google ") == "google"
+    assert main._normalize_translate_provider("auto") == "auto"
+    assert main._normalize_translate_provider("bing") is None
+    assert main._normalize_translate_provider(42) is None
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "")
+    assert main._normalize_translate_provider("deepl") is None
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (Exception("Unexpected status code \"429\" from ['translate.googleapis.com']"), True),
+        (RuntimeError("Translation upstream returned HTTP 429"), True),
+        (RuntimeError("Translation upstream returned HTTP 456"), True),
+        (RuntimeError("Translation upstream returned HTTP 500"), False),
+        (RuntimeError("timed out after 429 ms"), False),
+    ],
+)
+def test_looks_rate_limited_message_forms(exc, expected):
+    assert main._looks_rate_limited(exc) is expected
+
+
+def test_looks_rate_limited_reads_response_status():
+    class WithResponse(Exception):
+        def __init__(self, status):
+            super().__init__("boom")
+            self.response = types.SimpleNamespace(status_code=status)
+
+    assert main._looks_rate_limited(WithResponse(429)) is True
+    assert main._looks_rate_limited(WithResponse(503)) is False
+
+
+def test_translation_router_switches_to_fallback_on_rate_limit(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    monkeypatch.setattr(main, "TRANSLATE_FALLBACK_COOLDOWN_SECONDS", 600.0)
+    google = _FakeProvider("google", _rate_limited)
+    deepl = _FakeProvider("deepl", lambda text, src, dest: f"deepl:{dest}:{text}")
+    cooldown: dict = {}
+    router = main.TranslationRouter({"google": google, "deepl": deepl}, cooldown=cooldown)
+
+    async def scenario():
+        first = await router.translate("auto", "ahoj", src="cs", dest="en")
+        second = await router.translate("auto", "svete", src="cs", dest="en")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == ("deepl:en:ahoj", "deepl")
+    assert second == ("deepl:en:svete", "deepl")
+    # Google was tried once, then skipped for the cooldown; DeepL served both.
+    assert len(google.calls) == 1
+    assert len(deepl.calls) == 2
+    assert cooldown["google"] > time.monotonic()
+
+
+def test_translation_router_retries_primary_once_its_cooldown_expired(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    google = _FakeProvider("google", lambda text, src, dest: f"google:{text}")
+    deepl = _FakeProvider("deepl", lambda text, src, dest: f"deepl:{text}")
+    cooldown = {"google": time.monotonic() - 1}  # block already lifted
+    router = main.TranslationRouter({"google": google, "deepl": deepl}, cooldown=cooldown)
+
+    assert asyncio.run(router.translate("auto", "x", src="cs", dest="en")) == ("google:x", "google")
+    assert deepl.calls == []
+
+
+def test_translation_router_tries_cooling_providers_last_oldest_block_first(monkeypatch):
+    """Everything limited: still try, oldest block first — the limit may have lifted."""
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    now = time.monotonic()
+    google = _FakeProvider("google", lambda *_: "g")
+    deepl = _FakeProvider("deepl", lambda *_: "d")
+    router = main.TranslationRouter(
+        {"google": google, "deepl": deepl},
+        cooldown={"google": now + 100, "deepl": now + 50},
+    )
+    assert [p.name for p in router.candidates("auto")] == ["deepl", "google"]
+
+
+def test_translation_router_pinned_provider_never_switches(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    google = _FakeProvider("google", _rate_limited)
+    deepl = _FakeProvider("deepl", lambda *_: "d")
+    router = main.TranslationRouter({"google": google, "deepl": deepl}, cooldown={})
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        asyncio.run(router.translate("google", "x", src="cs", dest="en"))
+    assert deepl.calls == []
+
+
+def test_translation_router_recycles_and_closes_every_provider():
+    google = _FakeProvider("google", lambda *_: "g")
+    deepl = _FakeProvider("deepl", lambda *_: "d")
+    router = main.TranslationRouter({"google": google, "deepl": deepl}, cooldown={})
+
+    async def scenario():
+        await router.recycle()
+        await router.aclose()
+
+    asyncio.run(scenario())
+    assert (google.recycled, deepl.recycled, google.closed, deepl.closed) == (1, 1, 1, 1)
+
+
+def _deepl_provider(handler, key="key:fx", **kwargs):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return main.DeepLTranslateProvider(key, client=client, **kwargs)
+
+
+def test_deepl_provider_translates_and_maps_language_codes():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"translations": [{"detected_source_language": "CS", "text": "Hello world"}]}
+        )
+
+    provider = _deepl_provider(handler)
+    text = asyncio.run(provider.translate("Ahoj světe", src="cs", dest="en"))
+
+    assert text == "Hello world"
+    assert seen["url"] == "https://api-free.deepl.com/v2/translate"  # ":fx" key -> free host
+    assert seen["auth"] == "DeepL-Auth-Key key:fx"
+    assert seen["body"] == {"text": ["Ahoj světe"], "target_lang": "EN-US", "source_lang": "CS"}
+    asyncio.run(provider.aclose())
+
+
+def test_deepl_provider_picks_host_from_key_and_honours_override():
+    idle = httpx.MockTransport(lambda request: httpx.Response(500))
+    pro = main.DeepLTranslateProvider("abc", client=httpx.AsyncClient(transport=idle))
+    custom = main.DeepLTranslateProvider(
+        "abc:fx", api_url="http://localhost:9/v2/translate", client=httpx.AsyncClient(transport=idle)
+    )
+    assert pro.api_url == "https://api.deepl.com/v2/translate"
+    assert custom.api_url == "http://localhost:9/v2/translate"
+
+    async def close():
+        await pro.aclose()
+        await custom.aclose()
+
+    asyncio.run(close())
+
+
+def test_deepl_provider_omits_source_lang_it_cannot_name():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"translations": [{"text": "ok"}]})
+
+    provider = _deepl_provider(handler)
+    asyncio.run(provider.translate("x", src="sw", dest="de"))  # Swahili: not a DeepL source
+    assert "source_lang" not in seen["body"]
+    assert seen["body"]["target_lang"] == "DE"
+    asyncio.run(provider.aclose())
+
+
+@pytest.mark.parametrize("code", [429, 456])
+def test_deepl_provider_reports_rate_limits(code):
+    provider = _deepl_provider(lambda request: httpx.Response(code, json={"message": "limit"}))
+    with pytest.raises(main.TranslationRateLimited):
+        asyncio.run(provider.translate("x", src="cs", dest="en"))
+    asyncio.run(provider.aclose())
+
+
+def test_deepl_provider_other_errors_are_plain_failures():
+    bad_lang = _deepl_provider(
+        lambda request: httpx.Response(400, json={"message": "Value for 'target_lang' not supported."})
+    )
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        asyncio.run(bad_lang.translate("x", src="cs", dest="xx"))
+
+    odd_body = _deepl_provider(lambda request: httpx.Response(200, json={"nope": []}))
+    with pytest.raises(RuntimeError, match="unexpected response"):
+        asyncio.run(odd_body.translate("x", src="cs", dest="en"))
+
+    def explode(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    down = _deepl_provider(explode)
+    with pytest.raises(RuntimeError, match="request failed"):
+        asyncio.run(down.translate("x", src="cs", dest="en"))
+
+    async def close():
+        for provider in (bad_lang, odd_body, down):
+            await provider.aclose()
+
+    asyncio.run(close())
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [("en", "EN-US"), ("pt", "PT-PT"), ("zh-cn", "ZH-HANS"), ("zh-tw", "ZH-HANT"), ("de", "DE"), ("no", "NB"), ("iw", "HE")],
+)
+def test_deepl_target_lang_mapping(code, expected):
+    assert main._deepl_target_lang(code) == expected
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [("cs", "CS"), ("zh-cn", "ZH"), ("en-US", "EN"), ("iw", "HE"), ("no", "NB"), ("sw", None)],
+)
+def test_deepl_source_lang_mapping(code, expected):
+    assert main._deepl_source_lang(code) == expected
+
+
+def test_ws_pins_translation_provider_from_config(client, monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "key:fx")
+    monkeypatch.setattr(main, "DeepLTranslateProvider", _FakeDeepL)
+
+    class GoogleMustNotRun:
+        async def translate(self, *_args, **_kwargs):
+            raise AssertionError("google must not be used when deepl is pinned")
+
+    monkeypatch.setattr(main, "Translator", GoogleMustNotRun)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"], "provider": "deepl"}})
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["translations"] == {"en": "deepl:en:Ahoj"}
+    assert data["provider"] == "deepl"
+
+
+def test_ws_auto_switches_to_deepl_when_google_is_rate_limited(client, monkeypatch):
+    """The production failure mode: Google answers 429 for this server's IP. Auto
+    mode must deliver the translation from DeepL instead of `translation_failed`,
+    and remember the block so the next request skips Google outright."""
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "key:fx")
+    monkeypatch.setattr(main, "DeepLTranslateProvider", _FakeDeepL)
+    google_calls = []
+
+    class ThrottledGoogle:
+        async def translate(self, text, src, dest):
+            google_calls.append(text)
+            raise Exception("Unexpected status code \"429\" from ['translate.googleapis.com']")
+
+    monkeypatch.setattr(main, "Translator", ThrottledGoogle)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        first = ws.receive_json()
+        ws.send_json({"type": "final", "text": "Světe", "src": "cs", "dests": ["en"]})
+        second = ws.receive_json()
+
+    assert "error" not in first and "error" not in second
+    assert first["translations"] == {"en": "deepl:en:Ahoj"}
+    assert second["translations"] == {"en": "deepl:en:Světe"}
+    assert first["provider"] == second["provider"] == "deepl"
+    assert google_calls == ["Ahoj"]  # skipped for the cooldown on the second message
+    assert main._PROVIDER_COOLDOWN_UNTIL["google"] > time.monotonic()
+
+
+def test_ws_pinned_google_reports_rate_limit_instead_of_switching(client, monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "key:fx")
+    monkeypatch.setattr(main, "DeepLTranslateProvider", _FakeDeepL)
+    _FakeDeepL.instances.clear()
+
+    class ThrottledGoogle:
+        async def translate(self, *_args, **_kwargs):
+            raise Exception("Unexpected status code \"429\" from ['translate.googleapis.com']")
+
+    monkeypatch.setattr(main, "Translator", ThrottledGoogle)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"], "provider": "google"}})
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["error"] == "translation_failed"
+    assert data["translations"] == {"en": ""}
+    assert all(instance.calls == [] for instance in _FakeDeepL.instances)
+
+
+def test_ws_ignores_an_unknown_translation_provider(client, monkeypatch):
+    class FakeAsyncTranslator:
+        async def translate(self, text, src, dest):
+            return _FakeTranslation(f"{dest}:{text}")
+
+    monkeypatch.setattr(main, "Translator", FakeAsyncTranslator)
+    client.post("/login", data={"password": "test-password", "next": "/"}, follow_redirects=False)
+
+    with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+        ws.send_json({"type": "config", "translate": {"src": "cs", "dests": ["en"], "provider": "bing"}})
+        ws.send_json({"type": "final", "text": "Ahoj", "src": "cs", "dests": ["en"]})
+        data = ws.receive_json()
+
+    assert data["translations"] == {"en": "en:Ahoj"}
+    assert data["provider"] == "google"
+
+
+def test_index_context_exposes_translate_providers(monkeypatch):
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "auto")
+    context = main._index_context()
+    assert context["translate_providers"] == ["google"]
+    assert context["translate_provider_default"] == "auto"
+
+    monkeypatch.setattr(main, "DEEPL_API_KEY", "k:fx")
+    monkeypatch.setattr(main, "TRANSLATE_PROVIDER", "deepl")
+    context = main._index_context()
+    assert context["translate_providers"] == ["google", "deepl"]
+    assert context["translate_provider_default"] == "deepl"
+
+
+def test_template_exposes_translation_provider_setting():
+    html = Path("app/templates/index.html").read_text()
+
+    assert 'id="translateProvider"' in html
+    assert "{{ translate_providers | tojson }}" in html
+    assert "{{ translate_provider_default | tojson }}" in html
+    assert "function populateTranslateProviderSelect" in html
+    assert 'id="statProvider"' in html
+    # Every WS session tells the server which provider it wants:
+    # /ws (1) + Deepgram (dbg echo + send = 2) + ElevenLabs server mode (1).
+    assert html.count("provider: translateProvider") == 4
+    assert "translateProvider," in html.split("function persistSettings")[1].split("}")[0]

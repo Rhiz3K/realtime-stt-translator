@@ -51,11 +51,16 @@ The entire backend is `app/main.py` (~1800 lines): auth, CSP middleware, HTTP ro
 
 ### WebSocket protocol (`/ws` and audio endpoints)
 
-Clients send typed JSON: `{"type": "config", ...}` (optional, first message), `{"type": "interim"|"final", "text": ..., "src": ..., "dests": [...]}`, `{"type": "ping"}`. Server replies with `{"type": ..., "original": ..., "translations": {...}}` or `{"error": ...}`. A legacy plain-text path (Czech → en/ru) is retained in `/ws` — don't break it. A reader task feeds a `LatestInterimQueue` that a worker task drains: superseded interims are coalesced, cancelled in flight, and re-checked against the revision counter before and after the (slow) translation call, while finals are always translated. An error payload without a `type` is terminal — the browser tears the session down on it (`translation_queue_full` → close 1013, `server_error` → 1011), so don't send a typeless error you expect the client to survive.
+Clients send typed JSON: `{"type": "config", "translate": {"src", "dests", "provider"}, ...}` (optional, first message; `provider` is `"auto"` or a configured provider name), `{"type": "interim"|"final", "text": ..., "src": ..., "dests": [...]}`, `{"type": "ping"}`. Server replies with `{"type": ..., "original": ..., "translations": {...}, "provider": ...}` or `{"error": ...}`. A legacy plain-text path (Czech → en/ru) is retained in `/ws` — don't break it. A reader task feeds a `LatestInterimQueue` that a worker task drains: superseded interims are coalesced, cancelled in flight, and re-checked against the revision counter before and after the (slow) translation call, while finals are always translated. An error payload without a `type` is terminal — the browser tears the session down on it (`translation_queue_full` → close 1013, `server_error` → 1011), so don't send a typeless error you expect the client to survive.
 
 ### Translation
 
-`googletrans` (unofficial API, 1–3 s per call, can break). `_translate()` handles both sync and async variants of the library, offloads sync calls with `asyncio.to_thread`, and applies `TRANSLATE_TIMEOUT_SECONDS`. On failure the `Translator` is recreated (stale HTTP session) and a `translation_failed` error payload is sent.
+Two providers behind one `TranslationRouter` (per WS session; all three endpoints use it):
+
+- **google** — `googletrans` (unofficial API, 1–3 s per call, can break, and Google 429-blocks a busy server IP). `_translate()` handles both sync and async variants of the library, offloads sync calls with `asyncio.to_thread`, and applies `TRANSLATE_TIMEOUT_SECONDS`. On failure the `Translator` is recreated (stale HTTP session) via `GoogleTranslateProvider.recycle()`.
+- **deepl** — `DeepLTranslateProvider`, plain httpx POST to `/v2/translate`; present only when `DEEPL_API_KEY` is set. Language codes are googletrans-style everywhere; `_deepl_target_lang()` / `_deepl_source_lang()` map them (`en` → `EN-US`, unknown source → auto-detect).
+
+`TranslationRouter.translate(requested, ...)` returns `(text, provider_name)`. `requested` is `"auto"` (server order from `TRANSLATE_PROVIDER`) or a pinned name from the session's `config` message (`translate.provider`). Only a `TranslationRateLimited` (HTTP 429/456, duck-typed from googletrans messages by `_looks_rate_limited`) triggers a switch: the provider is put into `_PROVIDER_COOLDOWN_UNTIL` (process-wide — the limit is per server IP / API key, not per session) for `TRANSLATE_FALLBACK_COOLDOWN_SECONDS` and the next candidate is tried; a pinned provider never switches. Any other failure still sends `translation_failed`. Typed payloads carry `provider` so the UI can show which one answered.
 
 ### Auth & security
 
@@ -80,6 +85,7 @@ These pairs must change together:
 - **Parakeet engine**: shares the Nemotron front-end (`../nemotron/mel.js`) and the same onnxruntime-web pin, so a CSP/ORT bump must cover `parakeet-engine.mjs` too. The int8 model in `app/static/parakeet/models/` is gitignored and fetched by `scripts/prepare_parakeet_onnx.py` (`requirements-parakeet-prep.txt`); its file names (`encoder-int8.onnx`, `decoder_joint-int8.onnx`, `vocab.txt`) are duplicated in the engine — change both.
 - **PCM framing**: `FRAME_SAMPLES = 512` in `pcm-worklet.js` matches the VAD timing constants (~32 ms/frame at 16 kHz) in `whisper-engine.mjs`, and is re-declared in `nemotron-engine.mjs` / `parakeet-engine.mjs`.
 - **Engine names**: `_ALL_ENGINES` / `ENABLED_ENGINES` in `main.py` ↔ engine dropdown and gating logic in `index.html` (template receives `enabled_engines`).
+- **Translation providers**: `_ALL_TRANSLATE_PROVIDERS` in `main.py` ↔ `TRANSLATE_PROVIDER_LABELS` in `index.html` (template receives `translate_providers` + `translate_provider_default`); the `config` message's `translate.provider` is parsed by all three WS endpoints.
 - **Azure Speech SDK version**: pinned in *both* the CSP `script-src` in `app/main.py` (`_CSPMiddleware`, the `azure_sdk` jsDelivr URL) and `AZURE_SDK_VERSION` in `index.html`. A mismatch means the CSP silently blocks the SDK script fetch. Azure's `connect-src` (`wss://*.stt.speech.microsoft.com`, `https://*.api.cognitive.microsoft.com`) also lives in that CSP.
 
 ## Conventions that matter here

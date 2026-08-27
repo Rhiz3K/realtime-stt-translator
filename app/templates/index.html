@@ -557,6 +557,10 @@
               TR
               <span class="stat-value">—</span>
             </span>
+            <span class="stat" id="statProvider" title="Translation provider behind the last translation">
+              Via
+              <span class="stat-value">—</span>
+            </span>
             <span class="stat" id="statRtt" title="WebSocket ping/pong RTT (when supported)">
               RTT
               <span class="stat-value">—</span>
@@ -770,6 +774,11 @@
               <select id="translateDestB"></select>
             </div>
             <div class="field">
+              <label for="translateProvider">Translation provider</label>
+              <select id="translateProvider"></select>
+              <p class="hint">Auto follows the server order and switches when a provider is rate limited</p>
+            </div>
+            <div class="field">
               <span class="checkbox">
                 <input id="translateInterim" type="checkbox" />
                 <label for="translateInterim">Translate interim text</label>
@@ -970,11 +979,13 @@
     const statSegments = document.getElementById('statSegments');
     const statStt = document.getElementById('statStt');
     const statTranslate = document.getElementById('statTranslate');
+    const statProvider = document.getElementById('statProvider');
     const statRtt = document.getElementById('statRtt');
     const statLangValue = statLang ? statLang.querySelector('.stat-value') : null;
     const statSegmentsValue = statSegments ? statSegments.querySelector('.stat-value') : null;
     const statSttValue = statStt ? statStt.querySelector('.stat-value') : null;
     const statTranslateValue = statTranslate ? statTranslate.querySelector('.stat-value') : null;
+    const statProviderValue = statProvider ? statProvider.querySelector('.stat-value') : null;
     const statRttValue = statRtt ? statRtt.querySelector('.stat-value') : null;
 
     // Settings modal
@@ -1020,6 +1031,7 @@
     const translateSrcInput = document.getElementById('translateSrc');
     const translateDestASelect = document.getElementById('translateDestA');
     const translateDestBSelect = document.getElementById('translateDestB');
+    const translateProviderSelect = document.getElementById('translateProvider');
     const continuousCheckbox = document.getElementById('continuous');
     const interimResultsCheckbox = document.getElementById('interimResults');
     const maxAlternativesInput = document.getElementById('maxAlternatives');
@@ -1063,6 +1075,47 @@
 
     // Enabled engines (from server env ENABLED_ENGINES).
     const enabledEngines = new Set({{ enabled_engines | tojson }});
+
+    // Translation providers the server can use (env DEEPL_API_KEY etc.) and the
+    // choice its TRANSLATE_PROVIDER preselects. 'auto' = the server's order with an
+    // automatic switch-over when a provider is rate limited.
+    const translateProviders = {{ translate_providers | tojson }};
+    const translateProviderDefault = {{ translate_provider_default | tojson }};
+    // Keep in sync with _ALL_TRANSLATE_PROVIDERS in app/main.py.
+    const TRANSLATE_PROVIDER_LABELS = { google: 'Google (googletrans)', deepl: 'DeepL' };
+
+    function translateProviderLabel(name) {
+      return TRANSLATE_PROVIDER_LABELS[name] || String(name || '');
+    }
+
+    function normalizeTranslateProvider(value) {
+      const v = String(value || '').trim().toLowerCase();
+      return v === 'auto' || translateProviders.includes(v) ? v : translateProviderDefault;
+    }
+
+    // Options depend on which providers the server configured; built once here so
+    // the Settings form can simply set .value like the other selects.
+    function populateTranslateProviderSelect() {
+      if (!translateProviderSelect) return;
+      translateProviderSelect.textContent = '';
+      const addOption = (value, label, disabled) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        opt.disabled = Boolean(disabled);
+        translateProviderSelect.appendChild(opt);
+      };
+      addOption('auto', 'Auto (server order, switch on rate limit)', false);
+      for (const name of Object.keys(TRANSLATE_PROVIDER_LABELS)) {
+        const available = translateProviders.includes(name);
+        addOption(
+          name,
+          available ? TRANSLATE_PROVIDER_LABELS[name] : `${TRANSLATE_PROVIDER_LABELS[name]} (not configured on server)`,
+          !available
+        );
+      }
+    }
+    populateTranslateProviderSelect();
 
     // Speech Recognition (Web Speech API)
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1108,6 +1161,10 @@
 
     // Translation: source + 1-2 target languages (Target B is optional)
     let translateSrc = 'cs';
+    // Which server-side translation provider this session asks for ('auto' or a
+    // name from translateProviders); sent in the config message of every WS session.
+    let translateProvider = translateProviderDefault;
+    let _trLastProvider = null; // provider behind the last translation (stats bar)
     let translateDestA = 'en';
     let translateDestB = '';
 
@@ -1288,6 +1345,10 @@
           const aRtt = _trRttEmaMs != null ? _fmtMs(_trRttEmaMs) : '—';
           statTranslate.title = `Translation: server ${srv} (avg ${aSrv}), /ws RTT ${rtt} (avg ${aRtt})`;
         }
+      }
+
+      if (statProviderValue) {
+        statProviderValue.textContent = _trLastProvider ? translateProviderLabel(_trLastProvider) : '—';
       }
 
       if (statRttValue) {
@@ -2466,6 +2527,7 @@
       translateSrcInput.value = translateSrc;
       translateDestASelect.value = translateDestA;
       translateDestBSelect.value = translateDestB;
+      if (translateProviderSelect) translateProviderSelect.value = translateProvider;
       continuousCheckbox.checked = recognitionContinuous;
       interimResultsCheckbox.checked = recognitionInterimResults;
       maxAlternativesInput.value = String(recognitionMaxAlternatives);
@@ -2548,6 +2610,9 @@
         if (typeof parsed.translateDestB === 'string') {
           translateDestB = parsed.translateDestB;
         }
+        if (typeof parsed.translateProvider === 'string') {
+          translateProvider = normalizeTranslateProvider(parsed.translateProvider);
+        }
         if (typeof parsed.translateInterimEnabled === 'boolean') {
           translateInterimEnabled = parsed.translateInterimEnabled;
         }
@@ -2615,6 +2680,7 @@
             translateSrc,
             translateDestA,
             translateDestB,
+            translateProvider,
             translateInterimEnabled,
             interimSendIntervalMs,
             deepgramModel,
@@ -2698,6 +2764,7 @@
       recognitionProcessLocally = Boolean(processLocallyCheckbox.checked);
       recognitionPhrasesText = String(phrasesTextarea.value || '');
 
+      if (translateProviderSelect) translateProvider = normalizeTranslateProvider(translateProviderSelect.value);
       translateInterimEnabled = Boolean(translateInterimCheckbox.checked);
       interimSendIntervalMs = clampInt(interimIntervalInput.value, 500, 30000, 5000);
 
@@ -3297,6 +3364,15 @@
         _trServerEmaMs = _ema(_trServerEmaMs, srv, 0.25);
       }
 
+      if (data && typeof data.provider === 'string' && data.provider) {
+        // In auto mode the server may switch providers mid-session (rate limit);
+        // say so once rather than leaving the user to notice a change of style.
+        if (_trLastProvider && data.provider !== _trLastProvider && translateProvider === 'auto') {
+          showMessage(`Translation switched to ${translateProviderLabel(data.provider)}`);
+        }
+        _trLastProvider = data.provider;
+      }
+
       const translations =
         data && typeof data.translations === 'object' && data.translations
           ? data.translations
@@ -3449,11 +3525,12 @@
         _startWsKeepAlive();
         try {
           const dests = getTranslateDests();
-          dbg('ws:/ws send', { type: 'config', translate: { src: translateSrc, dests } });
+          const translate = { src: translateSrc, dests, provider: translateProvider };
+          dbg('ws:/ws send', { type: 'config', translate });
           socket.send(
             JSON.stringify({
               type: 'config',
-              translate: { src: translateSrc, dests },
+              translate,
             })
           );
         } catch (_e) {
@@ -3943,7 +4020,7 @@
               interim_results: Boolean(deepgramInterimResults),
               punctuate: Boolean(deepgramPunctuate),
             },
-            translate: { src: translateSrc, dests: getTranslateDests() },
+            translate: { src: translateSrc, dests: getTranslateDests(), provider: translateProvider },
             translate_interim: Boolean(translateInterimEnabled),
           });
           sessionSocket.send(
@@ -3955,7 +4032,7 @@
                 interim_results: Boolean(deepgramInterimResults),
                 punctuate: Boolean(deepgramPunctuate),
               },
-              translate: { src: translateSrc, dests: getTranslateDests() },
+              translate: { src: translateSrc, dests: getTranslateDests(), provider: translateProvider },
               translate_interim: Boolean(translateInterimEnabled),
             })
           );
@@ -4539,7 +4616,7 @@ registerProcessor('int16-pcm-processor-el-browser', Int16PCMProcessor);
               language_code: elevenlabsLanguage || '',
               commit_strategy: elevenlabsCommitStrategy,
             },
-            translate: { src: translateSrc, dests: getTranslateDests() },
+            translate: { src: translateSrc, dests: getTranslateDests(), provider: translateProvider },
             translate_interim: Boolean(translateInterimEnabled),
           };
           dbg('ws:/ws/elevenlabs send', config);
