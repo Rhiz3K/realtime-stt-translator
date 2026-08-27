@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import posixpath
 import secrets
 import threading
 import time
@@ -68,10 +69,17 @@ def _is_model_asset_path(path: str) -> bool:
 # --- Security middleware: Content-Security-Policy ---
 class _CSPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # StaticFiles resolves the request path through os.path.normpath *after*
+        # this middleware runs, so a non-canonical spelling ("/nemotron//models",
+        # "/whisper/../nemotron/models", a "%2e%2e" that the server decodes to
+        # "..") would slip past a raw startswith gate yet still be served.
+        # Normalize the same way first, and reuse the result for the
+        # cache-control decisions below so a bypass path can't dodge those either.
+        asset_path = posixpath.normpath(request.url.path)
         # The model weights are hundreds of MB to ~1.2 GB each and StaticFiles has
         # no auth of its own, so an unauthenticated scraper could pull them at will.
         # The browser fetches them same-origin, so the auth cookie rides along.
-        if _is_model_asset_path(request.url.path) and AUTH_ENABLED:
+        if _is_model_asset_path(asset_path) and AUTH_ENABLED:
             if not APP_PASSWORD or not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
                 return PlainTextResponse("unauthorized", status_code=401)
         response: StarletteResponse = await call_next(request)
@@ -116,24 +124,24 @@ class _CSPMiddleware(BaseHTTPMiddleware):
         response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         # Always revalidate the local Whisper engine/worklet so a browser can't
         # pin a stale (and possibly broken) cached copy across reloads.
-        if request.url.path.startswith("/static/whisper/"):
+        if asset_path.startswith("/static/whisper/"):
             response.headers["Cache-Control"] = "no-cache"
         # The Nemotron model weights (~1.2 GB) are immutable and must be cached
         # aggressively; the engine code is revalidated like Whisper's.
-        elif request.url.path.startswith("/static/nemotron/models/"):
+        elif asset_path.startswith("/static/nemotron/models/"):
             if 200 <= response.status_code < 400:
                 response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
             else:
                 response.headers["Cache-Control"] = "no-store"
-        elif request.url.path.startswith("/static/nemotron/"):
+        elif asset_path.startswith("/static/nemotron/"):
             response.headers["Cache-Control"] = "no-cache"
         # Parakeet mirrors Nemotron: immutable ~930 MB model weights, revalidated code.
-        elif request.url.path.startswith("/static/parakeet/models/"):
+        elif asset_path.startswith("/static/parakeet/models/"):
             if 200 <= response.status_code < 400:
                 response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
             else:
                 response.headers["Cache-Control"] = "no-store"
-        elif request.url.path.startswith("/static/parakeet/"):
+        elif asset_path.startswith("/static/parakeet/"):
             response.headers["Cache-Control"] = "no-cache"
         return response
 

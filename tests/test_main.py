@@ -1892,6 +1892,27 @@ def test_model_weights_are_not_downloadable_without_auth(client, path):
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        # httpx keeps "//" and "%2e%2e" verbatim (it collapses only literal "."/
+        # ".."), so these reach the server non-canonically; StaticFiles then
+        # normalizes them onto a real model file. A raw startswith gate on the
+        # request path would 401 the canonical spelling but serve these.
+        "/static/nemotron//models/encoder_fp16.onnx",
+        "/static/nemotron/%2e%2e/nemotron/models/encoder_fp16.onnx",
+        "/static/whisper/%2e%2e/nemotron/models/encoder_fp16.onnx",
+        "/static/parakeet//models/encoder-int8.onnx",
+        "/static/parakeet/%2e%2e/parakeet/models/encoder-int8.onnx",
+    ],
+)
+def test_model_weights_gate_is_not_bypassed_by_noncanonical_paths(client, path):
+    """The auth middleware must normalize the path the same way StaticFiles does,
+    or a scraper pulls ~1.2 GB per request with no session via "//"/"%2e%2e"."""
+    resp = client.get(path)
+    assert resp.status_code == 401
+
+
 def test_model_weights_are_served_without_auth_when_auth_is_disabled(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "AUTH_ENABLED", False)
     monkeypatch.setattr(main, "ENABLED_ENGINES", {"nemotron"})
