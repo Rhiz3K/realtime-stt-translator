@@ -207,6 +207,13 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 | `NEMOTRON_MODEL_DIR` | No | `app/static/nemotron/models` | Read by `scripts/prepare_nemotron_onnx.py` only — where to write the generated assets. |
 | `PARAKEET_MODEL_DIR` | No | `app/static/parakeet/models` | Read by `scripts/prepare_parakeet_onnx.py` only — where to write the downloaded assets. |
 
+#### Deployment (Docker / reverse proxy)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PORT` | No | `8000` | Port uvicorn listens on inside the container (`Dockerfile` CMD; Coolify usually sets it). |
+| `FORWARDED_ALLOW_IPS` | Behind a proxy | `127.0.0.1` | Read by **uvicorn**: `X-Forwarded-For` / `X-Forwarded-Proto` are trusted only from these IPs/CIDRs (comma-separated). Set it to the proxy's address or docker network, otherwise all visitors share the proxy's IP for login rate limiting and the auto-detected scheme is `http`. `*` only if the uvicorn port is not reachable directly. |
+
 ### Engine Selection
 
 Engines are enabled via the `ENABLED_ENGINES` environment variable:
@@ -354,7 +361,7 @@ services:
 ### Coolify
 
 1. Create a new service pointing to the GitHub repository.
-2. Set environment variables in the Coolify dashboard (see [Configuration](#configuration)).
+2. Set environment variables in the Coolify dashboard (see [Configuration](#configuration)). Besides `APP_PASSWORD`, set a separate `AUTH_SECRET`, `AUTH_COOKIE_SECURE=true`, and `FORWARDED_ALLOW_IPS` to Coolify's proxy network (check `docker network inspect coolify` for its subnet) so the login rate limiter sees real client IPs.
 3. Deploy. The `Dockerfile` includes a `HEALTHCHECK` that Coolify uses automatically.
 
 If `ENABLED_ENGINES` contains `nemotron`, the container starts Uvicorn immediately
@@ -375,7 +382,7 @@ When running behind nginx, Caddy, or similar:
 
 1. Set `AUTH_COOKIE_SECURE=true` if the proxy terminates TLS.
 2. Set `ALLOWED_ORIGINS=https://your-domain.com` to restrict WebSocket origins.
-3. Ensure the proxy forwards `Host`, `Origin`, and `X-Forwarded-For` headers.
+3. Ensure the proxy forwards `Host`, `Origin`, and `X-Forwarded-For` headers **and** set `FORWARDED_ALLOW_IPS` to the proxy's address so uvicorn honours them — otherwise the per-IP login rate limit (10 failures / 60 s) applies to the proxy's IP, i.e. to everyone at once.
 4. Enable WebSocket proxying for `/ws`, `/ws/deepgram`, and `/ws/elevenlabs`.
 5. For local Whisper: serve over HTTPS (microphone and WebGPU require a secure context) and pass the app's `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers through unmodified. If the proxy strips them, Whisper still works but loses the faster multi-threaded CPU path.
 

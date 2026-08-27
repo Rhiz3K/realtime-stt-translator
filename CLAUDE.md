@@ -67,7 +67,7 @@ Two providers behind one `TranslationRouter` (per WS session; all three endpoint
 - HMAC-SHA256 signed tokens (`payload_b64.sig_b64`) in an httpOnly cookie; signed with `AUTH_SECRET` (falls back to `APP_PASSWORD`). Compare secrets only via `secrets.compare_digest`.
 - WS endpoints validate auth **and** origin before `accept()` (`_require_ws_auth`); HTTP routes use `_require_http_auth`. Close codes: 1008 policy/unauthorized, 1011 server error.
 - Origin rules: exact match against `ALLOWED_ORIGINS` if set, otherwise origin host must equal the Host header.
-- `/login` is rate-limited in memory (10/60 s per IP) with Origin/Referer CSRF check; redirects sanitized by `sanitize_next_path`.
+- `/login` is rate-limited in memory (10/60 s per IP) with Origin/Referer CSRF check; redirects sanitized by `sanitize_next_path`. The IP is `request.client.host`, so behind a proxy uvicorn must trust `X-Forwarded-For` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) or every visitor shares the proxy's bucket.
 - `_CSPMiddleware` sets CSP, COOP/COEP (cross-origin isolation → SharedArrayBuffer → multi-threaded WASM for Whisper), and `no-cache` for `/static/whisper/*`.
 
 ### Version-drift defensiveness (intentional pattern — preserve it)
