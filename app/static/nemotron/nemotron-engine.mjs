@@ -318,6 +318,11 @@ export class NemotronLocalEngine {
     // download happens inside InferenceSession.create(), which ORT gives us no
     // way to cancel — that one still runs to completion in the background.
     this._abort = new AbortController();
+    // Resolves when the in-flight _drain() settles. dispose() awaits it so an ORT
+    // session is never released out from under a decode still suspended in run().
+    // Not cleared by _resetUtterance()/stop(): stop() must leave the pending
+    // drain visible here for dispose() to wait on.
+    this._drainPromise = null;
     this._resetUtterance();
   }
 
@@ -388,6 +393,11 @@ export class NemotronLocalEngine {
 
   /** Release the model's ORT sessions. Call after stop(); not reusable afterwards. */
   async dispose() {
+    // A decode may still be suspended inside _drain(); releasing the ORT session
+    // under it is a use-after-free in wasm and makes the next instance's first
+    // run() throw "Session already started". stop() flips _lifecycle so the drain
+    // returns at its next boundary, but we must still wait for it to unwind.
+    try { await this._drainPromise; } catch (_e) { /* _drain swallows its own errors */ }
     const model = this._model;
     this._model = null;
     if (model) {
@@ -443,7 +453,7 @@ export class NemotronLocalEngine {
     this._finalJobs.push(DISCARD_DECODE);
     if (this._busy) return;
     this._busy = true;
-    queueMicrotask(() => this._drain());
+    this._drainPromise = Promise.resolve().then(() => this._drain());
   }
 
   _schedule(isFinal) {
@@ -466,7 +476,7 @@ export class NemotronLocalEngine {
     }
     if (this._busy) return;
     this._busy = true;
-    queueMicrotask(() => this._drain());
+    this._drainPromise = Promise.resolve().then(() => this._drain());
   }
 
   async _drain() {

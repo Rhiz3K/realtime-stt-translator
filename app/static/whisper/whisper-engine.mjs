@@ -247,6 +247,9 @@ export class WhisperLocalEngine {
     this._mediaStream = null;
     this._running = false;
     this._busy = false;
+    /** Resolves when the in-flight _processQueue() settles; dispose() awaits it
+     *  so the transcriber pipeline is never released under a running inference. */
+    this._processingPromise = null;
 
     /** Queue of utterances waiting to be transcribed (each is an array of Int16 chunks). */
     this._pendingUtterances = [];
@@ -416,6 +419,10 @@ export class WhisperLocalEngine {
    * Call after stop(); the engine is not reusable afterwards.
    */
   async dispose() {
+    // A transcription may still be suspended in _processQueue(); disposing the
+    // Transformers.js pipeline (and its ORT session) under it is a use-after-free.
+    // stop() clears _running so the queue loop exits after the current await.
+    try { await this._processingPromise; } catch (_e) { /* _processQueue swallows its own errors */ }
     const transcriber = this._transcriber;
     this._transcriber = null;
     if (transcriber && typeof transcriber.dispose === "function") {
@@ -513,17 +520,20 @@ export class WhisperLocalEngine {
     this._processQueue();
   }
 
-  async _processQueue() {
-    if (this._busy) return;
+  _processQueue() {
+    if (this._busy) return this._processingPromise;
     this._busy = true;
-    try {
-      while (this._running && this._pendingUtterances.length > 0) {
-        const frames = this._pendingUtterances.shift();
-        await this._transcribeUtterance(frames);
+    this._processingPromise = (async () => {
+      try {
+        while (this._running && this._pendingUtterances.length > 0) {
+          const frames = this._pendingUtterances.shift();
+          await this._transcribeUtterance(frames);
+        }
+      } finally {
+        this._busy = false;
       }
-    } finally {
-      this._busy = false;
-    }
+    })();
+    return this._processingPromise;
   }
 
   async _transcribeUtterance(frames) {

@@ -69,7 +69,7 @@ def test_nemotron_template_exposes_local_engine_progress_status():
     assert 'id="localEngineProgress"' in html
     assert 'function showLocalEngineProgress' in html
     assert "handleLocalEngineStatus(status)" in html
-    assert "nemotron-engine.mjs?v=7" in html
+    assert "nemotron-engine.mjs?v=8" in html
 
 
 def test_nemotron_template_exposes_webgpu_debug_panel():
@@ -272,6 +272,70 @@ def test_local_engines_release_onnx_sessions_on_dispose():
         }
     """
     run_node(script)
+
+
+@requires_node
+def test_local_engines_await_inflight_decode_before_releasing_sessions():
+    """dispose() must not release the ORT session while a decode is still
+    suspended inside _drain(): that is a wasm use-after-free, and the ORT JSEP
+    module-global session state stays set until the stale run resolves, so the
+    next instance's first run() throws 'Session already started'."""
+    script = """
+        import { NemotronLocalEngine } from './app/static/nemotron/nemotron-engine.mjs';
+        import { ParakeetLocalEngine } from './app/static/parakeet/parakeet-engine.mjs';
+
+        for (const [name, Engine] of [['nemotron', NemotronLocalEngine], ['parakeet', ParakeetLocalEngine]]) {
+          const order = [];
+          let release;
+          const gate = new Promise((r) => { release = r; });
+          const engine = new Engine({ onStatus: () => {} });
+          engine._model = {
+            dispose: async () => { order.push('release'); },
+            resetStream: () => {},
+          };
+          engine._process = async () => { await gate; order.push('decode-done'); };
+
+          // Launch a drain with one queued final, let it reach the decode await,
+          // then stop + dispose while the decode is still suspended.
+          engine._frames = [new Float32Array(512)];
+          engine._schedule(true);
+          await new Promise((r) => setTimeout(r, 0));
+          engine.stop();
+
+          let settled = false;
+          const disposed = engine.dispose().then(() => { settled = true; });
+          await new Promise((r) => setTimeout(r, 0));
+          if (settled) throw new Error(`${name}: dispose resolved before the decode settled`);
+
+          release();
+          await disposed;
+          if (order[0] !== 'decode-done' || order[1] !== 'release') {
+            throw new Error(`${name}: released session before decode finished: ${JSON.stringify(order)}`);
+          }
+          if (engine._model !== null) throw new Error(`${name}: dispose kept the model`);
+        }
+    """
+    run_node(script)
+
+
+def test_whisper_awaits_inflight_transcription_before_dispose():
+    """Same hazard for Whisper: the Transformers.js pipeline (and its ORT session)
+    must not be disposed while a transcription is still running in _processQueue().
+    whisper-engine.mjs imports transformers.js from a URL at module top level, so
+    it can't be driven under node like the ONNX engines — assert the ordering in
+    source: _processQueue() must publish its promise and dispose() must await it
+    before releasing the transcriber."""
+    source = (ROOT / "app/static/whisper/whisper-engine.mjs").read_text()
+
+    assert "this._processingPromise = (async () => {" in source, (
+        "_processQueue() no longer publishes the in-flight promise dispose() waits on"
+    )
+
+    dispose = source.split("async dispose()", 1)[1].split("_resetVad", 1)[0]
+    assert "await this._processingPromise" in dispose, "dispose() no longer awaits the in-flight transcription"
+    assert dispose.index("await this._processingPromise") < dispose.index(".dispose()"), (
+        "dispose() releases the transcriber before awaiting the in-flight transcription"
+    )
 
 
 def test_template_releases_engine_sessions_on_every_stop():
