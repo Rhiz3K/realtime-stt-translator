@@ -527,7 +527,11 @@ def verify_auth_token(token: str | None) -> bool:
         return False
     payload_b64, sig_b64 = parts
     expected_sig = _sign(payload_b64)
-    if not expected_sig or not secrets.compare_digest(expected_sig, sig_b64):
+    # Compare as bytes: compare_digest() raises TypeError for non-ASCII str, and a
+    # cookie is attacker-supplied — one stray byte must yield "invalid", not a 500.
+    if not expected_sig or not secrets.compare_digest(
+        expected_sig.encode("utf-8"), sig_b64.encode("utf-8")
+    ):
         return False
     try:
         payload = json.loads(_b64url_decode(payload_b64))
@@ -1160,7 +1164,9 @@ async def login(
         )
 
     next_path = sanitize_next_path(next_path)
-    if not secrets.compare_digest(password, APP_PASSWORD):
+    # Bytes, not str: compare_digest() raises TypeError on non-ASCII input, which
+    # would turn a password with diacritics (or any such attempt) into a 500.
+    if not secrets.compare_digest(password.encode("utf-8"), APP_PASSWORD.encode("utf-8")):
         _record_login_attempt(client_ip)
         return _render_login(request, next_path=next_path, invalid_pwd=True)
 

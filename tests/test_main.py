@@ -2455,3 +2455,35 @@ def test_template_exposes_translation_provider_setting():
     # /ws (1) + Deepgram (dbg echo + send = 2) + ElevenLabs server mode (1).
     assert html.count("provider: translateProvider") == 4
     assert "translateProvider," in html.split("function persistSettings")[1].split("}")[0]
+
+
+# --- Auth: non-ASCII secrets ---
+
+
+def test_login_handles_non_ascii_password_and_cookie(client, monkeypatch):
+    """secrets.compare_digest() raises TypeError on non-ASCII str. A Czech
+    APP_PASSWORD with diacritics must simply work, and a cookie carrying a stray
+    non-ASCII byte (anyone can send one) must land on the login page, not a 500."""
+    monkeypatch.setattr(main, "APP_PASSWORD", "Křemílek42")
+
+    assert main.verify_auth_token("abc.ÿ") is False
+    resp = client.get("/", headers={b"cookie": "srlt_auth=abc.ÿ".encode("latin-1")})
+    assert resp.status_code == 200
+    _assert_login_h1(resp.text)
+
+    wrong = client.post(
+        "/login",
+        data={"password": "Křemílek", "next": "/"},
+        follow_redirects=False,
+    )
+    assert wrong.status_code == 200
+    assert "Incorrect password" in wrong.text
+
+    right = client.post(
+        "/login",
+        data={"password": "Křemílek42", "next": "/"},
+        follow_redirects=False,
+    )
+    assert right.status_code == 303
+    assert client.get("/").status_code == 200
+    assert "<title>Live Translator</title>" in client.get("/").text
