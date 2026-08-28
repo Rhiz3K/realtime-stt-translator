@@ -5,6 +5,24 @@ import subprocess
 import pytest
 
 
+def test_required_model_files_include_webgpu_concat_variants():
+    from app.nemotron_assets import REQUIRED_MODEL_FILES
+
+    assert "encoder_fp16_concat16.onnx" in REQUIRED_MODEL_FILES
+    assert "encoder_fp16_concat8.onnx" in REQUIRED_MODEL_FILES
+    assert "encoder_fp16.onnx.data" in REQUIRED_MODEL_FILES
+
+
+def test_zero_length_model_file_is_treated_as_missing(tmp_path: Path):
+    from app.nemotron_assets import REQUIRED_MODEL_FILES, missing_model_files
+
+    for name in REQUIRED_MODEL_FILES:
+        (tmp_path / name).write_text("ok")
+    (tmp_path / "encoder_fp16.onnx.data").write_bytes(b"")
+
+    assert missing_model_files(tmp_path) == ["encoder_fp16.onnx.data"]
+
+
 def test_ensure_nemotron_assets_skips_when_engine_disabled(tmp_path: Path):
     from app.nemotron_assets import ensure_nemotron_assets
 
@@ -172,3 +190,64 @@ def test_main_logs_unexpected_errors_with_traceback(monkeypatch, caplog):
     assert assets.main() == 1
     assert caplog.records[-1].message == "Nemotron asset preparation failed"
     assert caplog.records[-1].exc_info is not None
+
+
+def test_prepare_timeout_must_be_a_number(monkeypatch):
+    import app.nemotron_assets as assets
+
+    monkeypatch.setenv("NEMOTRON_PREPARE_TIMEOUT_SECONDS", "soon")
+    with pytest.raises(RuntimeError, match="must be a number"):
+        assets._prepare_timeout_seconds()
+
+
+def test_non_positive_prepare_timeout_means_no_timeout(monkeypatch):
+    import app.nemotron_assets as assets
+
+    monkeypatch.setenv("NEMOTRON_PREPARE_TIMEOUT_SECONDS", "0")
+    assert assets._prepare_timeout_seconds() is None
+
+
+def test_nemotron_enabled_reads_env_and_iterables(monkeypatch):
+    import app.nemotron_assets as assets
+
+    monkeypatch.setenv("ENABLED_ENGINES", "webspeech,nemotron")
+    assert assets.nemotron_enabled() is True
+
+    monkeypatch.setenv("ENABLED_ENGINES", "webspeech,whisper")
+    assert assets.nemotron_enabled() is False
+
+    # An explicit argument wins over the environment, as a string or an iterable.
+    assert assets.nemotron_enabled("nemotron") is True
+    assert assets.nemotron_enabled(["webspeech", " Nemotron "]) is True
+    assert assets.nemotron_enabled([]) is False
+
+
+def test_ensure_assets_raises_when_preparation_produces_nothing(tmp_path):
+    import app.nemotron_assets as assets
+
+    with pytest.raises(RuntimeError, match="still missing"):
+        assets.ensure_nemotron_assets(
+            enabled_engines="nemotron",
+            auto_prepare=True,
+            model_dir=tmp_path,
+            run_prepare=lambda: None,
+        )
+
+
+def test_ensure_assets_refuses_to_download_when_auto_prepare_is_off(tmp_path):
+    import app.nemotron_assets as assets
+
+    with pytest.raises(RuntimeError, match="NEMOTRON_AUTO_PREPARE"):
+        assets.ensure_nemotron_assets(
+            enabled_engines="nemotron",
+            auto_prepare=False,
+            model_dir=tmp_path,
+            run_prepare=lambda: pytest.fail("must not prepare when auto_prepare is off"),
+        )
+
+
+def test_main_skips_everything_when_nemotron_is_disabled(monkeypatch):
+    import app.nemotron_assets as assets
+
+    monkeypatch.setenv("ENABLED_ENGINES", "webspeech")
+    assert assets.main() == 0

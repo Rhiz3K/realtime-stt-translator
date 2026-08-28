@@ -82,7 +82,7 @@
           dir: "/app/static/nemotron/models",
           device: DEVICE,
           normalize: NORMALIZE,
-          onStatus: (m) => log("", "  status: " + m),
+          onStatus: (m) => log("", "  status: " + (m && typeof m === "object" ? m.text : m)),
         });
         log("ok", `model loaded in ${Math.round(performance.now() - t0)} ms`);
 

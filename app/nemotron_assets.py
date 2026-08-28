@@ -14,6 +14,8 @@ PREPARE_SCRIPT = ROOT / "scripts" / "prepare_nemotron_onnx.py"
 
 REQUIRED_MODEL_FILES = (
     "encoder_fp16.onnx",
+    "encoder_fp16_concat16.onnx",
+    "encoder_fp16_concat8.onnx",
     "encoder_fp16.onnx.data",
     "decoder_joint.onnx",
     "config.json",
@@ -52,8 +54,21 @@ def nemotron_enabled(enabled_engines: str | Iterable[str] | None = None) -> bool
     return "nemotron" in _split_engines(enabled_engines)
 
 
+def _is_present(path: Path) -> bool:
+    """A file counts as present only if it exists and is non-empty.
+
+    One stat() rather than is_file() + stat(): a file vanishing between the two
+    (a concurrent prepare run) would otherwise raise out of the startup check
+    instead of simply reporting the asset as missing.
+    """
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def missing_model_files(model_dir: Path = DEFAULT_MODEL_DIR) -> list[str]:
-    return [name for name in REQUIRED_MODEL_FILES if not (model_dir / name).is_file()]
+    return [name for name in REQUIRED_MODEL_FILES if not _is_present(model_dir / name)]
 
 
 def _run_prepare_script(model_dir: Path) -> None:
@@ -127,7 +142,7 @@ def main() -> int:
     except RuntimeError as exc:
         logging.error("%s", exc)
         return 1
-    except Exception as exc:
+    except Exception:
         logging.exception("Nemotron asset preparation failed")
         return 1
     return 0

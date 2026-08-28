@@ -60,7 +60,8 @@ export const WHISPER_MODELS = {
     label: 'large-v3-turbo (top quality, WebGPU only)',
     multilingual: true,
     webgpu: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
-    wasm: 'q8',
+    // No `wasm` entry on purpose: load() rejects this model without WebGPU, so a
+    // CPU dtype here would only suggest a path that does not exist.
   },
 };
 
@@ -246,6 +247,9 @@ export class WhisperLocalEngine {
     this._mediaStream = null;
     this._running = false;
     this._busy = false;
+    /** Resolves when the in-flight _processQueue() settles; dispose() awaits it
+     *  so the transcriber pipeline is never released under a running inference. */
+    this._processingPromise = null;
 
     /** Queue of utterances waiting to be transcribed (each is an array of Int16 chunks). */
     this._pendingUtterances = [];
@@ -271,8 +275,13 @@ export class WhisperLocalEngine {
 
   async load() {
     const spec = this._modelSpec();
+    const wantsWebGpu = await this._wantsWebGpu();
 
-    if (await this._wantsWebGpu()) {
+    if (this.modelKey === 'large-v3-turbo' && !wantsWebGpu) {
+      throw new Error('Whisper large-v3-turbo requires WebGPU; choose tiny, base, or small for CPU/WASM.');
+    }
+
+    if (wantsWebGpu) {
       try {
         this.onStatus(`Loading Whisper ${spec.label} on GPU (WebGPU)…`);
         this._transcriber = await pipeline('automatic-speech-recognition', spec.id, {
@@ -284,8 +293,11 @@ export class WhisperLocalEngine {
         await this._loadVad();
         return;
       } catch (err) {
+        if (this.device === 'webgpu' || this.modelKey === 'large-v3-turbo') {
+          throw new Error(`Whisper WebGPU initialization failed: ${err?.message || err}`, { cause: err });
+        }
         // No GPU adapter, missing fp16 model, or a driver/runtime issue — fall
-        // back to CPU so the engine still works (just slower).
+        // back to CPU only in Auto mode for models that are documented to support it.
         console.warn('WebGPU Whisper unavailable, falling back to CPU/WASM:', err);
         this.onStatus('WebGPU unavailable — loading on CPU (WASM)…');
         this._transcriber = null;
@@ -401,6 +413,23 @@ export class WhisperLocalEngine {
     this._resetVad();
   }
 
+  /**
+   * Release the transcriber. index.html drops the engine on every stop, and the
+   * Transformers.js pipeline holds its own ORT session — GC alone won't free it.
+   * Call after stop(); the engine is not reusable afterwards.
+   */
+  async dispose() {
+    // A transcription may still be suspended in _processQueue(); disposing the
+    // Transformers.js pipeline (and its ORT session) under it is a use-after-free.
+    // stop() clears _running so the queue loop exits after the current await.
+    try { await this._processingPromise; } catch (_e) { /* _processQueue swallows its own errors */ }
+    const transcriber = this._transcriber;
+    this._transcriber = null;
+    if (transcriber && typeof transcriber.dispose === "function") {
+      try { await transcriber.dispose(); } catch (_e) { /* ignore */ }
+    }
+  }
+
   _resetVad() {
     this._speechFrames = [];
     this._inSpeech = false;
@@ -491,17 +520,20 @@ export class WhisperLocalEngine {
     this._processQueue();
   }
 
-  async _processQueue() {
-    if (this._busy) return;
+  _processQueue() {
+    if (this._busy) return this._processingPromise;
     this._busy = true;
-    try {
-      while (this._running && this._pendingUtterances.length > 0) {
-        const frames = this._pendingUtterances.shift();
-        await this._transcribeUtterance(frames);
+    this._processingPromise = (async () => {
+      try {
+        while (this._running && this._pendingUtterances.length > 0) {
+          const frames = this._pendingUtterances.shift();
+          await this._transcribeUtterance(frames);
+        }
+      } finally {
+        this._busy = false;
       }
-    } finally {
-      this._busy = false;
-    }
+    })();
+    return this._processingPromise;
   }
 
   async _transcribeUtterance(frames) {

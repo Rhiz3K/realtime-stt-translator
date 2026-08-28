@@ -12,9 +12,11 @@ export class Tokenizer {
     this.pieces = pieces;
   }
 
-  static async load(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`vocab fetch failed: ${res.status}`);
+  static async load(url, { signal } = {}) {
+    const res = await fetch(url, { signal });
+    if (!res.ok) {
+      throw new Error(`vocab fetch failed: ${res.status}. Nemotron model assets are not ready on the server yet.`);
+    }
     return new Tokenizer(await res.json());
   }
 
