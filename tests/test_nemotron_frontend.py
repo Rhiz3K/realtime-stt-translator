@@ -234,6 +234,21 @@ def test_template_defers_single_shot_stop_until_final_translation():
     assert "_singleShotStopTimer = setTimeout(_finishSingleShotStop, _SINGLE_SHOT_STOP_TIMEOUT_MS)" in html
     # Single-shot onend must not stop while that final is still unanswered.
     assert "webspeech:end (single-shot mode, waiting for final translation)" in html
+    assert "_pendingFinalClientId == null && _pendingFinalTexts.length === 0" in html
+
+
+def test_template_preserves_trailing_webspeech_interim_during_end_and_stop():
+    html = (ROOT / "app/templates/index.html").read_text()
+
+    assert "let webSpeechLastInterimText = '';" in html
+    assert "function _commitWebSpeechTrailingInterim(reason)" in html
+    assert "_commitWebSpeechTrailingInterim('onend')" in html
+    # A user Stop must ask Web Speech to flush its last result, then leave /ws
+    # alive until the corresponding final translation has reached the browser.
+    assert "function _requestWebSpeechStop()" in html
+    assert "recognizer.stop();" in html
+    assert "_webSpeechStopRecognitionEnded = true;" in html
+    assert "_WEB_SPEECH_STOP_TIMEOUT_MS" in html
 
 
 @requires_node

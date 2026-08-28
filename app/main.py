@@ -1238,8 +1238,10 @@ class TranslationSession:
             task.cancel()
 
     async def aclose(self) -> None:
-        if self.current_interim_task is not None:
-            self.current_interim_task.cancel()
+        task = self.current_interim_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await self.router.aclose()
 
     async def run(self) -> None:
@@ -1283,9 +1285,13 @@ class TranslationSession:
                     task in self.superseded_interim_tasks
                     and asyncio.current_task().cancelling() == 0
                 ):
+                    await asyncio.gather(*children, return_exceptions=True)
+                    await asyncio.gather(task, return_exceptions=True)
                     continue
                 for child in children:
                     child.cancel()
+                await asyncio.gather(*children, return_exceptions=True)
+                await asyncio.gather(task, return_exceptions=True)
                 raise
             except Exception as exc:
                 logging.error("%s: %s", self.log_label, exc)
@@ -1295,6 +1301,7 @@ class TranslationSession:
                 for child in children:
                     child.cancel()
                 await asyncio.gather(*children, return_exceptions=True)
+                await asyncio.gather(task, return_exceptions=True)
                 await self.router.recycle()
                 response = _translation_payload(
                     work,

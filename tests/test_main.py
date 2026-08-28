@@ -2,6 +2,7 @@ import types
 import base64
 import json
 import asyncio
+import gc
 from pathlib import Path
 import re
 import shutil
@@ -1898,6 +1899,64 @@ def test_worker_drains_queued_final_after_supersede_when_inbox_closed(monkeypatc
     assert len(finals) == 1, f"final was dropped: {sent}"
     assert finals[0]["original"] == "final"
     assert finals[0]["translations"] == {"en": "en:final"}
+
+
+def test_translation_session_retrieves_cancelled_provider_gather(monkeypatch):
+    """Disconnecting during a translation must not leave asyncio's gather future
+    unobserved. That was the noisy CancelledError recorded in the Coolify logs."""
+
+    async def scenario():
+        started = asyncio.Event()
+        never_release = asyncio.Event()
+        loop_errors = []
+
+        class SlowTranslator:
+            async def translate(self, text, src, dest):
+                started.set()
+                await never_release.wait()
+                return _FakeTranslation(f"{dest}:{text}")
+
+        monkeypatch.setattr(main, "Translator", SlowTranslator)
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+
+        queue = main.LatestInterimQueue()
+
+        async def send(_payload):
+            pass
+
+        session = main.TranslationSession(queue, send, log_label="test")
+        worker = asyncio.create_task(session.run())
+        try:
+            assert queue.put(main.TranslationWork("final", "final", "cs", ["en"]))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        finally:
+            if not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            await session.aclose()
+
+        # _GatheringFuture and its callbacks form a short-lived reference cycle.
+        # Release the finished worker frame and collect it while our exception
+        # handler is still installed.
+        worker = None
+        session = None
+        queue = None
+        gc.collect()
+        await asyncio.sleep(0)
+        loop.set_exception_handler(previous_handler)
+
+        return loop_errors
+
+    errors = asyncio.run(scenario())
+    assert not [
+        context
+        for context in errors
+        if "exception was never retrieved" in str(context.get("message", "")).lower()
+    ]
 
 
 def test_ws_translation_failure_cancels_siblings_before_closing_the_translator(client, monkeypatch):

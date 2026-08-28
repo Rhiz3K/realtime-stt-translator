@@ -1128,6 +1128,10 @@
     let webSpeechLastFinalResultIndex = -1;
     let webSpeechLastFinalText = '';
     let webSpeechLastFinalAtMs = 0;
+    // The browser may end a recognition session without ever promoting its last
+    // hypothesis to isFinal. Keep that text until onend can commit it instead of
+    // silently removing it from both the source and translation columns.
+    let webSpeechLastInterimText = '';
 
     // --- Web Speech restart tracking ---
     // Chrome frequently ends recognition sessions (silence timeout, network glitch,
@@ -1225,6 +1229,12 @@
     let _singleShotStopTimer = null;
     const _SINGLE_SHOT_STOP_TIMEOUT_MS = 12000;
     let _pendingFinalClientId = null; // last final sent to /ws and not yet answered
+    // Continuous Web Speech Stop is also graceful: stop() asks the browser to flush
+    // a final and /ws stays alive until that final's translation is rendered.
+    let _webSpeechStopPending = false;
+    let _webSpeechStopRecognitionEnded = false;
+    let _webSpeechStopTimer = null;
+    const _WEB_SPEECH_STOP_TIMEOUT_MS = 12000;
 
     // Whisper local (browser ONNX via Transformers.js)
     // Keep in sync with WHISPER_MODELS in whisper-engine.mjs.
@@ -2853,6 +2863,7 @@
         webSpeechLastFinalResultIndex = -1;
         webSpeechLastFinalText = '';
         webSpeechLastFinalAtMs = 0;
+        webSpeechLastInterimText = '';
         _sttSegmentStartPerf = null;
         _wsLastStartAtMs = Date.now();
         _wsState = 'listening';
@@ -2934,45 +2945,14 @@
         // Remove the previous interim element (if present)
         removeInterimElement(recognizedContainer);
 
-        // Add final results as new segments
+        // Add final results as new segments.
         for (const part of finalParts) {
-          const finalTrimmed = String(part).trim();
-          if (!finalTrimmed) {
-            continue;
-          }
-
-          // Extra dedupe for Android Chrome where the same final may be emitted repeatedly.
-          // Window is kept short (400 ms) to avoid dropping legitimate repeated phrases.
-          const nowMs = Date.now();
-          if (finalTrimmed === webSpeechLastFinalText && nowMs - webSpeechLastFinalAtMs < 400) {
-            dbg('webspeech:dedupe-skip', { text: finalTrimmed, deltaMs: nowMs - webSpeechLastFinalAtMs });
-            continue;
-          }
-          webSpeechLastFinalText = finalTrimmed;
-          webSpeechLastFinalAtMs = nowMs;
-
-          czSegmentCount++;
-          addSegment(recognizedContainer, czSegmentCount, finalTrimmed);
-
-          if (_sttSegmentStartPerf != null) {
-            const sttMs = performance.now() - _sttSegmentStartPerf;
-            _sttLastFinalMs = sttMs;
-            _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
-            _sttSegmentStartPerf = null;
-            updateStatsBar();
-          }
-
-          // Send final to translation
-          dbg('ws:/ws send', { type: 'final', text: finalTrimmed });
-          sendTranslateWsMessage('final', finalTrimmed);
-
-          // Reset interim throttle (new segment)
-          lastInterimSentText = '';
-          lastInterimSentAtMs = 0;
+          _commitWebSpeechFinalText(part, 'result');
         }
 
         // Render interim text as a temporary element
         const interimTrimmed = interimParts.join('').trim();
+        webSpeechLastInterimText = interimTrimmed;
         if (interimTrimmed) {
           showInterim(recognizedContainer, interimTrimmed);
 
@@ -3004,6 +2984,27 @@
           dbg('webspeech:end (stale session, not restarting)');
           return;
         }
+        if (_webSpeechStopPending) {
+          // stop() normally emits a final onresult first. Some implementations only
+          // give us the last interim, so promote that hypothesis before teardown.
+          _commitWebSpeechTrailingInterim('stop');
+          removeInterimElement(recognizedContainer);
+          _webSpeechStopRecognitionEnded = true;
+          _wsState = 'idle';
+          if (_pendingFinalClientId == null && _pendingFinalTexts.length === 0) {
+            _finishWebSpeechStop();
+          } else {
+            // Give the translation its full timeout budget; stop() itself may have
+            // spent a moment waiting for the recognizer to produce this final.
+            if (_webSpeechStopTimer != null) clearTimeout(_webSpeechStopTimer);
+            _webSpeechStopTimer = setTimeout(_finishWebSpeechStop, _WEB_SPEECH_STOP_TIMEOUT_MS);
+            dbg('webspeech:stop waiting for final translation', {
+              clientId: _pendingFinalClientId,
+              bufferedFinals: _pendingFinalTexts.length,
+            });
+          }
+          return;
+        }
         // Keep going unless the user stopped recording
         if (stopButton.disabled) {
           dbg('webspeech:end (user stopped, not restarting)');
@@ -3011,9 +3012,11 @@
           return;
         }
 
+        _commitWebSpeechTrailingInterim('onend');
+
         if (!recognitionContinuous) {
           removeInterimElement(recognizedContainer);
-          if (_pendingFinalClientId == null) {
+          if (_pendingFinalClientId == null && _pendingFinalTexts.length === 0) {
             dbg('webspeech:end (single-shot mode, stopping)');
             stopRecording();
             return;
@@ -3225,6 +3228,51 @@
       updateStatsBar();
     }
 
+    function _commitWebSpeechFinalText(text, reason) {
+      const finalTrimmed = String(text || '').trim();
+      removeInterimElement(recognizedContainer);
+      webSpeechLastInterimText = '';
+      if (!finalTrimmed) return false;
+
+      // Extra dedupe for Android Chrome where the same final may be emitted repeatedly.
+      // Window is kept short (400 ms) to avoid dropping legitimate repeated phrases.
+      const nowMs = Date.now();
+      if (finalTrimmed === webSpeechLastFinalText && nowMs - webSpeechLastFinalAtMs < 400) {
+        dbg('webspeech:dedupe-skip', {
+          text: finalTrimmed,
+          deltaMs: nowMs - webSpeechLastFinalAtMs,
+          reason,
+        });
+        return false;
+      }
+      webSpeechLastFinalText = finalTrimmed;
+      webSpeechLastFinalAtMs = nowMs;
+
+      czSegmentCount++;
+      addSegment(recognizedContainer, czSegmentCount, finalTrimmed);
+
+      if (_sttSegmentStartPerf != null) {
+        const sttMs = performance.now() - _sttSegmentStartPerf;
+        _sttLastFinalMs = sttMs;
+        _sttFinalEmaMs = _ema(_sttFinalEmaMs, sttMs, 0.25);
+        _sttSegmentStartPerf = null;
+        updateStatsBar();
+      }
+
+      dbg('ws:/ws send', { type: 'final', text: finalTrimmed, reason });
+      sendTranslateWsMessage('final', finalTrimmed);
+      lastInterimSentText = '';
+      lastInterimSentAtMs = 0;
+      return true;
+    }
+
+    function _commitWebSpeechTrailingInterim(reason) {
+      const trailing = String(webSpeechLastInterimText || '').trim();
+      if (!trailing) return false;
+      dbg('webspeech:commit trailing interim', { reason, text: trailing });
+      return _commitWebSpeechFinalText(trailing, `trailing-${reason}`);
+    }
+
     function _updateCommitButton() {
       if (!commitButton) return;
       const visible = currentEngine === 'elevenlabs' && elevenlabsCommitStrategy === 'manual';
@@ -3286,11 +3334,51 @@
       stopRecording();
     }
 
+    function _finishWebSpeechStop() {
+      if (!_webSpeechStopPending) return;
+      _webSpeechStopPending = false;
+      _webSpeechStopRecognitionEnded = false;
+      if (_webSpeechStopTimer != null) {
+        clearTimeout(_webSpeechStopTimer);
+        _webSpeechStopTimer = null;
+      }
+      stopRecording();
+    }
+
+    function _requestWebSpeechStop() {
+      if (currentEngine !== 'webspeech' || !recognition) return false;
+      _webSpeechStopPending = true;
+      _webSpeechStopRecognitionEnded = false;
+      if (_webSpeechStopTimer != null) clearTimeout(_webSpeechStopTimer);
+      _webSpeechStopTimer = setTimeout(_finishWebSpeechStop, _WEB_SPEECH_STOP_TIMEOUT_MS);
+
+      const recognizer = recognition;
+      dbg('webspeech:graceful-stop requested');
+      try {
+        // stop(), unlike abort(), asks the recognizer to flush its pending result.
+        // Start remains disabled while we wait, so that final cannot leak into a
+        // replacement session. A second Stop press forces immediate teardown.
+        recognizer.stop();
+      } catch (e) {
+        dbg('webspeech:graceful-stop failed', { error: String(e) });
+        _commitWebSpeechTrailingInterim('stop-error');
+        _webSpeechStopRecognitionEnded = true;
+        if (_pendingFinalClientId == null && _pendingFinalTexts.length === 0) {
+          _finishWebSpeechStop();
+        }
+      }
+      return true;
+    }
+
     function requestStopRecording() {
       // Already waiting on a committed transcript and the user pressed Stop again:
       // treat it as "stop now, I don't want to wait" rather than ignoring the click.
       if (_elManualStopPending) {
         _finishManualCommitStop();
+        return;
+      }
+      if (_webSpeechStopPending) {
+        _finishWebSpeechStop();
         return;
       }
       if (_requestElevenLabsCommit()) {
@@ -3305,6 +3393,7 @@
         _elManualStopTimer = setTimeout(_finishManualCommitStop, _EL_MANUAL_STOP_TIMEOUT_MS);
         return;
       }
+      if (_requestWebSpeechStop()) return;
       stopRecording();
     }
 
@@ -3344,6 +3433,7 @@
       ruSegmentCount = 0;
       lastInterimSentText = '';
       lastInterimSentAtMs = 0;
+      webSpeechLastInterimText = '';
       _resetStats();
     }
 
@@ -3576,12 +3666,16 @@
           showMessage(String(data.error));
         }
         handleTranslationMessage(data);
-        if (
+        const answeredPendingFinal = (
           data.type === 'final' && _pendingFinalClientId != null &&
           (typeof data.client_id !== 'number' || data.client_id === _pendingFinalClientId)
-        ) {
+        );
+        if (answeredPendingFinal) {
           _pendingFinalClientId = null;
           _finishSingleShotStop(); // no-op unless single-shot is waiting on this final
+          if (_webSpeechStopPending && _webSpeechStopRecognitionEnded) {
+            _finishWebSpeechStop();
+          }
         }
         if (
           _elManualStopPending && currentEngine === 'elevenlabs' &&
@@ -3656,6 +3750,7 @@
       webSpeechLastFinalResultIndex = -1;
       webSpeechLastFinalText = '';
       webSpeechLastFinalAtMs = 0;
+      webSpeechLastInterimText = '';
       _wsRestartCount = 0;
       _wsLastRestartAtMs = 0;
       _wsLastResultAtMs = 0;
@@ -5067,6 +5162,12 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         clearTimeout(_singleShotStopTimer);
         _singleShotStopTimer = null;
       }
+      _webSpeechStopPending = false;
+      _webSpeechStopRecognitionEnded = false;
+      if (_webSpeechStopTimer != null) {
+        clearTimeout(_webSpeechStopTimer);
+        _webSpeechStopTimer = null;
+      }
       _pendingFinalClientId = null;
       // Invalidate the current recording session up front: any in-flight async
       // callback (Web Speech onresult/onend, remote socket.onopen, local transcript
@@ -5092,10 +5193,11 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
         recognition = null;
         _detachWebSpeechRecognition(recognizer);
         try {
-          // abort(), not stop(): stop() keeps the session alive while the cloud
-          // flushes a trailing final — on a rapid Stop→Start the generations
-          // re-align and that stale final would leak into the fresh session.
-          // abort() discards pending results and tears down immediately.
+          // This is the hard teardown path. The Web Speech Stop button reaches it
+          // only after _requestWebSpeechStop() has flushed the trailing result and
+          // its translation (or after the safety timeout / second Stop press).
+          // Other callers — engine switches and fatal errors — must still abort so
+          // a stale result cannot leak into the next recording generation.
           recognizer.abort();
         } catch (_e) {
           // no-op
@@ -5127,6 +5229,7 @@ registerProcessor('int16-pcm-processor-el', Int16PCMProcessor);
 
       lastInterimSentText = '';
       lastInterimSentAtMs = 0;
+      webSpeechLastInterimText = '';
       _pendingFinalTexts = [];
 
       startButton.disabled = false;
