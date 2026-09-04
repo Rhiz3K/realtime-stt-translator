@@ -1,98 +1,23 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+See `AGENTS.md` for the complete repository guidance.
 
-Real-time speech-to-text + translation web app: FastAPI backend, Jinja templates with inline JS/CSS, seven switchable STT engines. `AGENTS.md` contains additional agent notes and code-style detail; `CONTRIBUTING.md` has the full workflow.
-
-## Commands
+This is a single-purpose FastAPI app. Browser microphone audio is streamed as
+fixed PCM16/16 kHz frames to `/ws/audio`, proxied to Google Live Transcribe in
+fixed Czech SMART mode, then translated by one structured Flash-Lite request
+into an atomic English/Russian pair. There are no selectable engines,
+providers, languages, model sizes, or chunk controls.
 
 ```bash
-# Setup
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
-cp .env.example .env   # set at least APP_PASSWORD
-
-# Run dev server
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# Tests (pytest.ini sets -q, testpaths=tests, pythonpath=.)
+cp .env.example .env  # set GEMINI_API_KEY and APP_PASSWORD
 pytest
-pytest tests/test_main.py::test_ws_translates_text   # single test
-pytest -k translate                                  # by substring
-pytest --cov=app --cov-report=term-missing           # coverage
-
-# Fast syntax check
 python -m compileall app tests
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-No linter/formatter is pinned. If available locally: `ruff check .`, `ruff format .`, `mypy app` (expect noise from googletrans/deepgram typing). CI (`.github/workflows/ci.yml`) runs `pytest` on a self-hosted runner, Python 3.12; fork PRs are skipped. Code targets Python 3.10+ (`X | None` unions).
-
-**Deepgram tests:** these drive a real SDK listener thread, so anything that asserts a fixed ordering between an interim and a final is a scheduling coin flip — the two cross into the event loop as separate `call_soon_threadsafe` callbacks. The old happy-path test did exactly that and appeared to "hang" (it blocked forever waiting for an interim that had been coalesced away); it now reads until the final instead. Coalescing itself is asserted directly on `LatestTranscriptQueue` in unit tests. Keep new Deepgram tests order-agnostic, and run them under `timeout` while iterating.
-
-Commits follow Conventional Commits (`feat(stt): ...`, `fix(ws): ...`). New env vars must be documented in `.env.example` (and README's table).
-
-## Architecture
-
-The entire backend is `app/main.py` (~1800 lines): auth, CSP middleware, HTTP routes, and three WebSocket endpoints. The entire frontend UI is `app/templates/index.html` (~5200 lines of inline JS/CSS) plus the local-Whisper engine in `app/static/whisper/`.
-
-### Seven STT engines, two data-flow shapes
-
-1. **Text-only flow** — STT happens in the browser; the server only translates:
-   - **Web Speech**: browser `SpeechRecognition` → text → `/ws`
-   - **Whisper (local)**: mic → `pcm-worklet.js` (16 kHz int16 frames) → Silero VAD (`silero-vad.onnx`) segments speech → Transformers.js Whisper ONNX (WebGPU, or WASM/CPU fallback) in `whisper-engine.mjs` → text → `/ws`. Audio never leaves the client.
-   - **Nemotron (local)**: mic → `pcm-worklet.js` → `mel.js` log-mel → fp16 cache-aware FastConformer encoder (onnxruntime-web, WebGPU with WASM fallback) + RNN-T greedy decode (`rnnt.js`) in `nemotron-engine.mjs` → text → `/ws`. Streaming, so it emits growing interims and commits a final at end-of-utterance (RMS VAD). Model assets are generated/gitignored (~1.2 GB) — see `app/static/nemotron/README.md`. Audio never leaves the client.
-   - **Parakeet v3 (local)**: mic → `pcm-worklet.js` → `../nemotron/mel.js` log-mel (128-bin) → int8 FastConformer encoder (onnxruntime-web, WebGPU/WASM) + **TDT greedy decode** (`parakeet/tdt.js`, duration head) in `parakeet/parakeet-engine.mjs` → text → `/ws`. Reuses the Nemotron front-end but the export is **offline** (no streaming cache), so it re-encodes the growing buffer per interim and commits a final on RMS-VAD pause. Multilingual incl. Czech. Assets (~930 MB int8) downloaded/gitignored by `scripts/prepare_parakeet_onnx.py`. Audio never leaves the client.
-   - **ElevenLabs browser mode**: browser fetches a single-use token via `POST /api/elevenlabs/token`, connects directly to the ElevenLabs WS, sends recognized text to `/ws`.
-   - **Azure Speech (browser-direct)**: browser fetches a short-lived token via `POST /api/azure/token` (server mints it from `AZURE_SPEECH_KEY`/`AZURE_SPEECH_REGION`), then the lazily-loaded Azure SpeechSDK (`window.SpeechSDK`) streams mic audio directly to Azure; `recognizing`/`recognized` text → `/ws`. Good Czech quality; free F0 tier.
-
-2. **Audio-proxy flow** — browser streams raw PCM (16-bit, 16 kHz, mono) to the server, which proxies to a vendor STT API and translates results:
-   - **`/ws/deepgram`**: Deepgram SDK live connection. The SDK callback runs in a separate listener thread; results cross into asyncio via `event_loop.call_soon_threadsafe` into a `LatestTranscriptQueue` — only the newest interim is held (older ones are coalesced away, never queued), finals are never dropped, and if finals do back up past the cap the session stops with `transcript_queue_full` rather than losing one. Preserve that asymmetry: interims are disposable, finals are not. Shutdown drains the queue within a grace deadline.
-   - **`/ws/elevenlabs`**: server opens its own WS to ElevenLabs Scribe (via `websockets`), then runs two concurrent tasks (`_forward_audio`, `_receive_transcripts`) until either stops.
-
-### WebSocket protocol (`/ws` and audio endpoints)
-
-Clients send typed JSON: `{"type": "config", "translate": {"src", "dests", "provider"}, ...}` (optional, first message; `provider` is `"auto"` or a configured provider name), `{"type": "interim"|"final", "text": ..., "src": ..., "dests": [...]}`, `{"type": "ping"}`. Server replies with `{"type": ..., "original": ..., "translations": {...}, "provider": ...}` or `{"error": ...}`. A legacy plain-text path (Czech → en/ru) is retained in `/ws` — don't break it. A reader task feeds a `LatestInterimQueue` that a worker task drains: superseded interims are coalesced, cancelled in flight, and re-checked against the revision counter before and after the (slow) translation call, while finals are always translated. An error payload without a `type` is terminal — the browser tears the session down on it (`translation_queue_full` → close 1013, `server_error` → 1011), so don't send a typeless error you expect the client to survive.
-
-### Translation
-
-Two providers behind one `TranslationRouter` (per WS session; all three endpoints use it):
-
-- **google** — `googletrans` (unofficial API, 1–3 s per call, can break, and Google 429-blocks a busy server IP). `_translate()` handles both sync and async variants of the library, offloads sync calls with `asyncio.to_thread`, and applies `TRANSLATE_TIMEOUT_SECONDS`. On failure the `Translator` is recreated (stale HTTP session) via `GoogleTranslateProvider.recycle()`.
-- **deepl** — `DeepLTranslateProvider`, plain httpx POST to `/v2/translate`; present only when `DEEPL_API_KEY` is set. Language codes are googletrans-style everywhere; `_deepl_target_lang()` / `_deepl_source_lang()` map them (`en` → `EN-US`, unknown source → auto-detect).
-
-`TranslationRouter.translate(requested, ...)` returns `(text, provider_name)`. `requested` is `"auto"` (server order from `TRANSLATE_PROVIDER`) or a pinned name from the session's `config` message (`translate.provider`). Only a `TranslationRateLimited` (HTTP 429/456, duck-typed from googletrans messages by `_looks_rate_limited`) triggers a switch: the provider is put into `_PROVIDER_COOLDOWN_UNTIL` (process-wide — the limit is per server IP / API key, not per session) for `TRANSLATE_FALLBACK_COOLDOWN_SECONDS` and the next candidate is tried; a pinned provider never switches. Any other failure still sends `translation_failed`. Typed payloads carry `provider` so the UI can show which one answered.
-
-### Auth & security
-
-- HMAC-SHA256 signed tokens (`payload_b64.sig_b64`) in an httpOnly cookie; signed with `AUTH_SECRET` (falls back to `APP_PASSWORD`). Compare secrets only via `secrets.compare_digest`.
-- WS endpoints validate auth **and** origin before `accept()` (`_require_ws_auth`); HTTP routes use `_require_http_auth`. Close codes: 1008 policy/unauthorized, 1011 server error.
-- Origin rules: exact match against `ALLOWED_ORIGINS` if set, otherwise origin host must equal the Host header.
-- `/login` is rate-limited in memory (10/60 s per IP) with Origin/Referer CSRF check; redirects sanitized by `sanitize_next_path`. The IP is `request.client.host`, so behind a proxy uvicorn must trust `X-Forwarded-For` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) or every visitor shares the proxy's bucket.
-- `_CSPMiddleware` sets CSP, COOP/COEP (cross-origin isolation → SharedArrayBuffer → multi-threaded WASM for Whisper), and `no-cache` for `/static/whisper/*`.
-
-### Version-drift defensiveness (intentional pattern — preserve it)
-
-`deepgram-sdk` and `googletrans` have breaking API changes across versions. All their imports are wrapped in `try/except` with duck-typed fallbacks (`_looks_like_deepgram_results`, `_deepgram_send_finalize`, sync/async `_translate`). Deepgram must stay optional so the app still boots (Web Speech mode) without the SDK. Dependencies are pinned exactly (`requirements*.txt`), which fixes the version you get today but not the one you get after a bump — keep the duck-typing, since upgrades still cross breaking majors.
-
-## Cross-file sync constraints
-
-These pairs must change together:
-
-- **Transformers.js / ONNX Runtime versions** are pinned in *both* the CSP in `app/main.py` (`_CSPMiddleware`) and `app/static/whisper/whisper-engine.mjs` (import URL + `env.backends.onnx.wasm.wasmPaths`). The wasm must come from the same transformers.js build or session creation throws (`s._OrtGetInputName is not a function`); a CSP mismatch silently blocks the CDN fetch.
-- **Whisper model list**: `WHISPER_MODELS` in `whisper-engine.mjs` ↔ the model `<select>` in `index.html` (marked with a "Keep in sync" comment).
-- **Cache-buster**: `index.html` imports each engine as `?v=N` — `whisper-engine.mjs`, `nemotron-engine.mjs`, `parakeet-engine.mjs`. Bump `N` for **every** engine file you touch, in the same change. `tests/test_nemotron_frontend.py` pins the nemotron value, so a bump there is a deliberate two-line edit.
-- **Nemotron engine**: the onnxruntime-web version is pinned in *both* the CSP in `app/main.py` (`_CSPMiddleware`) and `nemotron-engine.mjs` (import URL + `env.wasm.wasmPaths`); bump the `?v=N` on the `nemotron-engine.mjs` import in `index.html` when changing it. The fp16 model in `app/static/nemotron/models/` is gitignored and rebuilt by `scripts/prepare_nemotron_onnx.py` (`requirements-nemotron-prep.txt`). The encoder is uniformly fp16 (JS feeds fp16 via `f16.js`); `decoder_joint.onnx` stays fp32 on WASM. `mel.js` must stay numerically in sync with `scripts/nemotron_reference.py` (validated by `scripts/validate_mel.mjs`).
-- **Parakeet engine**: shares the Nemotron front-end (`../nemotron/mel.js`) and the same onnxruntime-web pin, so a CSP/ORT bump must cover `parakeet-engine.mjs` too. The int8 model in `app/static/parakeet/models/` is gitignored and fetched by `scripts/prepare_parakeet_onnx.py` (`requirements-parakeet-prep.txt`); its file names (`encoder-int8.onnx`, `decoder_joint-int8.onnx`, `vocab.txt`) are duplicated in the engine — change both.
-- **PCM framing**: `FRAME_SAMPLES = 512` in `pcm-worklet.js` matches the VAD timing constants (~32 ms/frame at 16 kHz) in `whisper-engine.mjs`, and is re-declared in `nemotron-engine.mjs` / `parakeet-engine.mjs`.
-- **Engine names**: `_ALL_ENGINES` / `ENABLED_ENGINES` in `main.py` ↔ engine dropdown and gating logic in `index.html` (template receives `enabled_engines`).
-- **Translation providers**: `_ALL_TRANSLATE_PROVIDERS` in `main.py` ↔ `TRANSLATE_PROVIDER_LABELS` in `index.html` (template receives `translate_providers` + `translate_provider_default`); the `config` message's `translate.provider` is parsed by all three WS endpoints.
-- **Azure Speech SDK version**: pinned in *both* the CSP `script-src` in `app/main.py` (`_CSPMiddleware`, the `azure_sdk` jsDelivr URL) and `AZURE_SDK_VERSION` in `index.html`. A mismatch means the CSP silently blocks the SDK script fetch. Azure's `connect-src` (`wss://*.stt.speech.microsoft.com`, `https://*.api.cognitive.microsoft.com`) also lives in that CSP.
-
-## Conventions that matter here
-
-- Czech and English are mixed in comments, log messages, and UI labels (UI i18n is a roadmap item). Don't translate or "fix" them in unrelated PRs; avoid large formatting-only diffs in templates.
-- Never block the event loop: sync library calls go through `asyncio.to_thread`, timeouts via `asyncio.wait_for`, cross-thread events via `loop.call_soon_threadsafe`.
-- Broad `except Exception` is acceptable only at outer boundaries (WS loops, optional imports, translation calls); treat WS send/close failures as best-effort.
-- Frontend JS: insert text via `textContent`/`createTextNode` (never `innerHTML`); wrap `JSON.parse` in try/catch in `onmessage` handlers; keep ARIA attributes.
-- Tests use `TestClient` + `client.websocket_connect(...)`; the `client` fixture monkeypatches module globals (`main.APP_PASSWORD`, `main.ENABLED_ENGINES`, ...) — mutate globals only inside fixtures. External services (Translator, Deepgram) are faked via `monkeypatch`.
-- The same AudioWorklet PCM processor is currently inlined in three places in `index.html` (Deepgram, ElevenLabs server, ElevenLabs browser) — a known wart; extraction is a roadmap item.
+Important invariants: validate auth and Origin before accepting the WebSocket;
+never expose the Google key; coalesce/cancel interims but never drop finals;
+emit EN and RU together; loop over SDK `receive()` because it ends after each
+turn; use `textContent` in the UI; close all async tasks on Stop/disconnect.

@@ -1,162 +1,97 @@
-# Agent Notes (sr_live-translator)
+<!-- codebase-memory-mcp:start -->
+# Codebase Knowledge Graph (codebase-memory-mcp)
 
-This repository is a small FastAPI app that serves a password-protected UI with seven STT engines:
-- **Web Speech** – browser Web Speech API, sends recognized text to `/ws` for translation.
-- **Whisper (local)** – browser Transformers.js + ONNX, WebGPU with CPU/WASM fallback (browser analogue of whisper_android); audio stays on device, text to `/ws`.
-- **Nemotron (local)** – browser onnxruntime-web streaming ASR (NVIDIA Nemotron-3.5), WebGPU with CPU/WASM fallback; audio stays on device, text to `/ws`. Model assets are generated/gitignored — see `app/static/nemotron/README.md`.
-- **Parakeet v3 (local)** – browser onnxruntime-web offline ASR (NVIDIA Parakeet-TDT-0.6b-v3, int8) reusing the Nemotron front-end with TDT decode; multilingual incl. Czech, audio stays on device. Assets downloaded/gitignored by `scripts/prepare_parakeet_onnx.py`.
-- **Deepgram** – streams audio to `/ws/deepgram` for Deepgram Nova-3 transcription + translation.
-- **ElevenLabs** – streams audio to `/ws/elevenlabs`, server proxies to ElevenLabs Scribe v2 Realtime WS API.
-- **Azure Speech** – browser fetches a short-lived token from `POST /api/azure/token` and streams mic audio directly to Azure; recognized text to `/ws`.
+This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.
+ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 
-Repo layout:
-- `app/main.py`: FastAPI app, auth cookie, websocket handlers, Deepgram + ElevenLabs integration.
-- `app/templates/*.html`: Jinja templates with inline CSS + inline JS.
-- `tests/test_main.py`: pytest suite (FastAPI TestClient + websocket tests).
+## Priority Order
+1. `search_graph` — find functions, classes, routes, variables by pattern
+2. `trace_path` — trace who calls a function or what it calls
+3. `get_code_snippet` — read specific function/class source code
+4. `query_graph` — run Cypher queries for complex patterns
+5. `get_architecture` — high-level project summary
 
-No Cursor rules found (`.cursor/rules/`, `.cursorrules` absent).
-No Copilot rules found (`.github/copilot-instructions.md` absent).
+## When to fall back to grep/glob
+- Searching for string literals, error messages, config values
+- Searching non-code files (Dockerfiles, shell scripts, configs)
+- When MCP tools return insufficient results
+<!-- codebase-memory-mcp:end -->
 
+# Agent Notes (realtime-stt-translator)
 
-## Quickstart
+This branch is intentionally a single-purpose FastAPI application:
 
-Create a venv and install deps:
+```text
+browser microphone
+  -> /ws/audio (raw PCM16, mono, 16 kHz)
+  -> Google gemini-3.5-transcribe-live (fixed cs-CZ, SMART)
+  -> one structured Flash-Lite request per selected transcript
+  -> atomic {type, en, ru} interim/final message
+```
+
+There is no browser Web Speech path, local model, alternate STT engine,
+translation provider, text input, language selector, or user-tunable audio
+buffering. Do not add configuration messages to the WebSocket protocol.
+
+## Layout
+
+- `app/main.py`: auth, security headers, health routes, and the sole audio WS.
+- `app/google_audio.py`: fixed Google models/configuration and cost-aware actor.
+- `app/static/pcm-worklet.js`: fixed 100 ms PCM16 capture/resampling.
+- `app/templates/index.html`: one Start/Stop action and EN/RU output.
+- `tests/`: provider-free fakes; tests never call Google over the network.
+
+## Commands
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-```
-
-Run the app:
-```bash
+pip install -r requirements.txt -r requirements-dev.txt
 cp .env.example .env
-# edit .env (APP_PASSWORD is required)
+pytest
+python -m compileall app tests
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+Python 3.10+ is required. No linter or formatter is pinned. Keep edits local;
+if available, `ruff check .` and `ruff format .` are suitable.
 
-## Build / Lint / Test Commands
+## Invariants
 
-There is no separate build step (Python + templates). The core CI-like checks are:
+- The Google API key stays server-side.
+- Authenticate and validate WebSocket Origin before `accept()`.
+- Results contain EN and RU in the same JSON object; never emit one language at
+  a time.
+- Keep at most one in-flight interim snapshot and one newest pending interim;
+  coalesce any other hypotheses. Finals are FIFO, must not be dropped, and
+  immediately cancel speculative interim work.
+- Interim translation has no retry. Final translation retries once only for a
+  timeout (including HTTP 408), 429, or 5xx response.
+- Google SDK `AsyncSession.receive()` ends at each `turn_complete`; call it
+  repeatedly for a continuous session.
+- Live Transcribe sessions last at most ten minutes; the app finishes at 9:45
+  with a recoverable `session_limit` event.
+- Insert browser content with `textContent`, never `innerHTML`.
+- Do not log transcripts, passwords, cookies, or API keys.
 
-Test suite:
-```bash
-pytest
-```
+## Fixed model choices
 
-Run a single test file:
-```bash
-pytest tests/test_main.py
-```
+- STT: `gemini-3.5-transcribe-live`, `cs-CZ`, `SMART`.
+- Interim: `gemini-2.5-flash-lite`, thinking disabled.
+- Final: `gemini-3.5-flash-lite`, minimal thinking.
+- Audio: signed little-endian PCM16, mono, 16 kHz, 100 ms frames.
 
-Run a single test by node id (most precise):
-```bash
-pytest tests/test_main.py::test_ws_translates_text
-```
+These constants deliberately live in code rather than environment variables.
+Changing them is a product decision and requires tests plus README updates.
 
-Run tests matching a substring/expression:
-```bash
-pytest -k translate
-```
+## Security and async style
 
-Run tests with output (pytest.ini sets `-q` by default):
-```bash
-pytest -vv
-```
-
-Run tests with coverage (requires `pytest-cov` from `requirements-dev.txt`):
-```bash
-pytest --cov=app --cov-report=term-missing
-```
-
-Smoke-check importability (fast, catches syntax errors):
-```bash
-python -m compileall app tests
-```
-
-Lint/format:
-- No linter/formatter is pinned in this repo.
-- `.gitignore` mentions `.ruff_cache/` and `.mypy_cache/`, so you may see those tools locally.
-
-If you have them installed locally, these are reasonable defaults:
-```bash
-ruff check .
-ruff format .
-mypy app
-```
-
-
-## Code Style Guidelines
-
-### Python (general)
-
-- Python version: code uses `X | None` unions, so target Python 3.10+.
-- Imports: group in this order with blank lines: stdlib, third-party, local.
-- Formatting: keep changes minimal and local; avoid repo-wide reformatting.
-- Prefer f-strings; avoid `str.format` unless needed.
-- Use `snake_case` for functions/vars, `PascalCase` for classes/types, `UPPER_SNAKE_CASE` for constants.
-- Use leading underscore for internal helpers (e.g., `_translate`, `_sign`).
-- Prefer explicit return types for non-trivial helpers; use `TypedDict` for JSON payload shapes.
-
-### FastAPI / Starlette patterns
-
-- Keep route handlers small; push logic into helpers.
-- Websocket endpoints must:
-  - Validate auth and origin before `accept()`.
-  - Send structured JSON errors (`{"error": "..."}`) when possible.
-  - Close with appropriate codes (1008 for policy/unauthorized, 1011 for server error).
-
-### Async + blocking work
-
-- Do not block the event loop.
-  - If a library call is sync-only, offload with `asyncio.to_thread(...)`.
-  - Apply timeouts with `asyncio.wait_for(...)`.
-- When receiving events from other threads, use `loop.call_soon_threadsafe(...)`.
-- Be careful cancelling tasks during shutdown; catch `asyncio.CancelledError`.
-
-### Error handling + logging
-
-- Prefer specific exceptions where practical; use broad `except Exception` only at outer boundaries
-  (websocket loops, optional imports, translation calls).
-- Log actionable context; do not log secrets (passwords, auth tokens, API keys).
-- In websocket handlers, attempt to notify the client, then close; treat send/close failures as best-effort.
-
-### Security / auth
-
-- `APP_PASSWORD` is required; the app should refuse to operate without it.
-- Auth tokens are signed with `AUTH_SECRET` (defaults to `APP_PASSWORD`).
-- Use `secrets.compare_digest(...)` for secret comparisons.
-- Keep redirects safe: only allow relative paths via `sanitize_next_path`.
-- Origin checks:
-  - If `ALLOWED_ORIGINS` is set, origin must be an exact match.
-  - Otherwise, origin host must match the request Host header.
-
-### Optional dependencies + version drift
-
-- Deepgram SDK and googletrans have API drift.
-  - Imports are wrapped in `try/except` and code uses duck-typing.
-  - Preserve this pattern: keep Deepgram optional so `/` still works when SDK is missing.
-
-### Templates / frontend
-
-- Templates are Jinja (`app/templates/*.html`) and include inline CSS + inline JS.
-- Keep accessibility attributes and semantics (aria labels, role=status, skip link).
-- Avoid large formatting-only diffs in HTML/CSS/JS.
-- When injecting content in JS, use `textContent` / `createTextNode` (avoid `innerHTML`) to prevent XSS.
-
-### Tests
-
-- Use `pytest`.
-- Prefer `TestClient` for HTTP and `client.websocket_connect(...)` for websockets.
-- Use `monkeypatch` to isolate external services (Translator, Deepgram client).
-- When tests mutate module globals (e.g., `main.APP_PASSWORD`), do it inside fixtures.
-
-
-## Repo-specific gotchas
-
-- Don’t commit secrets:
-  - `.env` is gitignored.
-  - `credentials/*.json` is gitignored.
-- Deepgram websocket logic uses threads + async queues; changes here can introduce races.
-- Keep the queue asymmetry (`LatestTranscriptQueue`): only the newest interim is held, finals are never dropped, and a finals backlog past the cap stops the session with `transcript_queue_full`. That bounds memory without losing a committed transcript.
+- HMAC auth tokens use `AUTH_SECRET` (falling back to `APP_PASSWORD`) and
+  `secrets.compare_digest`.
+- Keep redirects relative via `sanitize_next_path`.
+- `ALLOWED_ORIGINS`, when set, is an exact allowlist; otherwise WS Origin host
+  must match Host.
+- Never block the event loop. Bound external calls with timeouts and drain or
+  cancel every spawned task during disconnect.
+- Send sanitized JSON errors and use close codes 1008 (policy), 1009 (size),
+  1011 (server), and 1013 (temporary overload).

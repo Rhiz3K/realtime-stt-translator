@@ -22,7 +22,7 @@ profile at https://github.com/Rhiz3K.
 
 - A description of the vulnerability and its impact
 - Steps to reproduce (proof-of-concept code is welcome)
-- Affected endpoints/engines/configuration (Web Speech / Deepgram / ElevenLabs)
+- Affected endpoint or component (`/ws/audio`, Google pipeline, authentication)
 - Any relevant logs (redact secrets: API keys, auth cookies, passwords)
 
 ### Disclosure Process

@@ -1,512 +1,198 @@
+from __future__ import annotations
+
 import asyncio
 import base64
-from collections import deque
-import contextlib
-from dataclasses import dataclass
+import binascii
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import os
-import posixpath
-import re
 import secrets
 import threading
 import time
-from typing import TypedDict
-from urllib.parse import urlencode, urlparse
+from collections import deque
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from urllib.parse import quote, urlparse
 
-import httpx
-import websockets as ws_lib
-from anyio import EndOfStream
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi import (
+    FastAPI,
+    Form,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from googletrans import Translator
+from google import genai
+from google.genai import errors, types
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response as StarletteResponse
-from starlette.websockets import WebSocketDisconnect
 
-logging.basicConfig(level=logging.INFO)
+from app.google_audio import (
+    AUDIO_MIME_TYPE,
+    FINAL_TIMEOUT_SECONDS,
+    MAX_AUDIO_CHUNK_BYTES,
+    MAX_FINAL_BACKLOG,
+    TRANSCRIBE_MODEL,
+    GeminiPairTranslator,
+    TranslationBacklogFull,
+    TranslationCoordinator,
+    live_transcription_config,
+    transcript_from_message,
+)
 
-# deepgram-sdk has had breaking API changes across major versions. Treat it as an
-# optional dependency so the app can still boot (at least for the Web Speech API
-# mode) when Deepgram is not installed or an import path changes.
-try:  # pragma: no cover - depends on installed deepgram-sdk version
-    from deepgram import DeepgramClient  # type: ignore
-except Exception:  # pragma: no cover
-    DeepgramClient = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - depends on installed deepgram-sdk version
-    from deepgram.core.events import EventType  # type: ignore
-except Exception:  # pragma: no cover
-    class EventType:  # type: ignore[no-redef]
-        MESSAGE = "message"
-        ERROR = "error"
-        CLOSE = "close"
-
-try:  # pragma: no cover - deepgram-sdk v3 exported this, newer versions may not
-    from deepgram.listen import ListenV1Results  # type: ignore
-except Exception:  # pragma: no cover
-    ListenV1Results = None  # type: ignore[assignment]
-
-# Načteme .env proměnné (volitelně, pokud máte něco v .env)
 load_dotenv()
 
-app = FastAPI()
-templates = Jinja2Templates(directory="app/templates")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+logger = logging.getLogger("realtime_translator")
+BASE_DIR = Path(__file__).resolve().parent
 
 
-_MODEL_ASSET_PREFIXES = ("/static/nemotron/models/", "/static/parakeet/models/")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
-def _is_model_asset_path(path: str) -> bool:
-    return path.startswith(_MODEL_ASSET_PREFIXES)
+def _env_bool(name: str, default: bool) -> tuple[bool, bool]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default, True
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True, True
+    if normalized in _FALSE_VALUES:
+        return False, True
+    # Authentication configuration must fail closed on a typo.
+    return True, False
 
 
-# --- Security middleware: Content-Security-Policy ---
-class _CSPMiddleware(BaseHTTPMiddleware):
+def _env_int(name: str, default: int) -> tuple[int, bool]:
+    try:
+        return int(os.getenv(name, str(default))), True
+    except ValueError:
+        return default, False
+
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+AUTH_ENABLED, _AUTH_ENABLED_VALID = _env_bool("AUTH_ENABLED", True)
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+AUTH_SECRET = os.getenv("AUTH_SECRET", "").strip() or APP_PASSWORD
+AUTH_COOKIE_NAME = (
+    os.getenv("AUTH_COOKIE_NAME", "translator_auth").strip() or "translator_auth"
+)
+AUTH_TOKEN_TTL_SECONDS, _AUTH_TOKEN_TTL_VALID = _env_int(
+    "AUTH_TOKEN_TTL_SECONDS", 12 * 60 * 60
+)
+AUTH_COOKIE_SECURE_RAW = os.getenv("AUTH_COOKIE_SECURE")
+
+_PLACEHOLDERS = {
+    "change-me",
+    "changeme",
+    "replace-me",
+    "replace-with-a-long-random-value",
+    "your-api-key",
+    "your-password",
+}
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_SECONDS = 60.0
+_LOGIN_TRACKED_IP_CAP = 10_000
+_login_attempts: dict[str, deque[float]] = {}
+_login_attempts_lock = threading.Lock()
+
+# Google currently limits one live-transcription connection to ten minutes.
+# End slightly early so the browser receives a controlled, restartable result.
+_SESSION_MAX_SECONDS = 9 * 60 + 45
+_GOOGLE_SETUP_TIMEOUT_SECONDS = 15.0
+_GOOGLE_CLOSE_TIMEOUT_SECONDS = 2.0
+_FINAL_TRANSCRIPT_GRACE_SECONDS = 2.5
+_FINAL_DRAIN_SECONDS = (MAX_FINAL_BACKLOG + 1) * (
+    (2 * FINAL_TIMEOUT_SECONDS) + 0.25
+) + 1
+_AUDIO_BYTES_PER_SECOND = 16_000 * 2
+_AUDIO_BURST_BYTES = _AUDIO_BYTES_PER_SECOND * 2
+_MAX_CONCURRENT_AUDIO_SESSIONS = 4
+_audio_session_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_AUDIO_SESSIONS)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # StaticFiles resolves the request path through os.path.normpath *after*
-        # this middleware runs, so a non-canonical spelling ("/nemotron//models",
-        # "/whisper/../nemotron/models", a "%2e%2e" that the server decodes to
-        # "..") would slip past a raw startswith gate yet still be served.
-        # Normalize the same way first, and reuse the result for the
-        # cache-control decisions below so a bypass path can't dodge those either.
-        asset_path = posixpath.normpath(request.url.path)
-        # The model weights are hundreds of MB to ~1.2 GB each and StaticFiles has
-        # no auth of its own, so an unauthenticated scraper could pull them at will.
-        # The browser fetches them same-origin, so the auth cookie rides along.
-        if _is_model_asset_path(asset_path) and AUTH_ENABLED:
-            if not APP_PASSWORD or not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
-                return PlainTextResponse("unauthorized", status_code=401)
-        response: StarletteResponse = await call_next(request)
-        # Inline scripts/styles are used throughout; connect-src must allow
-        # ElevenLabs WS for browser mode.
-        # jsDelivr is scoped to the two pinned packages we actually load
-        # (Transformers.js and the ONNX Runtime build used by it and the VAD)
-        # rather than the whole CDN. The bare-version entry covers the initial
-        # import; the trailing-slash entries cover its /+esm and /dist/* sub-paths.
-        jsdelivr = (
-            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0 "
-            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0/ "
-            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250306-ccf8fdd9ea/ "
-            "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/"
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "; ".join(
+                (
+                    "default-src 'self'",
+                    "script-src 'self' 'unsafe-inline'",
+                    "style-src 'self' 'unsafe-inline'",
+                    "img-src 'self' data:",
+                    "connect-src 'self'",
+                    "worker-src 'self'",
+                    "object-src 'none'",
+                    "base-uri 'none'",
+                    "frame-ancestors 'none'",
+                    "form-action 'self'",
+                )
+            ),
         )
-        # Azure AI Speech browser SDK (loaded only for the 'azure' engine). The
-        # version here must match the one index.html loads (see AZURE_SDK_VERSION).
-        azure_sdk = "https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.50.0/"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            f"script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: {jsdelivr} {azure_sdk}; "
-            "worker-src 'self' blob:; "
-            "style-src 'self' 'unsafe-inline'; "
-            f"connect-src 'self' wss://api.elevenlabs.io {jsdelivr} "
-            "https://huggingface.co https://cdn-lfs.huggingface.co "
-            "https://cas-bridge.xethub.hf.co "
-            "wss://*.stt.speech.microsoft.com https://*.api.cognitive.microsoft.com; "
-            "img-src 'self' data:; "
-            "frame-ancestors 'none'"
-        )
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Permissions-Policy"] = (
-            "microphone=(self), on-device-speech-recognition=(self)"
-        )
-        # Cross-origin isolation enables SharedArrayBuffer, which lets ONNX Runtime
-        # Web run the local Whisper model multi-threaded on the CPU (much faster on
-        # multi-core devices). COEP 'credentialless' still allows the cross-origin
-        # CDN/Hugging Face fetches (transformers.js, ORT wasm, model weights) since
-        # those send CORS headers.
-        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
-        # Always revalidate the local Whisper engine/worklet so a browser can't
-        # pin a stale (and possibly broken) cached copy across reloads.
-        if asset_path.startswith("/static/whisper/"):
-            response.headers["Cache-Control"] = "no-cache"
-        # The Nemotron model weights (~1.2 GB) are immutable and must be cached
-        # aggressively; the engine code is revalidated like Whisper's.
-        elif asset_path.startswith("/static/nemotron/models/"):
-            if 200 <= response.status_code < 400:
-                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-            else:
-                response.headers["Cache-Control"] = "no-store"
-        elif asset_path.startswith("/static/nemotron/"):
-            response.headers["Cache-Control"] = "no-cache"
-        # Parakeet mirrors Nemotron: immutable ~930 MB model weights, revalidated code.
-        elif asset_path.startswith("/static/parakeet/models/"):
-            if 200 <= response.status_code < 400:
-                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-            else:
-                response.headers["Cache-Control"] = "no-store"
-        elif asset_path.startswith("/static/parakeet/"):
-            response.headers["Cache-Control"] = "no-cache"
+        response.headers.setdefault("Permissions-Policy", "microphone=(self)")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        response.headers.setdefault("Cache-Control", "no-store")
+        if _request_is_https(request):
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
         return response
 
 
-app.add_middleware(_CSPMiddleware)
+app = FastAPI(title="Czech live translation", docs_url=None, redoc_url=None)
+app.add_middleware(SecurityHeadersMiddleware)
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# --- Helpers for safe env var parsing ---
+
+def configuration_errors() -> list[str]:
+    failures: list[str] = []
+    if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in _PLACEHOLDERS:
+        failures.append("gemini_api_key_missing")
+    if AUTH_ENABLED:
+        if not _AUTH_ENABLED_VALID:
+            failures.append("auth_enabled_invalid")
+        if not APP_PASSWORD or APP_PASSWORD.lower() in _PLACEHOLDERS:
+            failures.append("app_password_missing")
+        if not AUTH_SECRET or AUTH_SECRET.lower() in _PLACEHOLDERS:
+            failures.append("auth_secret_missing")
+        if not _AUTH_TOKEN_TTL_VALID or AUTH_TOKEN_TTL_SECONDS <= 0:
+            failures.append("auth_token_ttl_invalid")
+        if AUTH_COOKIE_SECURE_RAW and not _valid_optional_bool(AUTH_COOKIE_SECURE_RAW):
+            failures.append("auth_cookie_secure_invalid")
+    return failures
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "")
-    if not raw:
-        return default
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
     try:
-        value = int(raw)
-        if value < 0:
-            logging.warning("Env %s=%s is negative, using default %d", name, raw, default)
-            return default
-        return value
-    except ValueError:
-        logging.warning("Env %s=%r is not a valid integer, using default %d", name, raw, default)
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, "")
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-        if value <= 0:
-            logging.warning("Env %s=%s is non-positive, using default %s", name, raw, default)
-            return default
-        return value
-    except ValueError:
-        logging.warning("Env %s=%r is not a valid number, using default %s", name, raw, default)
-        return default
-
-
-def _normalize_lang_code(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    v = value.strip().lower()
-    return v or None
-
-
-def _normalize_translate_dests(value: object) -> list[str] | None:
-    """Return 1-2 normalized dest language codes, or None if invalid/empty."""
-
-    if not isinstance(value, list):
-        return None
-    out: list[str] = []
-    for item in value:
-        if len(out) >= 2:
-            break
-        if not isinstance(item, str):
-            continue
-        v = item.strip().lower()
-        if v:
-            out.append(v)
-    if not out:
-        return None
-    if len(out) == 2 and out[0] == out[1]:
-        out[1] = "ru" if out[0] != "ru" else "en"
-    return out
-
-
-# --- Konfigurace (z prostředí) ---
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-AUTH_SECRET = os.getenv("AUTH_SECRET") or APP_PASSWORD
-AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "srlt_auth")
-AUTH_TOKEN_TTL_SECONDS = _env_int("AUTH_TOKEN_TTL_SECONDS", 43200)
-
-if AUTH_ENABLED and AUTH_SECRET == APP_PASSWORD and APP_PASSWORD:
-    logging.warning(
-        "AUTH_SECRET is not set — falling back to APP_PASSWORD for token signing. "
-        "Set a separate AUTH_SECRET for production."
-    )
-
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-DEEPGRAM_RESULT_QUEUE_SIZE = _env_int("DEEPGRAM_RESULT_QUEUE_SIZE", 100)
-
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
-
-# Upstream Scribe error types that end the session — nothing sent afterwards can
-# succeed, so the endpoint stops and the browser tears the session down.
-ELEVENLABS_FATAL_ERRORS = frozenset({
-    "auth_error", "quota_exceeded", "session_time_limit_exceeded", "unaccepted_terms",
-    "transcriber_error", "resource_exhausted", "queue_overflow", "error",
-})
-# ...and the ones the session survives. `insufficient_audio_activity` in particular
-# is routine: it fires whenever a manual commit lands during silence. These are
-# reported as {"type": "warning", ...} so the browser shows them without stopping.
-ELEVENLABS_TRANSIENT_ERRORS = frozenset({
-    "input_error", "throttled", "rate_limited", "chunk_size_exceeded",
-    "insufficient_audio_activity",
-})
-
-# Azure AI Speech (browser-direct mode): the server only mints a short-lived
-# auth token; the browser SpeechSDK does the streaming. Region must match the
-# resource (e.g. "westeurope"). Free F0 tier gives ~5 audio hours/month.
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
-
-# Which STT engines are available to users.  Comma-separated list.
-# Valid values: webspeech, whisper, nemotron, deepgram, elevenlabs, azure.  Default: webspeech only.
-_ALL_ENGINES = {"webspeech", "whisper", "nemotron", "deepgram", "elevenlabs", "azure", "parakeet"}
-_raw_engines = os.getenv("ENABLED_ENGINES", "webspeech").strip()
-ENABLED_ENGINES: set[str] = {
-    e.strip().lower() for e in _raw_engines.split(",") if e.strip().lower() in _ALL_ENGINES
-} or {"webspeech"}
-
-# Warn if an engine is enabled but its API key is missing.
-if "deepgram" in ENABLED_ENGINES and not DEEPGRAM_API_KEY:
-    logging.warning("Engine 'deepgram' is enabled but DEEPGRAM_API_KEY is not set.")
-if "elevenlabs" in ENABLED_ENGINES and not ELEVENLABS_API_KEY:
-    logging.warning(
-        "Engine 'elevenlabs' is enabled but ELEVENLABS_API_KEY is not set. "
-        "Server-side mode will fail; browser mode requires users to provide their own key."
-    )
-if "azure" in ENABLED_ENGINES and not (AZURE_SPEECH_KEY and AZURE_SPEECH_REGION):
-    logging.warning(
-        "Engine 'azure' is enabled but AZURE_SPEECH_KEY / AZURE_SPEECH_REGION are not set. "
-        "Token minting will fail until both are configured (or the client supplies its own)."
-    )
-
-MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH", 5000)
-TRANSLATE_TIMEOUT_SECONDS = _env_float("TRANSLATE_TIMEOUT_SECONDS", 10.0)
-INTERIM_COALESCE_DELAY_SECONDS = 0.02
-
-# --- Translation providers ---
-# googletrans (free, keyless, unofficial — Google throttles it per IP) is always
-# available; DeepL joins the pool when DEEPL_API_KEY is set. TRANSLATE_PROVIDER
-# is "auto" (try providers in _ALL_TRANSLATE_PROVIDERS order, skipping any that
-# hit a rate limit recently), a single provider name (never switch), or an
-# explicit comma-separated preference order such as "deepl,google".
-_ALL_TRANSLATE_PROVIDERS = ("google", "deepl")
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
-DEEPL_API_URL = os.getenv("DEEPL_API_URL", "").strip()
-TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "auto").strip().lower() or "auto"
-TRANSLATE_FALLBACK_COOLDOWN_SECONDS = _env_float("TRANSLATE_FALLBACK_COOLDOWN_SECONDS", 600.0)
-# Provider name -> time.monotonic() deadline until which auto mode skips it.
-# Process-wide on purpose: Google's 429 is per server IP and DeepL's quota per
-# key, so one session hitting the limit should steer every session.
-_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
-
-
-def available_translate_providers() -> list[str]:
-    """Providers this server can use, in _ALL_TRANSLATE_PROVIDERS order."""
-    names = ["google"]
-    if DEEPL_API_KEY:
-        names.append("deepl")
-    return names
-
-
-def _parse_translate_provider_order(raw: str, available: list[str], *, warn: bool = False) -> list[str]:
-    """Turn a TRANSLATE_PROVIDER value into a preference list over configured providers.
-
-    "auto" (or empty) = every configured provider in _ALL_TRANSLATE_PROVIDERS
-    order; a single name = that provider only (no fallback); "a,b" = explicit
-    order. Unknown or unconfigured names are dropped (logged once at startup).
-    """
-    names = [name.strip().lower() for name in raw.split(",") if name.strip()]
-    if names in ([], ["auto"]):
-        return list(available)
-    order: list[str] = []
-    for name in names:
-        if name not in _ALL_TRANSLATE_PROVIDERS:
-            if warn:
-                logging.warning("TRANSLATE_PROVIDER: unknown provider %r ignored.", name)
-        elif name not in available:
-            if warn:
-                logging.warning(
-                    "TRANSLATE_PROVIDER: %r is not configured (missing API key); ignored.", name
-                )
-        elif name not in order:
-            order.append(name)
-    if not order:
-        if warn:
-            logging.warning(
-                "TRANSLATE_PROVIDER=%r selects nothing usable; using %r.", raw, available[0]
-            )
-        return [available[0]]
-    return order
-
-
-def _translate_provider_order(requested: str | None = None) -> list[str]:
-    """Preference order for one request: a session's pinned provider, else the server's."""
-    available = available_translate_providers()
-    if requested and requested != "auto" and requested in available:
-        return [requested]
-    return _parse_translate_provider_order(TRANSLATE_PROVIDER, available)
-
-
-def _translate_provider_ui_default() -> str:
-    """What the Settings dialog preselects: a single pinned provider, otherwise "auto"."""
-    names = [name.strip().lower() for name in TRANSLATE_PROVIDER.split(",") if name.strip()]
-    order = _translate_provider_order()
-    if len(names) == 1 and names != ["auto"] and len(order) == 1:
-        return order[0]
-    return "auto"
-
-
-def _normalize_translate_provider(value: object) -> str | None:
-    """Validate a client's `translate.provider`: "auto" or a configured provider name."""
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    if normalized == "auto" or normalized in available_translate_providers():
-        return normalized
-    return None
-
-
-# Surface a misconfigured TRANSLATE_PROVIDER once, at startup, not on every call.
-_parse_translate_provider_order(TRANSLATE_PROVIDER, available_translate_providers(), warn=True)
-
-# --- Simple in-memory rate limiter for /login ---
-_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
-_LOGIN_MAX_ATTEMPTS = 10
-_LOGIN_WINDOW_SECONDS = 60.0
-
-
-class TranscriptResult(TypedDict):
-    transcript: str
-    is_final: bool
-
-
-class LatestTranscriptQueue:
-    """Preserve all committed transcripts and coalesce pending interim updates."""
-
-    def __init__(self, *, max_finals: int = 100) -> None:
-        self._finals: deque[TranscriptResult] = deque()
-        self._interim: TranscriptResult | None = None
-        self._wake = asyncio.Event()
-        self._max_finals = max(1, max_finals)
-
-    def put(self, result: TranscriptResult) -> bool:
-        if result["is_final"]:
-            self._interim = None
-            if len(self._finals) >= self._max_finals:
-                return False
-            self._finals.append(result)
-        else:
-            self._interim = result
-        self._wake.set()
-        return True
-
-    async def get(self) -> TranscriptResult:
-        while True:
-            if self._finals:
-                return self._finals.popleft()
-            if self._interim is not None:
-                result = self._interim
-                self._interim = None
-                return result
-            self._wake.clear()
-            await self._wake.wait()
-
-    def empty(self) -> bool:
-        return not self._finals and self._interim is None
-
-
-@dataclass(slots=True)
-class TranslationWork:
-    text: str
-    msg_type: str
-    src: str
-    dests: list[str]
-    typed: bool = True
-    client_id: int | None = None
-    client_sent_ms: float | None = None
-    revision: int = 0
-
-
-class LatestInterimQueue:
-    """Keep every committed item but only the newest pending interim item."""
-
-    def __init__(self, *, max_finals: int = 100) -> None:
-        self._finals: deque[TranslationWork] = deque()
-        self._interim: TranslationWork | None = None
-        self._wake = asyncio.Event()
-        self._closed = False
-        self._max_finals = max(1, max_finals)
-        self._revision = 0
-
-    def put(self, work: TranslationWork) -> bool:
-        if self._closed:
-            return False
-        self._revision += 1
-        work.revision = self._revision
-        if work.msg_type == "interim":
-            self._interim = work
-        else:
-            # A final supersedes any still-pending hypothesis for the same stream.
-            self._interim = None
-            if len(self._finals) >= self._max_finals:
-                return False
-            self._finals.append(work)
-        self._wake.set()
-        return True
-
-    @property
-    def revision(self) -> int:
-        return self._revision
-
-    @property
-    def closed(self) -> bool:
-        """True once close() has been called. Queued finals still drain from
-        get() first; only then does get() return None."""
-        return self._closed
-
-    async def get(self) -> TranslationWork | None:
-        while True:
-            if self._finals:
-                return self._finals.popleft()
-            if self._interim is not None:
-                work = self._interim
-                self._interim = None
-                return work
-            if self._closed:
-                return None
-            self._wake.clear()
-            await self._wake.wait()
-
-    def close(self) -> None:
-        self._closed = True
-        self._wake.set()
-
-
-try:
-    from deepgram.extensions.types.sockets.listen_v1_control_message import (
-        ListenV1ControlMessage,
-    )
-except Exception:  # pragma: no cover - optional dependency surface varies by deepgram-sdk version
-    ListenV1ControlMessage = None  # type: ignore[assignment]
-
-
-def _looks_like_deepgram_results(obj: object) -> bool:
-    # deepgram-sdk has changed public result types across versions.
-    # Use duck-typing so we don't hard-depend on a specific class import.
-    return hasattr(obj, "channel") and hasattr(obj, "is_final")
-
-
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
+        return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid base64url") from exc
 
 
 def _sign(payload_b64: str) -> str:
     if not AUTH_SECRET:
         return ""
-    mac = hmac.new(
-        AUTH_SECRET.encode("utf-8"),
-        payload_b64.encode("utf-8"),
-        hashlib.sha256,
+    digest = hmac.new(
+        AUTH_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256
     ).digest()
-    return _b64url_encode(mac)
+    return _b64url_encode(digest)
 
 
 def create_auth_token() -> str:
@@ -515,8 +201,7 @@ def create_auth_token() -> str:
     payload_b64 = _b64url_encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
-    sig_b64 = _sign(payload_b64)
-    return f"{payload_b64}.{sig_b64}"
+    return f"{payload_b64}.{_sign(payload_b64)}"
 
 
 def verify_auth_token(token: str | None) -> bool:
@@ -525,31 +210,34 @@ def verify_auth_token(token: str | None) -> bool:
     parts = token.split(".")
     if len(parts) != 2:
         return False
-    payload_b64, sig_b64 = parts
-    expected_sig = _sign(payload_b64)
-    # Compare as bytes: compare_digest() raises TypeError for non-ASCII str, and a
-    # cookie is attacker-supplied — one stray byte must yield "invalid", not a 500.
-    if not expected_sig or not secrets.compare_digest(
-        expected_sig.encode("utf-8"), sig_b64.encode("utf-8")
+    payload_b64, signature = parts
+    expected = _sign(payload_b64)
+    if not expected or not secrets.compare_digest(
+        expected.encode("ascii"), signature.encode("utf-8")
     ):
         return False
     try:
         payload = json.loads(_b64url_decode(payload_b64))
     except Exception:
         return False
-    exp = payload.get("exp")
-    if not isinstance(exp, int):
-        return False
-    return exp >= int(time.time())
+    issued_at = payload.get("iat")
+    expires_at = payload.get("exp")
+    now = int(time.time())
+    return (
+        isinstance(issued_at, int)
+        and isinstance(expires_at, int)
+        and issued_at <= now + 60
+        and expires_at >= now
+    )
 
 
 def sanitize_next_path(next_path: str | None) -> str:
-    # Only same-site absolute paths. "//host" is protocol-relative, and browsers
-    # normalize backslashes to slashes in Location, so "/\host" is too — both would
-    # turn a post-login redirect into an off-site one.
-    if not next_path or not next_path.startswith("/") or next_path.startswith("//"):
+    if not next_path or not next_path.startswith("/"):
         return "/"
-    if "\\" in next_path or any(c < " " or c == "\x7f" for c in next_path):
+    if next_path.startswith("//") or "\\" in next_path:
+        return "/"
+    parsed = urlparse(next_path)
+    if parsed.scheme or parsed.netloc:
         return "/"
     return next_path
 
@@ -557,587 +245,131 @@ def sanitize_next_path(next_path: str | None) -> str:
 def is_origin_allowed(origin: str | None, host: str | None) -> bool:
     configured = os.getenv("ALLOWED_ORIGINS", "").strip()
     if configured:
-        allowed = {o.strip() for o in configured.split(",") if o.strip()}
+        allowed = {value.strip() for value in configured.split(",") if value.strip()}
         return bool(origin) and origin in allowed
-
     if not origin or not host:
         return False
     try:
         parsed = urlparse(origin)
-    except Exception:  # pragma: no cover - urlparse practically never raises on a str
+        return parsed.scheme in {"http", "https"} and parsed.netloc == host
+    except Exception:  # pragma: no cover - urlparse accepts arbitrary strings
         return False
-    return parsed.netloc == host
+
+
+def _request_is_https(request: Request) -> bool:
+    # Uvicorn rewrites ASGI scope["scheme"] only for trusted proxy addresses;
+    # reading X-Forwarded-Proto here directly would bypass that trust boundary.
+    return request.url.scheme == "https"
+
+
+def _valid_optional_bool(raw: str) -> bool:
+    return raw.strip().lower() in (_TRUE_VALUES | _FALSE_VALUES)
 
 
 def _cookie_secure_for_request(request: Request) -> bool:
-    configured = os.getenv("AUTH_COOKIE_SECURE")
-    if configured is None or configured == "":
-        return request.url.scheme == "https"
-    return configured.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _render_login(request: Request, *, next_path: str, invalid_pwd: bool) -> HTMLResponse:
-    return templates.TemplateResponse(
-        request,
-        "password_prompt.html",
-        {"invalid_pwd": invalid_pwd, "next_path": next_path},
-    )
-
-
-def _new_translator() -> Translator:
-    # googletrans 4.x otherwise converts upstream HTTP failures into a dummy
-    # "translation" containing the original text.
-    try:
-        return Translator(raise_exception=True)
-    except TypeError:  # pragma: no cover - compatibility with older releases
-        return Translator()
-
-
-async def _close_translator(translator: Translator | None) -> None:
-    if translator is None:
-        return
-    client = getattr(translator, "client", None)
-    closer = getattr(client, "aclose", None)
-    if callable(closer):
-        try:
-            result = closer()
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            logging.debug("Translator close failed: %s", exc)
-
-
-def _validate_translation_result(result):
-    # httpx.Response is falsy for 4xx/5xx statuses, so do not use ``a or b``
-    # here: that would discard precisely the failed response we need to detect.
-    response = getattr(result, "_response", None)
-    if response is None:
-        response = getattr(result, "response", None)
-    status_code = getattr(response, "status_code", 200)
-    if isinstance(status_code, int) and status_code >= 400:
-        raise RuntimeError(f"Translation upstream returned HTTP {status_code}")
-    return result
-
-
-async def _translate(translator: Translator, text: str, *, src: str, dest: str):
-    # googletrans has had both sync and async implementations across versions.
-    # Run sync translate in a worker thread to avoid blocking the event loop.
-    if inspect.iscoroutinefunction(translator.translate):
-        result = await asyncio.wait_for(
-            translator.translate(text, src=src, dest=dest),
-            timeout=TRANSLATE_TIMEOUT_SECONDS,
-        )
-    else:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(lambda: translator.translate(text, src=src, dest=dest)),
-            timeout=TRANSLATE_TIMEOUT_SECONDS,
-        )
-    return _validate_translation_result(result)
-
-
-class TranslationRateLimited(Exception):
-    """A provider refused for rate/quota reasons (HTTP 429, DeepL's 456).
-
-    Kept distinct from other failures so the router can hand the request to the
-    next provider instead of reporting `translation_failed`.
-    """
-
-
-_RATE_LIMIT_MESSAGE_RE = re.compile(r'(?:status code|HTTP)\s*"?(?:429|456)\b')
-
-
-def _looks_rate_limited(exc: BaseException) -> bool:
-    """Duck-type a rate-limit failure across googletrans versions.
-
-    googletrans 4.x raises a bare Exception that only mentions the status code
-    in its message, `_validate_translation_result` reports "HTTP 429", and an
-    httpx error carries the response object itself.
-    """
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if isinstance(status, int):
-        return status in (429, 456)
-    return bool(_RATE_LIMIT_MESSAGE_RE.search(str(exc)))
-
-
-class GoogleTranslateProvider:
-    """googletrans: free and keyless, but an unofficial API Google throttles per IP."""
-
-    name = "google"
-
-    def __init__(self) -> None:
-        self.translator = _new_translator()
-
-    async def translate(self, text: str, *, src: str, dest: str) -> str:
-        try:
-            result = await _translate(self.translator, text, src=src, dest=dest)
-        except Exception as exc:
-            if _looks_rate_limited(exc):
-                raise TranslationRateLimited(f"google: {exc}") from exc
-            raise
-        return result.text if result else ""
-
-    async def recycle(self) -> None:
-        # The library's HTTP session goes stale after a failure; build a fresh one.
-        old = self.translator
-        self.translator = _new_translator()
-        await _close_translator(old)
-
-    async def aclose(self) -> None:
-        await _close_translator(self.translator)
-
-
-_DEEPL_FREE_URL = "https://api-free.deepl.com/v2/translate"
-_DEEPL_PRO_URL = "https://api.deepl.com/v2/translate"
-# Languages DeepL accepts as a source (base codes). Anything else is sent without
-# source_lang so DeepL auto-detects instead of rejecting the request outright.
-_DEEPL_SOURCE_LANGS = frozenset(
-    "ar bg cs da de el en es et fi fr he hu id it ja ko lt lv nb nl pl pt ro ru sk sl sv th tr uk vi zh".split()
-)
-# googletrans-style codes -> DeepL target codes where they differ. DeepL wants a
-# regional variant for English/Portuguese/Chinese targets (plain EN/PT are deprecated).
-_DEEPL_TARGET_ALIASES = {
-    "en": "EN-US",
-    "pt": "PT-PT",
-    "zh": "ZH-HANS",
-    "zh-cn": "ZH-HANS",
-    "zh-tw": "ZH-HANT",
-    "no": "NB",
-    "iw": "HE",
-}
-
-
-def _deepl_source_lang(code: str) -> str | None:
-    base = code.strip().lower().split("-", 1)[0]
-    base = {"iw": "he", "no": "nb"}.get(base, base)
-    return base.upper() if base in _DEEPL_SOURCE_LANGS else None
-
-
-def _deepl_target_lang(code: str) -> str:
-    normalized = code.strip().lower()
-    return _DEEPL_TARGET_ALIASES.get(normalized) or normalized.upper()
-
-
-class DeepLTranslateProvider:
-    """DeepL REST API. Free keys end with ":fx" and must use the api-free host."""
-
-    name = "deepl"
-
-    def __init__(
-        self, api_key: str, *, api_url: str = "", client: httpx.AsyncClient | None = None
-    ) -> None:
-        self.api_key = api_key
-        self.api_url = api_url or (_DEEPL_FREE_URL if api_key.endswith(":fx") else _DEEPL_PRO_URL)
-        self._client = client or httpx.AsyncClient(timeout=TRANSLATE_TIMEOUT_SECONDS)
-
-    async def translate(self, text: str, *, src: str, dest: str) -> str:
-        body: dict = {"text": [text], "target_lang": _deepl_target_lang(dest)}
-        source = _deepl_source_lang(src)
-        if source:
-            body["source_lang"] = source
-        try:
-            response = await asyncio.wait_for(
-                self._client.post(
-                    self.api_url,
-                    json=body,
-                    headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
-                ),
-                timeout=TRANSLATE_TIMEOUT_SECONDS,
-            )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"DeepL request failed: {exc}") from exc
-        if response.status_code in (429, 456):
-            # 429 = too many requests, 456 = the plan's character quota is used up.
-            raise TranslationRateLimited(f"deepl: HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise RuntimeError(f"DeepL HTTP {response.status_code}: {response.text[:200]}")
-        try:
-            return str(response.json()["translations"][0]["text"])
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("DeepL returned an unexpected response body") from exc
-
-    async def recycle(self) -> None:
-        """Nothing to refresh: plain HTTPS requests, httpx reconnects on its own."""
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-
-def _build_translate_providers() -> dict:
-    providers: dict = {"google": GoogleTranslateProvider()}
-    if DEEPL_API_KEY:
-        providers["deepl"] = DeepLTranslateProvider(DEEPL_API_KEY, api_url=DEEPL_API_URL)
-    return providers
-
-
-class TranslationRouter:
-    """Per-session translation providers behind one `translate()` call.
-
-    Which provider serves a request is decided per call: a session may pin one
-    ("google"/"deepl") or leave it on "auto", where the server's preference
-    order applies and a provider that answered with a rate-limit error is
-    skipped for TRANSLATE_FALLBACK_COOLDOWN_SECONDS. The cooldown table is
-    process-wide (see _PROVIDER_COOLDOWN_UNTIL) while the provider objects —
-    googletrans HTTP session, httpx client — are per session so their lifetime
-    stays tied to the WebSocket.
-    """
-
-    def __init__(self, providers: dict | None = None, *, cooldown: dict[str, float] | None = None) -> None:
-        self.providers = providers if providers is not None else _build_translate_providers()
-        self._cooldown = _PROVIDER_COOLDOWN_UNTIL if cooldown is None else cooldown
-
-    def candidates(self, requested: str | None) -> list:
-        """Providers to try for one request, in order.
-
-        Those not cooling down come first, in preference order; the rest follow
-        with the oldest block first, so a limit that has lifted is rediscovered
-        by the next request that needs it rather than by a separate probe.
-        """
-        order = [name for name in _translate_provider_order(requested) if name in self.providers]
-        if not order:
-            order = list(self.providers)
-        now = time.monotonic()
-        ready = [name for name in order if self._cooldown.get(name, 0.0) <= now]
-        cooling = sorted(
-            (name for name in order if name not in ready),
-            key=lambda name: self._cooldown.get(name, 0.0),
-        )
-        return [self.providers[name] for name in ready + cooling]
-
-    def mark_rate_limited(self, name: str) -> None:
-        already_cooling = self._cooldown.get(name, 0.0) > time.monotonic()
-        self._cooldown[name] = time.monotonic() + TRANSLATE_FALLBACK_COOLDOWN_SECONDS
-        log = logging.debug if already_cooling else logging.warning
-        log(
-            "Translation provider %r is rate limited; auto mode skips it for %.0f s.",
-            name,
-            TRANSLATE_FALLBACK_COOLDOWN_SECONDS,
-        )
-
-    async def translate(self, requested: str | None, text: str, *, src: str, dest: str) -> tuple[str, str]:
-        """Translate with the first candidate that is not rate limited.
-
-        Returns (translation, provider name). A pinned provider is the only
-        candidate, so a rate limit there surfaces as a failure — never a switch.
-        """
-        last_error: TranslationRateLimited | None = None
-        for provider in self.candidates(requested):
-            try:
-                return await provider.translate(text, src=src, dest=dest), provider.name
-            except TranslationRateLimited as exc:
-                self.mark_rate_limited(provider.name)
-                last_error = exc
-        raise RuntimeError(f"all translation providers are rate limited ({last_error})")
-
-    async def recycle(self) -> None:
-        for provider in self.providers.values():
-            await provider.recycle()
-
-    async def aclose(self) -> None:
-        for provider in self.providers.values():
-            await provider.aclose()
-
-
-def _providers_used(results) -> str | None:
-    """Name the provider(s) behind one message's per-dest results, for the payload."""
-    names = sorted({name for _text, name in results if name})
-    return ",".join(names) or None
-
-
-def _translation_payload(
-    work: TranslationWork,
-    translations: dict[str, str],
-    *,
-    error: str | None = None,
-    translate_ms: int = 0,
-    provider: str | None = None,
-) -> dict:
-    if not work.typed:
-        payload: dict = {
-            "original": work.text,
-            "en": translations.get("en", ""),
-            "ru": translations.get("ru", ""),
-        }
-        if error:
-            payload["error"] = error
-        return payload
-
-    payload = {
-        "type": work.msg_type if work.msg_type in {"interim", "final"} else "final",
-        "original": work.text,
-        "dests": work.dests,
-        "translations": translations,
-        "timing": {"translate_ms": translate_ms},
-    }
-    if work.client_id is not None:
-        payload["client_id"] = work.client_id
-    if work.client_sent_ms is not None:
-        payload["client_sent_ms"] = work.client_sent_ms
-    if provider:
-        payload["provider"] = provider
-    if error:
-        payload["error"] = error
-    return payload
-
-
-@contextlib.asynccontextmanager
-async def _threaded_exit_stack():
-    """Run potentially blocking synchronous context-manager shutdown off-loop."""
-    stack = contextlib.ExitStack()
-    try:
-        yield stack
-    finally:
-        await asyncio.to_thread(stack.close)
-
-
-def _deepgram_send_finalize(dg_socket) -> None:
-    # deepgram-sdk v3 had send_finalize/send_close_stream with dedicated types.
-    # deepgram-sdk v5 uses send_control(ListenV1ControlMessage(type=...)).
-    if hasattr(dg_socket, "send_finalize"):
-        try:
-            from deepgram.listen.v1.types.listen_v1finalize import ListenV1Finalize  # type: ignore
-
-            dg_socket.send_finalize(ListenV1Finalize(type="Finalize"))
-            return
-        except Exception:  # pragma: no cover - depends on installed deepgram-sdk version
-            pass
-
-    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:  # pragma: no cover
-        try:
-            dg_socket.send_control(ListenV1ControlMessage(type="Finalize"))
-        except Exception:
-            pass
-
-
-def _deepgram_send_close_stream(dg_socket) -> None:
-    if hasattr(dg_socket, "send_close_stream"):
-        try:
-            from deepgram.listen.v1.types.listen_v1close_stream import (  # type: ignore
-                ListenV1CloseStream,
-            )
-
-            dg_socket.send_close_stream(ListenV1CloseStream(type="CloseStream"))
-            return
-        except Exception:  # pragma: no cover - depends on installed deepgram-sdk version
-            pass
-
-    if hasattr(dg_socket, "send_control") and ListenV1ControlMessage is not None:  # pragma: no cover
-        try:
-            dg_socket.send_control(ListenV1ControlMessage(type="CloseStream"))
-        except Exception:
-            pass
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint for Docker HEALTHCHECK and load balancers."""
-    return {"status": "ok"}
+    if AUTH_COOKIE_SECURE_RAW is not None and AUTH_COOKIE_SECURE_RAW.strip():
+        normalized = AUTH_COOKIE_SECURE_RAW.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+        return True
+    return _request_is_https(request)
 
 
 def _is_same_origin(request: Request) -> bool:
-    """Check that Origin or Referer header matches the request host (CSRF mitigation)."""
-    origin = request.headers.get("origin")
-    if origin:
-        try:
-            parsed = urlparse(origin)
-            return parsed.netloc == request.headers.get("host", "")
-        except Exception:
-            return False
-    referer = request.headers.get("referer")
-    if referer:
-        try:
-            parsed = urlparse(referer)
-            return parsed.netloc == request.headers.get("host", "")
-        except Exception:
-            return False
-    # No Origin/Referer — allow (same-site navigation from address bar).
-    return True
+    source = request.headers.get("origin") or request.headers.get("referer")
+    if not source:
+        return True
+    try:
+        return urlparse(source).netloc == request.headers.get("host", "")
+    except Exception:  # pragma: no cover - urlparse accepts arbitrary strings
+        return False
+
+
+def _prune_login_attempts(client_ip: str, now: float) -> deque[float] | None:
+    attempts = _login_attempts.get(client_ip)
+    if attempts is None:
+        return None
+    cutoff = now - _LOGIN_WINDOW_SECONDS
+    while attempts and attempts[0] <= cutoff:
+        attempts.popleft()
+    if not attempts:
+        _login_attempts.pop(client_ip, None)
+        return None
+    return attempts
 
 
 def _check_login_rate_limit(client_ip: str) -> bool:
-    """Return True if the IP is within the allowed rate limit, False if blocked."""
-    now = time.time()
-    attempts = _LOGIN_ATTEMPTS.get(client_ip, [])
-    # Prune old entries.
-    attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
-    if attempts:
-        _LOGIN_ATTEMPTS[client_ip] = attempts
-    else:
-        # Drop the key entirely, or a scanner walking IPs grows this dict forever.
-        _LOGIN_ATTEMPTS.pop(client_ip, None)
-    return len(attempts) < _LOGIN_MAX_ATTEMPTS
+    with _login_attempts_lock:
+        attempts = _prune_login_attempts(client_ip, time.monotonic())
+        return attempts is None or len(attempts) < _LOGIN_MAX_ATTEMPTS
 
 
 def _record_login_attempt(client_ip: str) -> None:
-    _LOGIN_ATTEMPTS.setdefault(client_ip, []).append(time.time())
+    with _login_attempts_lock:
+        now = time.monotonic()
+        attempts = _prune_login_attempts(client_ip, now)
+        if attempts is None:
+            if len(_login_attempts) >= _LOGIN_TRACKED_IP_CAP:
+                for tracked_ip in list(_login_attempts):
+                    _prune_login_attempts(tracked_ip, now)
+            if len(_login_attempts) >= _LOGIN_TRACKED_IP_CAP:
+                _login_attempts.pop(next(iter(_login_attempts)))
+            attempts = deque()
+            _login_attempts[client_ip] = attempts
+        attempts.append(now)
 
 
-def _index_context() -> dict:
-    """Template context shared by all routes that render index.html."""
-    return {
-        "enabled_engines": sorted(ENABLED_ENGINES),
-        # Translation providers the server can use and what the Settings dialog
-        # preselects ("auto" = server order with rate-limit fallback).
-        "translate_providers": available_translate_providers(),
-        "translate_provider_default": _translate_provider_ui_default(),
-    }
+def _clear_login_attempts(client_ip: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(client_ip, None)
+
+
+def _render_login(
+    request: Request, *, next_path: str = "/", invalid_pwd: bool = False
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request=request,
+        name="password_prompt.html",
+        context={
+            "next_path": sanitize_next_path(next_path),
+            "invalid_pwd": invalid_pwd,
+        },
+        status_code=401 if invalid_pwd else 200,
+    )
+
+
+@app.get("/health")
+@app.get("/health/live")
+async def health_live() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    failures = configuration_errors()
+    if failures:
+        return JSONResponse(
+            {"status": "not_ready", "checks": failures}, status_code=503
+        )
+    return {"status": "ready"}
 
 
 @app.get("/", response_class=HTMLResponse)
-async def get_index(request: Request):
-    """
-    Vrátí index.html z app/templates (případně heslo).
-    """
-    if AUTH_ENABLED:
-        if not APP_PASSWORD:
-            return HTMLResponse("APP_PASSWORD not configured", status_code=500)
-
-        if not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
-            return _render_login(request, next_path=request.url.path, invalid_pwd=False)
-
-    return templates.TemplateResponse(request, "index.html", _index_context())
-
-
-@app.get("/deepgram", response_class=HTMLResponse)
-async def get_deepgram_index(request: Request):
-    """Legacy endpoint — redirects to unified UI. Auth is enforced at /."""
-    return RedirectResponse(url="/", status_code=303)
-
-
-def _require_http_auth(request: Request) -> None:
-    if not AUTH_ENABLED:
-        return
-    if not APP_PASSWORD:
-        raise HTTPException(status_code=500, detail="server_not_configured")
-    if not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-
-def _require_engine_enabled(engine: str) -> None:
-    if engine not in ENABLED_ENGINES:
-        raise HTTPException(status_code=404, detail="engine_not_enabled")
-
-
-@app.get("/api/translate/languages")
-async def api_translate_languages(request: Request):
-    """Return available translation languages (googletrans)."""
-    _require_http_auth(request)
-    try:
-        from googletrans import LANGUAGES  # type: ignore
-
-        languages = [{"code": code, "name": name} for code, name in LANGUAGES.items()]
-        languages.sort(key=lambda x: (x["name"], x["code"]))
-        return {"languages": languages}
-    except Exception:
-        return {"languages": []}
-
-
-ELEVENLABS_TOKEN_URL = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe"
-
-
-@app.post("/api/elevenlabs/token")
-async def api_elevenlabs_token(request: Request):
-    """Create a single-use ElevenLabs token for browser-side Scribe connections.
-
-    The client may supply its own API key in the JSON body (``api_key``).
-    If omitted, the server-side ``ELEVENLABS_API_KEY`` env var is used.
-    """
-    _require_http_auth(request)
-    _require_engine_enabled("elevenlabs")
-
-    body: dict = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
-    api_key = ""
-    if isinstance(body, dict) and isinstance(body.get("api_key"), str):
-        api_key = body["api_key"].strip()
-    if not api_key:
-        api_key = ELEVENLABS_API_KEY
-
-    if not api_key:
-        raise HTTPException(status_code=400, detail="No ElevenLabs API key provided")
-
-    import httpx  # lightweight async HTTP client (ships with FastAPI/Starlette)
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                ELEVENLABS_TOKEN_URL,
-                headers={"xi-api-key": api_key},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return {"token": data.get("token", "")}
-    except httpx.HTTPStatusError as e:
-        detail = f"ElevenLabs API error: {e.response.status_code}"
-        try:
-            detail = e.response.json().get("detail", detail)
-        except Exception:
-            pass
-        raise HTTPException(status_code=e.response.status_code, detail=detail)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to create token: {e}")
-
-
-def _valid_azure_region(region: str) -> bool:
-    # Region is interpolated into the token URL host — restrict to the Azure
-    # region charset to prevent SSRF/host injection.
-    return bool(region) and len(region) <= 40 and all(c.isalnum() or c == "-" for c in region)
-
-
-@app.post("/api/azure/token")
-async def api_azure_token(request: Request):
-    """Mint a short-lived Azure AI Speech auth token for browser-side recognition.
-
-    The client may supply its own ``api_key``/``region`` in the JSON body;
-    otherwise the server-side ``AZURE_SPEECH_KEY`` / ``AZURE_SPEECH_REGION`` are
-    used. Azure's issueToken returns the token as plain text, valid ~10 minutes;
-    the browser SpeechSDK consumes it via ``fromAuthorizationToken``.
-    """
-    _require_http_auth(request)
-    _require_engine_enabled("azure")
-
-    body: dict = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
-    api_key = ""
-    region = ""
-    if isinstance(body, dict):
-        if isinstance(body.get("api_key"), str):
-            api_key = body["api_key"].strip()
-        if isinstance(body.get("region"), str):
-            region = body["region"].strip()
-    api_key = api_key or AZURE_SPEECH_KEY
-    region = region or AZURE_SPEECH_REGION
-
-    if not api_key or not region:
-        raise HTTPException(status_code=400, detail="Azure Speech key/region not configured")
-    if not _valid_azure_region(region):
-        raise HTTPException(status_code=400, detail="Invalid Azure region")
-
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
-                headers={"Ocp-Apim-Subscription-Key": api_key, "Content-Length": "0"},
-            )
-            resp.raise_for_status()
-            return {"token": resp.text, "region": region}
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"Azure token error: {e.response.status_code}",
+async def index(request: Request):
+    if AUTH_ENABLED and not verify_auth_token(request.cookies.get(AUTH_COOKIE_NAME)):
+        return RedirectResponse(
+            url=f"/login?next={quote('/', safe='')}", status_code=303
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to create Azure token: {e}")
+    return templates.TemplateResponse(request=request, name="index.html", context={})
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request, next: str = "/"):  # noqa: A002
+    if not AUTH_ENABLED:
+        return RedirectResponse(url="/", status_code=303)
+    return _render_login(request, next_path=next)
 
 
 @app.post("/login")
@@ -1150,28 +382,23 @@ async def login(
         return RedirectResponse(url="/", status_code=303)
     if not APP_PASSWORD:
         return HTMLResponse("APP_PASSWORD not configured", status_code=500)
-
-    # CSRF mitigation: verify that the request Origin/Referer matches our host.
     if not _is_same_origin(request):
         raise HTTPException(status_code=403, detail="Cross-origin login not allowed")
 
-    # Rate limiting.
     client_ip = request.client.host if request.client else "0.0.0.0"
     if not _check_login_rate_limit(client_ip):
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many login attempts. Try again in {int(_LOGIN_WINDOW_SECONDS)}s.",
-        )
+        raise HTTPException(status_code=429, detail="Too many login attempts")
 
     next_path = sanitize_next_path(next_path)
-    # Bytes, not str: compare_digest() raises TypeError on non-ASCII input, which
-    # would turn a password with diacritics (or any such attempt) into a 500.
-    if not secrets.compare_digest(password.encode("utf-8"), APP_PASSWORD.encode("utf-8")):
+    if not secrets.compare_digest(
+        password.encode("utf-8"), APP_PASSWORD.encode("utf-8")
+    ):
         _record_login_attempt(client_ip)
         return _render_login(request, next_path=next_path, invalid_pwd=True)
 
-    resp = RedirectResponse(url=next_path, status_code=303)
-    resp.set_cookie(
+    _clear_login_attempts(client_ip)
+    response = RedirectResponse(url=next_path, status_code=303)
+    response.set_cookie(
         AUTH_COOKIE_NAME,
         create_auth_token(),
         max_age=AUTH_TOKEN_TTL_SECONDS,
@@ -1180,15 +407,16 @@ async def login(
         secure=_cookie_secure_for_request(request),
         path="/",
     )
-    return resp
+    return response
 
 
 async def _require_ws_auth(websocket: WebSocket) -> bool:
-    """Check WS auth. Returns True if allowed, False if closed with error."""
     if AUTH_ENABLED and not APP_PASSWORD:
         await websocket.close(code=1011, reason="Server not configured")
         return False
-    if not is_origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host")):
+    if not is_origin_allowed(
+        websocket.headers.get("origin"), websocket.headers.get("host")
+    ):
         await websocket.close(code=1008, reason="Origin not allowed")
         return False
     if AUTH_ENABLED and not verify_auth_token(websocket.cookies.get(AUTH_COOKIE_NAME)):
@@ -1197,1031 +425,419 @@ async def _require_ws_auth(websocket: WebSocket) -> bool:
     return True
 
 
-async def _require_ws_engine(websocket: WebSocket, engine: str) -> bool:
-    if engine in ENABLED_ENGINES:
+class _JsonSender:
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._lock = asyncio.Lock()
+
+    async def send(self, payload: dict[str, object]) -> None:
+        async with self._lock:
+            await self._websocket.send_json(payload)
+
+
+class _ClientProtocolError(RuntimeError):
+    def __init__(self, code: int, reason: str, error_code: str) -> None:
+        super().__init__(reason)
+        self.close_code = code
+        self.reason = reason
+        self.error_code = error_code
+
+
+class _ReportedSessionError(RuntimeError):
+    """Terminal error already sent to the browser before a bounded drain."""
+
+    def __init__(self, close_code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.close_code = close_code
+        self.reason = reason
+
+
+class _AudioRateLimiter:
+    """Bound paid audio bytes to realtime with a two-second jitter allowance."""
+
+    def __init__(self) -> None:
+        self._tokens = float(_AUDIO_BURST_BYTES)
+        self._updated_at = time.monotonic()
+
+    def consume(self, size: int) -> bool:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._updated_at)
+        self._updated_at = now
+        self._tokens = min(
+            float(_AUDIO_BURST_BYTES),
+            self._tokens + (elapsed * _AUDIO_BYTES_PER_SECOND),
+        )
+        if size > self._tokens:
+            return False
+        self._tokens -= size
         return True
-    await websocket.close(code=1008, reason="Engine not enabled")
-    return False
 
 
-class TranslationSession:
-    """Reader/worker pair around a `LatestInterimQueue`.
+def _create_google_client() -> genai.Client:
+    return genai.Client(api_key=GEMINI_API_KEY)
 
-    `/ws` and `/ws/elevenlabs` both feed transcripts in from a reader task and
-    translate them in a worker task, with identical supersede/shield/recycle
-    semantics. Keeping one implementation means a fix to this subtle cancellation
-    logic cannot land on only one of them — which is exactly what had happened.
-    """
 
-    def __init__(
-        self, inbox: LatestInterimQueue, send, *, log_label: str, provider: str = "auto"
-    ) -> None:
-        self.inbox = inbox
-        self.send = send
-        self.log_label = log_label
-        self.router = TranslationRouter()
-        # "auto" or a provider name; the reader may change it from a config message.
-        self.provider = provider
-        self.current_interim_task: asyncio.Future | None = None
-        self.superseded_interim_tasks: set[asyncio.Future] = set()
+@asynccontextmanager
+async def _connect_google_live(async_client: object):
+    """Bound setup, then leave the established Live session untimed."""
 
-    def supersede_interim(self) -> None:
-        """Drop the in-flight interim translation.
-
-        A newer hypothesis or a committed final makes it useless, and cancelling
-        also lets a final bypass a slow request. The task is marked before being
-        cancelled so the worker can tell this apart from its own teardown.
-        """
-        task = self.current_interim_task
-        if task is not None and not task.done():
-            self.superseded_interim_tasks.add(task)
-            task.cancel()
-
-    async def aclose(self) -> None:
-        task = self.current_interim_task
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        await self.router.aclose()
-
-    async def run(self) -> None:
-        while True:
-            work = await self.inbox.get()
-            if work is None:
-                return
-            if work.msg_type == "interim":
-                # Give the reader one event-loop turn to consume a burst's newer
-                # hypothesis/final before starting network work for this interim.
-                await asyncio.sleep(INTERIM_COALESCE_DELAY_SECONDS)
-                if work.revision != self.inbox.revision:
-                    continue
-            started = time.perf_counter()
-            # Held explicitly: cancelling the gather future once it has already
-            # completed (which is what a failure does) is a no-op, so the only way
-            # to stop the surviving siblings is to keep their tasks.
-            children = [
-                asyncio.ensure_future(
-                    self.router.translate(self.provider, work.text, src=work.src, dest=dest)
-                )
-                for dest in work.dests
-            ]
-            task = asyncio.gather(*children)
-            if work.msg_type == "interim":
-                self.current_interim_task = task
-            try:
-                # Shield lets us distinguish an explicitly superseded child
-                # translation from cancellation of this worker itself. The reader
-                # marks the former before cancelling it.
-                results = await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # Swallow only the cancellation the reader caused by superseding
-                # this interim, and keep looping so the final it queued behind the
-                # interim still drains. `inbox.closed` is not a safe proxy for "we
-                # are being torn down": the upstream can end (closing the inbox)
-                # with a committed final still queued. current_task().cancelling()
-                # is >0 only when this worker task was itself cancelled — the real
-                # teardown signal — so honour our own cancellation in that case.
-                if (
-                    task in self.superseded_interim_tasks
-                    and asyncio.current_task().cancelling() == 0
-                ):
-                    await asyncio.gather(*children, return_exceptions=True)
-                    await asyncio.gather(task, return_exceptions=True)
-                    continue
-                for child in children:
-                    child.cancel()
-                await asyncio.gather(*children, return_exceptions=True)
-                await asyncio.gather(task, return_exceptions=True)
-                raise
-            except Exception as exc:
-                logging.error("%s: %s", self.log_label, exc)
-                # gather() does not cancel its siblings on the first failure, so a
-                # slow dest would still be using the translator we are about to
-                # close. Stop them before swapping it out.
-                for child in children:
-                    child.cancel()
-                await asyncio.gather(*children, return_exceptions=True)
-                await asyncio.gather(task, return_exceptions=True)
-                await self.router.recycle()
-                response = _translation_payload(
-                    work,
-                    {dest: "" for dest in work.dests},
-                    error="translation_failed",
-                )
-            else:
-                response = _translation_payload(
-                    work,
-                    {dest: text for dest, (text, _provider) in zip(work.dests, results)},
-                    translate_ms=int((time.perf_counter() - started) * 1000),
-                    provider=_providers_used(results),
-                )
-            finally:
-                self.superseded_interim_tasks.discard(task)
-                if self.current_interim_task is task:
-                    self.current_interim_task = None
-            if work.msg_type == "interim" and work.revision != self.inbox.revision:
-                continue
-            await self.send(response)
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """Translate browser STT text while coalescing superseded interim hypotheses."""
-    if not await _require_ws_auth(websocket):
-        return
-
-    await websocket.accept()
-    logging.info("WebSocket /ws připojen")
-
-    session_src_lang = "cs"
-    session_dest_langs: list[str] = ["en", "ru"]
-    inbox = LatestInterimQueue()
-    send_lock = asyncio.Lock()
-
-    async def _send(payload: dict) -> None:
-        async with send_lock:
-            await websocket.send_json(payload)
-
-    session = TranslationSession(inbox, _send, log_label="Překlad selhal")
-
-    async def _reader() -> None:
-        nonlocal session_src_lang, session_dest_langs
-        try:
-            while True:
-                raw = await websocket.receive_text()
-                if not raw:
-                    continue
-
-                typed = False
-                msg_type = "final"
-                src_lang = session_src_lang
-                dest_langs = list(session_dest_langs)
-                text = raw
-                client_id: int | None = None
-                client_sent_ms: float | None = None
-
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    parsed = None
-
-                if isinstance(parsed, dict):
-                    if parsed.get("type") == "config":
-                        tr_cfg = parsed.get("translate")
-                        if isinstance(tr_cfg, dict):
-                            src_norm = _normalize_lang_code(tr_cfg.get("src"))
-                            if src_norm:
-                                session_src_lang = src_norm
-                            dests_norm = _normalize_translate_dests(tr_cfg.get("dests"))
-                            if dests_norm:
-                                session_dest_langs = dests_norm
-                            provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
-                            if provider_norm:
-                                session.provider = provider_norm
-                        continue
-                    if parsed.get("type") == "ping":
-                        await _send({"type": "pong"})
-                        continue
-                    if isinstance(parsed.get("text"), str):
-                        typed = True
-                        msg_type = parsed.get("type") if parsed.get("type") in {"interim", "final"} else "final"
-                        text = parsed["text"]
-                        src_lang = _normalize_lang_code(parsed.get("src")) or src_lang
-                        dest_langs = _normalize_translate_dests(parsed.get("dests")) or dest_langs
-                        cid = parsed.get("client_id")
-                        if isinstance(cid, int) and cid >= 0:
-                            client_id = cid
-                        sent_ms = parsed.get("client_sent_ms")
-                        if isinstance(sent_ms, (int, float)):
-                            client_sent_ms = float(sent_ms)
-
-                text = text.strip()
-                work = TranslationWork(
-                    text=text,
-                    msg_type=msg_type,
-                    src=src_lang,
-                    dests=dest_langs,
-                    typed=typed,
-                    client_id=client_id,
-                    client_sent_ms=client_sent_ms,
-                )
-
-                if not text or len(text) > MAX_TEXT_LENGTH:
-                    # Still supersedes: a rejected final (e.g. a trailing empty one
-                    # from the engine) makes the interim before it obsolete, and
-                    # letting that translation land afterwards reorders the UI.
-                    session.supersede_interim()
-                    empty_work = TranslationWork(
-                        text="",
-                        msg_type=msg_type,
-                        src=src_lang,
-                        dests=dest_langs,
-                        typed=typed,
-                        client_id=client_id,
-                        client_sent_ms=client_sent_ms,
-                    )
-                    await _send(
-                        _translation_payload(
-                            empty_work,
-                            {dest: "" for dest in dest_langs},
-                            error="text_too_long" if len(text) > MAX_TEXT_LENGTH else None,
-                        )
-                    )
-                    continue
-
-                session.supersede_interim()
-                if not inbox.put(work):
-                    await _send({"error": "translation_queue_full"})
-                    await websocket.close(code=1013, reason="Translation queue full")
-                    return
-        except (WebSocketDisconnect, EndOfStream):
-            logging.info("WebSocket odpojen klientem.")
-        finally:
-            inbox.close()
-
-    reader_task = asyncio.create_task(_reader())
-    worker_task = asyncio.create_task(session.run())
-    try:
-        done, pending = await asyncio.wait(
-            {reader_task, worker_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        failure: Exception | None = None
-        for task in done:
-            try:
-                task.result()
-            except (WebSocketDisconnect, EndOfStream):
-                pass
-            except Exception as exc:
-                failure = exc
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if failure is not None:
-            raise failure
-    except Exception as exc:
-        logging.error("Nastala chyba v /ws: %s", exc)
-        try:
-            await _send({"error": "server_error"})
-            await websocket.close(code=1011)
-        except Exception:
-            pass
-    finally:
-        inbox.close()
-        await session.aclose()
-
-
-@app.websocket("/ws/deepgram")
-async def deepgram_websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint pro Deepgram Nova-3 RSTT.
-    Přijímá audio data z prohlížeče, posílá je do Deepgram, 
-    vrací přepis a překlad.
-    """
-    if not await _require_ws_auth(websocket):
-        return
-    if not await _require_ws_engine(websocket, "deepgram"):
-        return
-
-    await websocket.accept()
-    logging.info("WebSocket /ws/deepgram připojen")
-
-    browser_send_lock = asyncio.Lock()
-
-    async def _send_browser(payload: dict) -> None:
-        async with browser_send_lock:
-            await websocket.send_json(payload)
-    
-    if not DEEPGRAM_API_KEY:
-        logging.error("DEEPGRAM_API_KEY není nastaven")
-        await _send_browser({"error": "DEEPGRAM_API_KEY not configured"})
-        await websocket.close()
-        return
-
-    if DeepgramClient is None:
-        logging.error("deepgram-sdk není nainstalovaný nebo nejde importovat")
-        await _send_browser({"error": "deepgram-sdk not installed"})
-        await websocket.close()
-        return
-    
-    stop_event = threading.Event()
-    async_stop_event = asyncio.Event()
-    process_task = None
-    listen_thread: threading.Thread | None = None
-    
-    # Capture event loop for use in callbacks from other threads
-    event_loop = asyncio.get_running_loop()
-
-    # Defaults for Deepgram connect.
-    # Model is fixed to match legacy behavior.
-    dg_language = "cs"
-    dg_interim_results = True
-    dg_punctuate = True
-
-    # Defaults for translation.
-    translate_src = "cs"
-    translate_dests: list[str] = ["en", "ru"]
-    translate_interim = False
-    translate_provider = "auto"
-
-    first_audio: bytes | None = None
-
-    # Optional session config as the first websocket text message.
-    # If the client sends audio first, we keep it and proceed with defaults.
-    try:
-        first = await websocket.receive()
-        if first.get("type") == "websocket.receive":
-            if first.get("text"):
-                try:
-                    cfg = json.loads(first["text"])
-                except Exception:
-                    cfg = None
-
-                if isinstance(cfg, dict) and cfg.get("type") == "config":
-                    dg_cfg = cfg.get("deepgram")
-                    if isinstance(dg_cfg, dict):
-                        language = dg_cfg.get("language")
-                        if isinstance(language, str) and language.strip():
-                            dg_language = language.strip()
-                        if isinstance(dg_cfg.get("interim_results"), bool):
-                            dg_interim_results = dg_cfg["interim_results"]
-                        if isinstance(dg_cfg.get("punctuate"), bool):
-                            dg_punctuate = dg_cfg["punctuate"]
-
-                    tr_cfg = cfg.get("translate")
-                    if isinstance(tr_cfg, dict):
-                        src_norm = _normalize_lang_code(tr_cfg.get("src"))
-                        if src_norm:
-                            translate_src = src_norm
-
-                        dests_norm = _normalize_translate_dests(tr_cfg.get("dests"))
-                        if dests_norm:
-                            translate_dests = dests_norm
-
-                        provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
-                        if provider_norm:
-                            translate_provider = provider_norm
-
-                    if isinstance(cfg.get("translate_interim"), bool):
-                        translate_interim = cfg["translate_interim"]
-            elif first.get("bytes"):
-                first_audio = first["bytes"]
-        elif first.get("type") == "websocket.disconnect":
-            return
-    except (WebSocketDisconnect, EndOfStream):
-        return
-
-    if len(translate_dests) == 2 and translate_dests[0] == translate_dests[1]:
-        translate_dests[1] = "ru" if translate_dests[0] != "ru" else "en"
-    router = TranslationRouter()
-
-    def _dg_payload(
-        *,
-        msg_type: str,
-        original: str,
-        translations: dict[str, str],
-        error: str | None = None,
-        timing: dict[str, int] | None = None,
-        provider: str | None = None,
-    ) -> dict:
-        payload: dict = {
-            "type": msg_type,
-            "original": original,
-            "dests": translate_dests,
-            "translations": translations,
-        }
-        # Backwards-compatible top-level fields.
-        if "en" in translations:
-            payload["en"] = translations["en"]
-        if "ru" in translations:
-            payload["ru"] = translations["ru"]
-        if timing:
-            payload["timing"] = timing
-        if provider:
-            payload["provider"] = provider
-        if error:
-            payload["error"] = error
-        return payload
-
-    try:
-        # Inicializace Deepgram klienta
-        deepgram = DeepgramClient(api_key=DEEPGRAM_API_KEY)
-
-        async with _threaded_exit_stack() as stack:
-            # Vytvoření živého připojení s Nova-3 modelem
-            connect_kwargs: dict[str, str] = {
-                "model": "nova-3",
-                "language": dg_language,
-                "encoding": "linear16",
-                "sample_rate": "16000",
-                "channels": "1",
-                "interim_results": "true" if dg_interim_results else "false",
-                "punctuate": "true" if dg_punctuate else "false",
-            }
-            connect_obj = deepgram.listen.v1.connect(**connect_kwargs)
-            # deepgram-sdk v5 returns a context manager, v3 returned an iterator.
-            if hasattr(connect_obj, "__enter__"):
-                dg_socket = await asyncio.to_thread(stack.enter_context, connect_obj)
-            else:
-                dg_socket_iterator = connect_obj
-                dg_socket = await asyncio.to_thread(next, dg_socket_iterator)
-                stack.callback(getattr(dg_socket_iterator, "close", lambda: None))
-
-            logging.info("Deepgram Nova-3 připojení úspěšně spuštěno")
-            
-            # Queue pro předávání výsledků mezi vlákny
-            result_queue = LatestTranscriptQueue(max_finals=DEEPGRAM_RESULT_QUEUE_SIZE)
-            queue_overflowed = False
-            # Notifications posted from the listener thread run detached. Hold a
-            # strong reference so they cannot be garbage-collected mid-flight, and
-            # discard on completion so the set does not grow.
-            _background_tasks: set[asyncio.Task] = set()
-
-            def _notify_browser_detached(payload: dict) -> None:
-                async def _send() -> None:
-                    try:
-                        await _send_browser(payload)
-                    except Exception as send_err:
-                        logging.debug(f"Nelze poslat Deepgram notifikaci: {send_err}")
-
-                task = asyncio.create_task(_send())
-                _background_tasks.add(task)
-                task.add_done_callback(_background_tasks.discard)
-
-            # Grace window to drain final results after shutdown.
-            shutdown_deadline: float | None = None
-            
-            # Callback pro příjem transkripce z Deepgram
-            def on_message(result):
-                try:
-                    if _looks_like_deepgram_results(result):
-                        # Check if alternatives exist and are non-empty
-                        if (result.channel and 
-                            result.channel.alternatives and 
-                            len(result.channel.alternatives) > 0):
-                            transcript = result.channel.alternatives[0].transcript
-                            is_final = result.is_final
-                            
-                            if transcript and transcript.strip():
-                                logging.debug(
-                                    "Deepgram transcript received (chars=%d, final=%s)",
-                                    len(transcript),
-                                    is_final,
-                                )
-                                payload: TranscriptResult = {
-                                    "transcript": transcript,
-                                    "is_final": bool(is_final),
-                                }
-
-                                def _enqueue() -> None:
-                                    nonlocal queue_overflowed
-                                    # During shutdown we still want to enqueue final results produced
-                                    # by Deepgram finalize/close, but we can drop interim updates.
-                                    if stop_event.is_set() and not payload["is_final"]:
-                                        return
-                                    if queue_overflowed:
-                                        return
-                                    if result_queue.put(payload):
-                                        return
-                                    # Never evict a committed transcript. Stop the
-                                    # overloaded session explicitly instead of
-                                    # growing without bound or silently losing text.
-                                    queue_overflowed = True
-                                    logging.error("Deepgram final transcript queue is full")
-                                    stop_event.set()
-                                    async_stop_event.set()
-                                    _notify_browser_detached({"error": "transcript_queue_full"})
-
-                                event_loop.call_soon_threadsafe(_enqueue)
-                except Exception as e:
-                    logging.error(f"Chyba při zpracování transkripce: {str(e)}")
-            
-            def on_error(error):
-                logging.error(f"Deepgram error: {error}")
-                stop_event.set()
-
-                def _notify() -> None:
-                    async_stop_event.set()
-                    # Vendor-supplied text: safe to forward, and it is what makes a
-                    # Deepgram-side failure diagnosable in the browser.
-                    _notify_browser_detached({"error": str(error)})
-
-                event_loop.call_soon_threadsafe(_notify)
-            
-            def on_close(close):
-                logging.info("Deepgram připojení uzavřeno")
-                stop_event.set()
-                event_loop.call_soon_threadsafe(async_stop_event.set)
-            
-            # Registrace callbacků
-            dg_socket.on(EventType.MESSAGE, on_message)
-            dg_socket.on(EventType.ERROR, on_error)
-            dg_socket.on(EventType.CLOSE, on_close)
-            
-            # Spustit poslouchání v samostatném vlákně
-            def _notify_listener_failure() -> None:
-                async_stop_event.set()
-                _notify_browser_detached({"error": "deepgram_listener_failed"})
-
-            def listen_thread_func():
-                try:
-                    dg_socket.start_listening()
-                except Exception as e:
-                    logging.exception("Listen thread error: %s", e)
-                    stop_event.set()
-                    # Tell the browser too. Without this the session just goes quiet:
-                    # no transcripts, no error, and the UI keeps claiming to record.
-                    event_loop.call_soon_threadsafe(_notify_listener_failure)
-            
-            listen_thread = threading.Thread(target=listen_thread_func, daemon=True)
-            listen_thread.start()
-
-            async def refresh_translator() -> None:
-                await router.recycle()
-            
-            # Coroutine pro zpracování výsledků
-            async def process_results():
-                while True:
-                    if stop_event.is_set() and result_queue.empty():
-                        # Prefer to drain results until the listen thread ends, but don't hang forever.
-                        if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
-                            break
-                        if listen_thread is None or not listen_thread.is_alive():
-                            break
-                    try:
-                        result = await asyncio.wait_for(result_queue.get(), timeout=0.1)
-                        transcript = result["transcript"]
-                        is_final = result["is_final"]
-                        
-                        if is_final:
-                            try:
-                                start_t = time.perf_counter()
-                                results = await asyncio.gather(
-                                    *[
-                                        router.translate(
-                                            translate_provider,
-                                            transcript,
-                                            src=translate_src,
-                                            dest=dest,
-                                        )
-                                        for dest in translate_dests
-                                    ]
-                                )
-                                translate_ms = int((time.perf_counter() - start_t) * 1000)
-                                translations = {
-                                    dest: text
-                                    for dest, (text, _provider) in zip(translate_dests, results)
-                                }
-                                response = _dg_payload(
-                                    msg_type="final",
-                                    original=transcript,
-                                    translations=translations,
-                                    timing={"translate_ms": translate_ms},
-                                    provider=_providers_used(results),
-                                )
-                            except Exception as translate_err:
-                                logging.error(f"Chyba při překladu: {translate_err}")
-                                await refresh_translator()
-                                response = _dg_payload(
-                                    msg_type="final",
-                                    original=transcript,
-                                    translations={d: "" for d in translate_dests},
-                                    error="translation_failed",
-                                    timing={"translate_ms": 0},
-                                )
-                        else:
-                            if translate_interim:
-                                try:
-                                    start_t = time.perf_counter()
-                                    results = await asyncio.gather(
-                                        *[
-                                            router.translate(
-                                                translate_provider,
-                                                transcript,
-                                                src=translate_src,
-                                                dest=dest,
-                                            )
-                                            for dest in translate_dests
-                                        ]
-                                    )
-                                    translate_ms = int((time.perf_counter() - start_t) * 1000)
-                                    translations = {
-                                        dest: text
-                                        for dest, (text, _provider) in zip(translate_dests, results)
-                                    }
-                                    response = _dg_payload(
-                                        msg_type="interim",
-                                        original=transcript,
-                                        translations=translations,
-                                        timing={"translate_ms": translate_ms},
-                                        provider=_providers_used(results),
-                                    )
-                                except Exception as translate_err:
-                                    logging.error(f"Chyba při překladu interim: {translate_err}")
-                                    await refresh_translator()
-                                    response = _dg_payload(
-                                        msg_type="interim",
-                                        original=transcript,
-                                        translations={d: "" for d in translate_dests},
-                                        error="translation_failed",
-                                        timing={"translate_ms": 0},
-                                    )
-                            else:
-                                response = _dg_payload(
-                                    msg_type="interim",
-                                    original=transcript,
-                                    translations={d: "" for d in translate_dests},
-                                    timing={"translate_ms": 0},
-                                )
-                         
-                        await _send_browser(response)
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        if not stop_event.is_set():
-                            logging.error(f"Chyba při zpracování výsledku: {str(e)}")
-            
-            # Spustit task pro zpracování výsledků
-            process_task = asyncio.create_task(process_results())
-            
-            # Přijímání audio dat z prohlížeče
-            # Created once, not per frame: audio arrives ~30x/s and a fresh pair of
-            # tasks each time is pure churn.
-            upstream_stop_task = asyncio.create_task(async_stop_event.wait())
-            try:
-                if first_audio:
-                    await asyncio.to_thread(dg_socket.send_media, first_audio)
-                while not stop_event.is_set():
-                    receive_task = asyncio.create_task(websocket.receive())
-                    done, pending = await asyncio.wait(
-                        {receive_task, upstream_stop_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if upstream_stop_task in done:
-                        # Consume the frame's result too when both finished in the
-                        # same turn, or its exception is never retrieved.
-                        if receive_task in done:
-                            receive_task.exception()
-                        else:
-                            receive_task.cancel()
-                            await asyncio.gather(receive_task, return_exceptions=True)
-                        break
-                    msg = receive_task.result()
-                    if msg.get("type") == "websocket.disconnect":
-                        break
-                    if msg.get("type") != "websocket.receive":
-                        continue
-                    data = msg.get("bytes")
-                    if data:
-                        await asyncio.to_thread(dg_socket.send_media, data)
-            except (WebSocketDisconnect, EndOfStream):
-                logging.info("Klient odpojen")
-            finally:
-                upstream_stop_task.cancel()
-                await asyncio.gather(upstream_stop_task, return_exceptions=True)
-                stop_event.set()
-                async_stop_event.set()
-                try:
-                    await asyncio.to_thread(_deepgram_send_finalize, dg_socket)
-                    await asyncio.to_thread(_deepgram_send_close_stream, dg_socket)
-                except Exception as e:
-                    logging.warning(f"Deepgram close selhal: {e}")
-                if listen_thread is not None:
-                    await asyncio.to_thread(listen_thread.join, 1.0)
-
-                # Let the processor drain queued results after finalize.
-                shutdown_deadline = time.monotonic() + 1.5
-                if process_task:
-                    try:
-                        await asyncio.wait_for(process_task, timeout=2.0)
-                    except asyncio.TimeoutError:
-                        process_task.cancel()
-                        try:
-                            await process_task
-                        except asyncio.CancelledError:
-                            pass
-    
-    except (WebSocketDisconnect, EndOfStream):
-        logging.info("Deepgram WebSocket odpojen klientem.")
-    except Exception as e:
-        # Generic code to the browser, detail to the log: an unexpected exception
-        # here is a bug or a config problem, and its message can carry paths and
-        # SDK internals. Vendor-sent errors keep their text (see on_error).
-        logging.exception("Deepgram chyba: %s", e)
-        try:
-            await _send_browser({"error": "server_error"})
-        except Exception as send_err:
-            logging.debug(f"Nelze poslat Deepgram error: {send_err}")
-    finally:
-        await router.aclose()
-
-
-@app.websocket("/ws/elevenlabs")
-async def elevenlabs_websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for ElevenLabs Scribe v2 Realtime STT.
-    Receives PCM audio from the browser, proxies it to the ElevenLabs
-    realtime WS, translates transcripts and sends them back.
-    """
-    if not await _require_ws_auth(websocket):
-        return
-    if not await _require_ws_engine(websocket, "elevenlabs"):
-        return
-
-    await websocket.accept()
-    logging.info("WebSocket /ws/elevenlabs připojen")
-
-    if not ELEVENLABS_API_KEY:
-        logging.error("ELEVENLABS_API_KEY není nastaven")
-        await websocket.send_json({"error": "ELEVENLABS_API_KEY not configured"})
-        await websocket.close()
-        return
-
-    # Session defaults.
-    translate_src = "cs"
-    translate_dests: list[str] = ["en", "ru"]
-    translate_interim = True
-    translate_provider = "auto"
-    el_language_code = ""
-    el_commit_strategy = "vad"
-
-    # Read optional config message (first message may be JSON config or audio).
-    first_audio: bytes | None = None
-    try:
-        first = await websocket.receive()
-        if first.get("type") == "websocket.receive":
-            if first.get("text"):
-                try:
-                    cfg = json.loads(first["text"])
-                except Exception:
-                    cfg = None
-
-                if isinstance(cfg, dict) and cfg.get("type") == "config":
-                    el_cfg = cfg.get("elevenlabs")
-                    if isinstance(el_cfg, dict):
-                        lang = el_cfg.get("language_code")
-                        if isinstance(lang, str) and lang.strip():
-                            el_language_code = lang.strip()
-                        strategy = el_cfg.get("commit_strategy")
-                        if isinstance(strategy, str) and strategy in {"vad", "manual"}:
-                            el_commit_strategy = strategy
-
-                    tr_cfg = cfg.get("translate")
-                    if isinstance(tr_cfg, dict):
-                        src_norm = _normalize_lang_code(tr_cfg.get("src"))
-                        if src_norm:
-                            translate_src = src_norm
-
-                        dests_norm = _normalize_translate_dests(tr_cfg.get("dests"))
-                        if dests_norm:
-                            translate_dests = dests_norm
-
-                        provider_norm = _normalize_translate_provider(tr_cfg.get("provider"))
-                        if provider_norm:
-                            translate_provider = provider_norm
-
-                    if isinstance(cfg.get("translate_interim"), bool):
-                        translate_interim = cfg["translate_interim"]
-            elif first.get("bytes"):
-                first_audio = first["bytes"]
-        elif first.get("type") == "websocket.disconnect":
-            return
-    except (WebSocketDisconnect, EndOfStream):
-        return
-
-    if len(translate_dests) == 2 and translate_dests[0] == translate_dests[1]:
-        translate_dests[1] = "ru" if translate_dests[0] != "ru" else "en"
-
-    # Build ElevenLabs WS URL with encoded query parameters.
-    el_params = {
-        "model_id": "scribe_v2_realtime",
-        "audio_format": "pcm_16000",
-        "sample_rate": "16000",
-        "commit_strategy": el_commit_strategy,
-    }
-    if el_language_code:
-        el_params["language_code"] = el_language_code
-    if el_commit_strategy == "vad":
-        el_params["vad_silence_threshold_secs"] = "1.5"
-    el_ws_url = f"{ELEVENLABS_WS_URL}?{urlencode(el_params)}"
-
-    def _el_payload(
-        *,
-        msg_type: str,
-        original: str,
-        translations: dict[str, str],
-        error: str | None = None,
-        timing: dict[str, int] | None = None,
-        provider: str | None = None,
-    ) -> dict:
-        payload: dict = {
-            "type": msg_type,
-            "original": original,
-            "dests": translate_dests,
-            "translations": translations,
-        }
-        if timing:
-            payload["timing"] = timing
-        if provider:
-            payload["provider"] = provider
-        if error:
-            payload["error"] = error
-        return payload
-
-    el_ws = None
-    stop_event = asyncio.Event()
-    transcript_inbox = LatestInterimQueue()
-    browser_send_lock = asyncio.Lock()
-
-    async def _send_browser(payload: dict) -> None:
-        async with browser_send_lock:
-            await websocket.send_json(payload)
-
-    session = TranslationSession(
-        transcript_inbox,
-        _send_browser,
-        log_label="ElevenLabs translation error",
-        provider=translate_provider,
+    connection = async_client.live.connect(
+        model=TRANSCRIBE_MODEL, config=live_transcription_config()
     )
+    google_session = await asyncio.wait_for(
+        connection.__aenter__(), timeout=_GOOGLE_SETUP_TIMEOUT_SECONDS
+    )
+    try:
+        yield google_session
+    except BaseException as exc:
+        suppressed = await asyncio.wait_for(
+            connection.__aexit__(type(exc), exc, exc.__traceback__),
+            timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS,
+        )
+        if not suppressed:
+            raise
+    else:
+        await asyncio.wait_for(
+            connection.__aexit__(None, None, None),
+            timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS,
+        )
+
+
+async def _receive_browser_audio(websocket: WebSocket, google_session: object) -> bool:
+    """Forward fixed-format audio. Return True for a deliberate Stop."""
+
+    limiter = _AudioRateLimiter()
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return False
+
+        audio = message.get("bytes")
+        if audio is not None:
+            if not audio or len(audio) % 2:
+                raise _ClientProtocolError(1003, "Invalid PCM frame", "invalid_audio")
+            if len(audio) > MAX_AUDIO_CHUNK_BYTES:
+                raise _ClientProtocolError(
+                    1009, "Audio frame too large", "audio_too_large"
+                )
+            if not limiter.consume(len(audio)):
+                raise _ClientProtocolError(
+                    1008, "Audio sent faster than realtime", "audio_rate_exceeded"
+                )
+            await google_session.send_realtime_input(
+                audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
+            )
+            continue
+
+        raw = message.get("text")
+        try:
+            control = json.loads(raw) if isinstance(raw, str) else None
+        except json.JSONDecodeError:
+            control = None
+        if control == {"type": "stop"}:
+            return True
+        raise _ClientProtocolError(
+            1003, "Unsupported client message", "invalid_message"
+        )
+
+
+async def _receive_google_transcripts(
+    google_session: object,
+    coordinator: TranslationCoordinator,
+    stop_requested: asyncio.Event,
+    final_after_stop: asyncio.Event,
+) -> None:
+    # AsyncSession.receive() ends after every model turn, so reconnect the
+    # iterator while keeping the same Live session open.
+    while True:
+        received = False
+        async for message in google_session.receive():
+            received = True
+            event = transcript_from_message(message)
+            if event is None:
+                continue
+            kind, text = event
+            coordinator.submit(kind, text)
+            if kind == "final" and stop_requested.is_set():
+                final_after_stop.set()
+        if stop_requested.is_set() and final_after_stop.is_set():
+            return
+        if not received:
+            raise RuntimeError("Google Live session ended without a response")
+
+
+async def _cancel_tasks(*tasks: asyncio.Task[object] | None) -> None:
+    selected = [task for task in tasks if task is not None]
+    active = [task for task in selected if not task.done()]
+    for task in active:
+        task.cancel()
+    if selected:
+        await asyncio.gather(*selected, return_exceptions=True)
+
+
+async def _close_google_session(google_session: object) -> None:
+    close = getattr(google_session, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            await asyncio.wait_for(close(), timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS)
+
+
+async def _drain_translations(
+    coordinator: TranslationCoordinator, translation_task: asyncio.Task[None]
+) -> None:
+    # close() discards only the speculative interim. Accepted finals remain in
+    # the bounded FIFO and therefore have a finite worst-case drain time.
+    coordinator.close()
+    await asyncio.wait_for(translation_task, timeout=_FINAL_DRAIN_SECONDS)
+
+
+async def _serve_audio_session(websocket: WebSocket, sender: _JsonSender) -> None:
+    client = _create_google_client()
+    async_client = client.aio
+    coordinator: TranslationCoordinator | None = None
+    browser_task: asyncio.Task[bool] | None = None
+    google_task: asyncio.Task[None] | None = None
+    translation_task: asyncio.Task[None] | None = None
+    limit_task: asyncio.Task[None] | None = None
 
     try:
-        el_ws = await ws_lib.connect(
-            el_ws_url,
-            additional_headers={"xi-api-key": ELEVENLABS_API_KEY},
-        )
-        logging.info("ElevenLabs Scribe WS připojeno")
-
-        # Wait for session_started before forwarding audio.
-        session_msg_raw = await asyncio.wait_for(el_ws.recv(), timeout=10)
-        session_msg = json.loads(session_msg_raw)
-        logging.info(f"ElevenLabs session started: {session_msg.get('session_id', '')}")
-
-        async def _forward_audio():
-            """Read PCM audio from browser WS and forward to ElevenLabs as base64."""
-            try:
-                if first_audio:
-                    audio_b64 = base64.b64encode(first_audio).decode("ascii")
-                    await el_ws.send(json.dumps({
-                        "message_type": "input_audio_chunk",
-                        "audio_base_64": audio_b64,
-                        "commit": False,
-                        "sample_rate": 16000,
-                    }))
-
-                while not stop_event.is_set():
-                    msg = await websocket.receive()
-                    if msg.get("type") == "websocket.disconnect":
-                        break
-                    if msg.get("type") != "websocket.receive":
-                        continue
-
-                    data = msg.get("bytes")
-                    if data:
-                        audio_b64 = base64.b64encode(data).decode("ascii")
-                        await el_ws.send(json.dumps({
-                            "message_type": "input_audio_chunk",
-                            "audio_base_64": audio_b64,
-                            "commit": False,
-                            "sample_rate": 16000,
-                        }))
-                    elif msg.get("text"):
-                        # Client may send JSON commands (e.g. commit).
-                        try:
-                            cmd = json.loads(msg["text"])
-                            if isinstance(cmd, dict) and cmd.get("type") == "commit":
-                                await el_ws.send(json.dumps({
-                                    "message_type": "input_audio_chunk",
-                                    "audio_base_64": "",
-                                    "commit": True,
-                                    "sample_rate": 16000,
-                                }))
-                            elif isinstance(cmd, dict) and cmd.get("type") == "ping":
-                                await _send_browser({"type": "pong"})
-                        except Exception:
-                            pass
-            except (WebSocketDisconnect, EndOfStream):
-                logging.info("ElevenLabs: klient odpojen")
-            except Exception as e:
-                logging.error(f"ElevenLabs forward_audio error: {e}")
-            finally:
-                stop_event.set()
-
-        async def _receive_transcripts():
-            """Read upstream continuously and enqueue translation outside this loop."""
-            try:
-                async for raw in el_ws:
-                    if stop_event.is_set():
-                        break
-                    try:
-                        ev = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    msg_type = ev.get("message_type", "")
-
-                    if msg_type == "partial_transcript":
-                        text = ev.get("text", "").strip()
-                        if not text:
-                            continue
-                        if translate_interim:
-                            session.supersede_interim()
-                            transcript_inbox.put(
-                                TranslationWork(
-                                    text=text,
-                                    msg_type="interim",
-                                    src=translate_src,
-                                    dests=list(translate_dests),
-                                )
-                            )
-                        else:
-                            await _send_browser(
-                                _el_payload(
-                                    msg_type="interim",
-                                    original=text,
-                                    translations={d: "" for d in translate_dests},
-                                    timing={"translate_ms": 0},
-                                )
-                            )
-
-                    elif msg_type in ("committed_transcript", "committed_transcript_with_timestamps"):
-                        text = ev.get("text", "").strip()
-                        if not text:
-                            continue
-                        session.supersede_interim()
-                        accepted = transcript_inbox.put(
-                            TranslationWork(
-                                text=text,
-                                msg_type="final",
-                                src=translate_src,
-                                dests=list(translate_dests),
-                            )
-                        )
-                        if not accepted:
-                            await _send_browser({"error": "translation_queue_full"})
-                            break
-
-                    elif msg_type in ELEVENLABS_FATAL_ERRORS or msg_type in ELEVENLABS_TRANSIENT_ERRORS:
-                        error_msg = ev.get("error", ev.get("message", str(ev)))
-                        fatal = msg_type in ELEVENLABS_FATAL_ERRORS
-                        logging.error(f"ElevenLabs error ({msg_type}, fatal={fatal}): {error_msg}")
-                        payload = {"error": f"ElevenLabs: {error_msg}"}
-                        if not fatal:
-                            payload["type"] = "warning"  # keeps the browser session alive
-                        await _send_browser(payload)
-                        if fatal:
-                            break
-
-            except Exception as e:
-                if not stop_event.is_set():
-                    logging.error(f"ElevenLabs receive_transcripts error: {e}")
-            finally:
-                transcript_inbox.close()
-                stop_event.set()
-
-        # Keep reading upstream while translation runs independently. If upstream
-        # closes, drain already-queued finals before tearing down the browser socket.
-        forward_task = asyncio.create_task(_forward_audio())
-        receive_task = asyncio.create_task(_receive_transcripts())
-        translate_task = asyncio.create_task(session.run())
-
-        done, pending_io = await asyncio.wait(
-            {forward_task, receive_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        upstream_finished = receive_task in done and forward_task not in done
-        stop_event.set()
-        for task in pending_io:
-            task.cancel()
-        await asyncio.gather(*pending_io, return_exceptions=True)
-
-        if upstream_finished:
-            try:
-                await asyncio.wait_for(
-                    translate_task,
-                    timeout=TRANSLATE_TIMEOUT_SECONDS + 1,
+        async with _connect_google_live(async_client) as google_session:
+            stop_requested = asyncio.Event()
+            final_after_stop = asyncio.Event()
+            coordinator = TranslationCoordinator(
+                GeminiPairTranslator(async_client), sender.send
+            )
+            translation_task = asyncio.create_task(coordinator.run())
+            google_task = asyncio.create_task(
+                _receive_google_transcripts(
+                    google_session, coordinator, stop_requested, final_after_stop
                 )
-            except asyncio.TimeoutError:
-                translate_task.cancel()
-        else:
-            translate_task.cancel()
-        await asyncio.gather(translate_task, return_exceptions=True)
+            )
+            browser_task = asyncio.create_task(
+                _receive_browser_audio(websocket, google_session)
+            )
+            limit_task = asyncio.create_task(asyncio.sleep(_SESSION_MAX_SECONDS))
 
-    except (WebSocketDisconnect, EndOfStream):
-        logging.info("ElevenLabs WebSocket odpojen klientem.")
-    except Exception as e:
-        # Same reasoning as /ws/deepgram: generic code out, detail to the log.
-        logging.exception("ElevenLabs chyba: %s", e)
-        try:
-            await websocket.send_json({"error": "server_error"})
-        except Exception as send_err:
-            logging.debug(f"Nelze poslat ElevenLabs error: {send_err}")
+            await sender.send({"type": "ready"})
+            done, _ = await asyncio.wait(
+                {browser_task, google_task, translation_task, limit_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # On an upstream/queue failure, stop buying audio first, then drain
+            # every final already accepted before surfacing the terminal error.
+            if google_task in done:
+                try:
+                    google_task.result()
+                except BaseException as exc:
+                    terminal_error = exc
+                else:
+                    terminal_error = RuntimeError(
+                        "Google Live session ended unexpectedly"
+                    )
+                google_task = None
+                await _cancel_tasks(browser_task, limit_task)
+                browser_task = None
+                limit_task = None
+                reported_error = await _report_terminal_error(sender, terminal_error)
+                await _close_google_session(google_session)
+                await _drain_translations(coordinator, translation_task)
+                translation_task = None
+                raise reported_error from terminal_error
+            if translation_task in done:
+                translation_task.result()
+                raise RuntimeError("translation actor ended unexpectedly")
+
+            deliberate_stop = False
+            if browser_task in done:
+                try:
+                    deliberate_stop = browser_task.result()
+                except BaseException as exc:
+                    await _cancel_tasks(google_task, limit_task)
+                    google_task = None
+                    limit_task = None
+                    reported_error = await _report_terminal_error(sender, exc)
+                    await _close_google_session(google_session)
+                    await _drain_translations(coordinator, translation_task)
+                    translation_task = None
+                    raise reported_error from exc
+                if not deliberate_stop:
+                    return
+            elif limit_task in done:
+                await sender.send(
+                    {"type": "error", "code": "session_limit", "recoverable": True}
+                )
+                # No audio may follow audio_stream_end.  The user-triggered
+                # Stop path has already completed this task; the timed path has
+                # to stop it explicitly before finalizing Google.
+                await _cancel_tasks(browser_task)
+                browser_task = None
+                deliberate_stop = True
+
+            if deliberate_stop:
+                stop_requested.set()
+                upstream_error: BaseException | None = None
+                try:
+                    await google_session.send_realtime_input(audio_stream_end=True)
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            final_after_stop.wait(),
+                            timeout=_FINAL_TRANSCRIPT_GRACE_SECONDS,
+                        )
+                    # A final and turn-complete can arrive in separate frames.
+                    await asyncio.sleep(0.10)
+                except Exception as exc:
+                    upstream_error = exc
+
+                if google_task is not None:
+                    if not google_task.done():
+                        google_task.cancel()
+                    result = (
+                        await asyncio.gather(google_task, return_exceptions=True)
+                    )[0]
+                    if (
+                        isinstance(result, BaseException)
+                        and not isinstance(result, asyncio.CancelledError)
+                        and upstream_error is None
+                    ):
+                        upstream_error = result
+                google_task = None
+
+                await _close_google_session(google_session)
+                await _drain_translations(coordinator, translation_task)
+                translation_task = None
+                if upstream_error is not None:
+                    raise upstream_error
+                await sender.send({"type": "ended"})
+                await websocket.close(code=1000, reason="Finished")
     finally:
-        transcript_inbox.close()
-        await session.aclose()
-        if el_ws:
-            try:
-                await el_ws.close()
-            except Exception:
-                pass
+        if coordinator is not None:
+            coordinator.close()
+        await _cancel_tasks(browser_task, google_task, translation_task, limit_task)
+        with suppress(Exception):
+            await asyncio.wait_for(
+                async_client.aclose(), timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS
+            )
+
+
+def _status_code_from_google_error(exc: BaseException) -> int | None:
+    value = getattr(exc, "code", None)
+    if isinstance(value, int):
+        return value
+    value = getattr(exc, "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+async def _best_effort_error(
+    sender: _JsonSender, code: str, *, recoverable: bool = False
+) -> None:
+    with suppress(Exception):
+        await sender.send({"type": "error", "code": code, "recoverable": recoverable})
+
+
+async def _report_terminal_error(
+    sender: _JsonSender, exc: BaseException
+) -> _ReportedSessionError:
+    """Tell the UI to release its microphone before final translations drain."""
+
+    if isinstance(exc, asyncio.CancelledError):
+        raise exc
+    if isinstance(exc, _ClientProtocolError):
+        code = exc.error_code
+        recoverable = False
+        close_code = exc.close_code
+        reason = exc.reason
+    elif isinstance(exc, TranslationBacklogFull):
+        code = "translation_backlog_full"
+        recoverable = False
+        close_code = 1013
+        reason = "Try again later"
+    elif isinstance(exc, errors.APIError):
+        status = _status_code_from_google_error(exc)
+        if status == 429:
+            code = "google_rate_limited"
+            close_code = 1013
+            reason = "Google rate limited"
+        else:
+            logger.warning("Google API session failed (status=%s)", status)
+            code = "google_unavailable"
+            close_code = 1011
+            reason = "Google unavailable"
+        recoverable = True
+    elif isinstance(exc, asyncio.TimeoutError):
+        code = "google_timeout"
+        recoverable = True
+        close_code = 1011
+        reason = "Google timeout"
+    else:
+        logger.error(
+            "Audio translation session failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        code = "session_failed"
+        recoverable = True
+        close_code = 1011
+        reason = "Session failed"
+
+    await _best_effort_error(sender, code, recoverable=recoverable)
+    return _ReportedSessionError(close_code, reason)
+
+
+async def _best_effort_close(websocket: WebSocket, code: int, reason: str) -> None:
+    with suppress(Exception):
+        await websocket.close(code=code, reason=reason)
+
+
+@app.websocket("/ws/audio")
+async def audio_websocket(websocket: WebSocket):
+    if not await _require_ws_auth(websocket):
+        return
+    if configuration_errors():
+        await websocket.close(code=1011, reason="Server not configured")
+        return
+
+    slot_acquired = _audio_session_slots.acquire(blocking=False)
+    if not slot_acquired:
+        await websocket.accept()
+        sender = _JsonSender(websocket)
+        await _best_effort_error(sender, "server_busy", recoverable=True)
+        await _best_effort_close(websocket, 1013, "Server busy")
+        return
+    try:
+        # accept() is inside the slot's finally scope: an aborted handshake must
+        # not permanently consume one of the fixed paid-session slots.
+        await websocket.accept()
+        sender = _JsonSender(websocket)
+        try:
+            await _serve_audio_session(websocket, sender)
+        except WebSocketDisconnect:
+            return
+        except _ReportedSessionError as exc:
+            # Its JSON error was sent before the possibly long final drain.
+            await _best_effort_close(websocket, exc.close_code, exc.reason)
+        except _ClientProtocolError as exc:
+            await _best_effort_error(sender, exc.error_code)
+            await _best_effort_close(websocket, exc.close_code, exc.reason)
+        except TranslationBacklogFull:
+            await _best_effort_error(sender, "translation_backlog_full")
+            await _best_effort_close(websocket, 1013, "Try again later")
+        except errors.APIError as exc:
+            status = _status_code_from_google_error(exc)
+            if status == 429:
+                await _best_effort_error(
+                    sender, "google_rate_limited", recoverable=True
+                )
+                await _best_effort_close(websocket, 1013, "Google rate limited")
+            else:
+                logger.warning("Google API session failed (status=%s)", status)
+                await _best_effort_error(sender, "google_unavailable", recoverable=True)
+                await _best_effort_close(websocket, 1011, "Google unavailable")
+        except asyncio.TimeoutError:
+            await _best_effort_error(sender, "google_timeout", recoverable=True)
+            await _best_effort_close(websocket, 1011, "Google timeout")
+        except Exception:
+            logger.exception("Audio translation session failed")
+            await _best_effort_error(sender, "session_failed", recoverable=True)
+            await _best_effort_close(websocket, 1011, "Session failed")
+    finally:
+        _audio_session_slots.release()

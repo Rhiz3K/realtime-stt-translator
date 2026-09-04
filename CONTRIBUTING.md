@@ -1,248 +1,76 @@
-# Contributing to Live Translator
+# Contributing
 
-Thank you for considering contributing to Live Translator! This document explains how to set up your development environment, the conventions we follow, and how to submit changes.
+Thanks for improving the Czech live translator. Please keep this branch's
+single-purpose architecture intact: one microphone, one Google STT pipeline,
+and one atomic English/Russian result.
 
-## Table of Contents
+## Setup
 
-- [Code of Conduct](#code-of-conduct)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Development Setup](#development-setup)
-- [Development Workflow](#development-workflow)
-  - [Branch Naming](#branch-naming)
-  - [Making Changes](#making-changes)
-  - [Running Tests](#running-tests)
-  - [Linting and Formatting](#linting-and-formatting)
-- [Code Style](#code-style)
-  - [Python](#python)
-  - [FastAPI / WebSocket Patterns](#fastapi--websocket-patterns)
-  - [Async Code](#async-code)
-  - [Templates / Frontend](#templates--frontend)
-- [Commit Messages](#commit-messages)
-- [Pull Requests](#pull-requests)
-- [Reporting Bugs](#reporting-bugs)
-- [Requesting Features](#requesting-features)
-- [Security Vulnerabilities](#security-vulnerabilities)
-
----
-
-## Code of Conduct
-
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you agree to uphold this code. Report unacceptable behavior to the maintainers.
-
-## Getting Started
-
-### Prerequisites
-
-- **Python 3.10+** (the codebase uses `X | None` union syntax)
-- **Git**
-- A microphone-capable browser for manual testing (Chrome or Edge recommended)
-
-### Development Setup
+Requirements are Python 3.10+, Git, and a microphone-capable browser.
 
 ```bash
-# Fork and clone the repository
-git clone https://github.com/<your-username>/sr_live-translator.git
-cd sr_live-translator
-
-# Create a virtual environment
+git clone https://github.com/<your-username>/realtime-stt-translator.git
+cd realtime-stt-translator
 python -m venv .venv
-source .venv/bin/activate   # Linux/macOS
-# .venv\Scripts\activate    # Windows
-
-# Install runtime + dev dependencies
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-
-# Set up environment
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
 cp .env.example .env
-# Edit .env — set at least APP_PASSWORD
-```
-
-Verify everything works:
-
-```bash
-# Run the test suite
+# Set GEMINI_API_KEY and APP_PASSWORD in .env.
 pytest
-
-# Quick syntax check
-python -m compileall app tests
-
-# Start the dev server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## Development Workflow
-
-### Branch Naming
-
-Use descriptive branch names with a category prefix:
-
-```
-feat/add-deepl-translation
-fix/websocket-reconnect-loop
-docs/update-api-reference
-refactor/extract-audio-worklet
-test/elevenlabs-happy-path
-```
-
-### Making Changes
-
-1. Create a branch from `main`:
-   ```bash
-   git checkout -b feat/your-feature main
-   ```
-2. Make your changes in small, focused commits.
-3. Run the test suite and fix any failures before pushing.
-4. Push your branch and open a pull request.
-
-### Running Tests
+Useful checks:
 
 ```bash
-# Run all tests (quick, quiet output — configured in pytest.ini)
-pytest
-
-# Verbose output
 pytest -vv
-
-# Run a single test file
 pytest tests/test_main.py
-
-# Run a specific test by name
-pytest tests/test_main.py::test_ws_translates_text
-
-# Run tests matching a substring
-pytest -k translate
-
-# Run with coverage
+pytest -k interim
 pytest --cov=app --cov-report=term-missing
+python -m compileall app tests
 ```
 
-**Deepgram tests:** these drive a real SDK listener thread, which reaches the event loop through separate `call_soon_threadsafe` callbacks — so a test that asserts a fixed interim-before-final ordering is a scheduling coin flip. The old happy-path test did that and looked like a hang (it waited forever for an interim that had been coalesced away); it now reads until the final arrives. Write new Deepgram tests order-agnostically, and run them under `timeout` while iterating on Deepgram code.
+No formatter is pinned. If available locally, use `ruff check .`,
+`ruff format .`, and `mypy app`; avoid unrelated reformatting.
 
-### Linting and Formatting
+## Architecture rules
 
-No linter is pinned in the project yet. If you have them installed:
+- `/ws/audio` accepts binary PCM16 mono audio plus only `{"type":"stop"}`.
+- Audio, language, models, throttling, and destinations are fixed internal
+  decisions—not environment variables or client configuration.
+- Every translation result includes both `en` and `ru` in one JSON message.
+- Keep at most one in-flight interim snapshot and one newest pending interim;
+  committed finals pre-empt interim work, stay ordered, and are never dropped.
+- Tests mock the Google SDK and must never use paid network calls.
+- Keep API keys, auth cookies, passwords, and transcript text out of logs.
 
-```bash
-# Ruff (recommended)
-ruff check .
-ruff format .
+The backend is async: do not block the event loop, apply timeouts to external
+calls, and explicitly cancel/drain tasks on every shutdown path. WebSockets
+must validate authentication and Origin before `accept()` and use structured,
+sanitized errors.
 
-# mypy (optional — expect some noise from googletrans/deepgram typing)
-mypy app
+Frontend content must be inserted with `textContent` or `createTextNode`, never
+`innerHTML`. Preserve semantic HTML, accessible labels, `role=status`, and the
+English/Russian `lang` attributes.
+
+## Workflow
+
+Use a descriptive branch and focused commits. Commit messages follow
+[Conventional Commits](https://www.conventionalcommits.org/), for example:
+
+```text
+feat(audio): improve fixed pcm resampling
+fix(ws): preserve final after superseded interim
+test(google): cover live session rollover
 ```
 
-Keep formatting changes minimal and local. Avoid sending PRs that reformat entire files without functional changes.
+Before opening a pull request:
 
-## Code Style
+- run the full tests and compile check;
+- document any new operational environment variable;
+- include tests for protocol or scheduling changes;
+- confirm no credentials or captured audio entered the diff;
+- explain any change to the fixed model/cost choices.
 
-### Python
-
-- **Naming:** `snake_case` for functions/variables, `PascalCase` for classes, `UPPER_SNAKE_CASE` for constants. Use a leading underscore for internal helpers (`_translate`, `_sign`).
-- **Imports:** Group with blank lines between: stdlib, third-party, local.
-- **Strings:** Prefer f-strings over `str.format()`.
-- **Type hints:** Use `X | None` union syntax (Python 3.10+). Add explicit return types for non-trivial helpers. Use `TypedDict` for JSON payload shapes.
-- **Error handling:** Prefer specific exceptions. Use broad `except Exception` only at outer boundaries (WebSocket loops, optional imports, translation calls).
-- **Logging:** Log actionable context. Never log secrets (passwords, API keys, auth tokens).
-
-### FastAPI / WebSocket Patterns
-
-- Keep route handlers small; push logic into helper functions.
-- WebSocket endpoints must:
-  1. Validate auth and origin **before** calling `accept()`.
-  2. Send structured JSON errors (`{"error": "..."}`) when possible.
-  3. Close with appropriate codes (`1008` for policy/unauthorized, `1011` for server error).
-- Treat `send`/`close` failures as best-effort (wrap in try/except).
-
-### Async Code
-
-- **Never block the event loop.** If a library call is sync-only, offload with `asyncio.to_thread(...)`.
-- Apply timeouts with `asyncio.wait_for(...)`.
-- When receiving events from other threads, use `loop.call_soon_threadsafe(...)`.
-- Catch `asyncio.CancelledError` during shutdown paths.
-
-### Templates / Frontend
-
-- Templates are Jinja HTML (`app/templates/*.html`) with inline CSS and inline JS.
-- Keep accessibility attributes (ARIA labels, roles, skip links).
-- Avoid large formatting-only diffs in HTML/CSS/JS.
-- Use `textContent` / `createTextNode` instead of `innerHTML` to prevent XSS.
-- Wrap all `JSON.parse` calls in try/catch in WebSocket `onmessage` handlers.
-
-## Commit Messages
-
-We use [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-<type>(<scope>): <short description>
-
-<optional body>
-```
-
-**Types:**
-
-| Type | When to use |
-|---|---|
-| `feat` | New feature |
-| `fix` | Bug fix |
-| `perf` | Performance improvement |
-| `refactor` | Code change that neither fixes a bug nor adds a feature |
-| `docs` | Documentation only |
-| `test` | Adding or updating tests |
-| `chore` | Build process, CI, dependencies |
-| `style` | Formatting, whitespace (no logic change) |
-
-**Examples:**
-
-```
-feat(stt): add ElevenLabs Scribe v2 Realtime engine
-fix(ws): prevent stale interim translations from blocking finals
-docs: add CONTRIBUTING.md and issue templates
-perf: throttle interim translations to prevent queue buildup
-```
-
-- Keep the first line under 72 characters.
-- Use the imperative mood ("add", not "added" or "adds").
-- Reference issues when applicable: `Fixes #42`.
-
-## Pull Requests
-
-1. **One concern per PR.** Don't mix features, bug fixes, and refactors in the same PR.
-2. **Write a clear description.** Explain *what* changed and *why*.
-3. **Include tests** for new functionality or bug fixes when feasible.
-4. **Ensure tests pass** before requesting review.
-5. **Keep diffs minimal.** Avoid unrelated formatting changes.
-
-### PR Checklist
-
-Before submitting, verify:
-
-- [ ] Tests pass (`pytest`)
-- [ ] No syntax errors (`python -m compileall app tests`)
-- [ ] Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) format
-- [ ] New environment variables are documented in `.env.example`
-- [ ] No secrets or credentials in the diff
-- [ ] Breaking changes are clearly noted in the PR description
-
-## Reporting Bugs
-
-Open a [Bug Report](../../issues/new?template=bug_report.yml) and include:
-
-- Steps to reproduce
-- Expected vs. actual behavior
-- Browser, OS, and Python version
-- STT engine in use
-- Relevant log output (redact any API keys)
-
-## Requesting Features
-
-Open a [Feature Request](../../issues/new?template=feature_request.yml) and describe:
-
-- The problem you're trying to solve
-- Your proposed solution
-- Any alternatives you've considered
-
-## Security Vulnerabilities
-
-**Do not open a public issue for security vulnerabilities.** See [SECURITY.md](SECURITY.md) for responsible disclosure instructions.
+Report security issues privately through GitHub's vulnerability reporting or a
+draft security advisory rather than a public issue. See `SECURITY.md`.
