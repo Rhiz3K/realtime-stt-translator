@@ -21,19 +21,6 @@ body:
         - label: This is not a security vulnerability
           required: true
 
-  - type: dropdown
-    attributes:
-      label: STT engine
-      description: Which engine were you using when the issue occurred?
-      options:
-        - Web Speech API
-        - Deepgram (server)
-        - ElevenLabs (server)
-        - ElevenLabs (browser)
-        - Not sure / Other
-    validations:
-      required: true
-
   - type: input
     attributes:
       label: Version / commit

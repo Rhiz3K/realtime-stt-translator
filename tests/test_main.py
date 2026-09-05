@@ -30,6 +30,7 @@ class FakeGoogleSession:
         self.sent = []
         self.turns = asyncio.Queue()
         self.closed = False
+        self.eof_on_stop = True
 
     async def send_realtime_input(self, **kwargs):
         self.sent.append(kwargs)
@@ -37,10 +38,14 @@ class FakeGoogleSession:
             await self.turns.put([_event(interim="ahoj")])
         if kwargs.get("audio_stream_end"):
             await self.turns.put([_event(final="ahoj", turn_complete=True)])
+            if self.eof_on_stop:
+                await self.turns.put(main.errors.APIError(1000, "Normal closure"))
 
     def receive(self):
         async def one_turn():
             turn = await self.turns.get()
+            if isinstance(turn, BaseException):
+                raise turn
             for item in turn:
                 yield item
 
@@ -84,8 +89,12 @@ class FakeModels:
         self.owner.translation_calls.append(kwargs)
         if self.owner.translation_release is not None:
             self.owner.translation_started.set()
-            while not self.owner.translation_release.is_set():
-                await asyncio.sleep(0.001)
+            try:
+                while not self.owner.translation_release.is_set():
+                    await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                self.owner.translation_cancelled.set()
+                raise
         text = kwargs["contents"]
         return SimpleNamespace(parsed={"en": f"EN:{text}", "ru": f"RU:{text}"})
 
@@ -112,6 +121,7 @@ class FakeGoogleClient:
         self.connect_hangs = connect_hangs
         self.exit_hangs = exit_hangs
         self.translation_started = threading.Event()
+        self.translation_cancelled = threading.Event()
         self.translation_release = None
         self.aio = FakeAsyncClient(self)
 
@@ -583,7 +593,7 @@ def test_receive_loop_reopens_sdk_iterator_for_multiple_turns():
         coordinator = Coordinator()
         with pytest.raises(RuntimeError, match="test complete"):
             await main._receive_google_transcripts(
-                Session(), coordinator, asyncio.Event(), asyncio.Event()
+                Session(), coordinator, asyncio.Event()
             )
         return coordinator.values
 
@@ -625,3 +635,227 @@ def test_session_limit_stops_input_before_stream_end_and_drains_final(
         assert websocket.receive_json() == {"type": "ended"}
 
     assert fake.session.sent == [{"audio_stream_end": True}]
+
+
+class StopSequenceSession(FakeGoogleSession):
+    """Finals in distinct SDK turns, with controllable delays and stream EOF."""
+
+    def __init__(self, results, *, eof=True):
+        super().__init__()
+        self.results = iter(results)
+        self.eof = eof
+        self.end_sent = asyncio.Event()
+
+    async def send_realtime_input(self, **kwargs):
+        self.sent.append(kwargs)
+        if kwargs.get("audio_stream_end"):
+            self.end_sent.set()
+
+    def receive(self):
+        async def turn():
+            await self.end_sent.wait()
+            item = next(self.results, None)
+            if item is None:
+                if self.eof:
+                    raise main.errors.APIError(1000, "Normal closure")
+                await asyncio.Event().wait()
+            delay, text = item
+            await asyncio.sleep(delay)
+            yield _event(final=text, turn_complete=True)
+
+        return turn()
+
+
+@pytest.mark.parametrize("delay", [0.01, 2.75])
+def test_stop_receives_earlier_and_last_final_across_sdk_turns(google_client, delay):
+    client, fake = google_client
+    fake.session = StopSequenceSession(
+        [(0, "předchozí věta"), (delay, "poslední věta")]
+    )
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        websocket.send_json({"type": "stop"})
+        assert websocket.receive_json() == {
+            "type": "final",
+            "en": "EN:předchozí věta",
+            "ru": "RU:předchozí věta",
+        }
+        assert websocket.receive_json() == {
+            "type": "final",
+            "en": "EN:poslední věta",
+            "ru": "RU:poslední věta",
+        }
+        assert websocket.receive_json() == {"type": "ended"}
+        with pytest.raises(WebSocketDisconnect) as closed:
+            websocket.receive_json()
+    assert closed.value.code == 1000
+    assert fake.closed_event.wait(1)
+
+
+@pytest.mark.parametrize("results", [[], [(0, "dřívější final")]])
+def test_stop_timeout_never_claims_complete_even_after_a_final(
+    google_client, monkeypatch, results
+):
+    client, fake = google_client
+    fake.session = StopSequenceSession(results, eof=False)
+    monkeypatch.setattr(main, "_FINAL_TRANSCRIPT_GRACE_SECONDS", 0.05)
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        websocket.send_json({"type": "stop"})
+        received = []
+        with pytest.raises(WebSocketDisconnect) as closed:
+            while True:
+                received.append(websocket.receive_json())
+    assert [r["type"] for r in received] == ["final"] * len(results) + ["error"]
+    assert received[-1]["code"] == "transcription_incomplete"
+    assert closed.value.code == 1011
+    assert fake.closed_event.wait(1)
+
+
+class ObservedSlots:
+    def __init__(self):
+        self.semaphore = threading.BoundedSemaphore(1)
+        self.released = threading.Event()
+
+    def acquire(self, *, blocking):
+        return self.semaphore.acquire(blocking=blocking)
+
+    def release(self):
+        self.semaphore.release()
+        self.released.set()
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_blocked_stream_end_releases_handler_and_paid_slot(
+    google_client, monkeypatch, disconnect
+):
+    client, fake = google_client
+    entered = threading.Event()
+
+    async def blocked_end(**kwargs):
+        assert kwargs == {"audio_stream_end": True}
+        entered.set()
+        await asyncio.Event().wait()
+
+    fake.session.send_realtime_input = blocked_end
+    slots = ObservedSlots()
+    monkeypatch.setattr(main, "_audio_session_slots", slots)
+    monkeypatch.setattr(main, "_GOOGLE_SEND_TIMEOUT_SECONDS", 0.05)
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        websocket.send_json({"type": "stop"})
+        assert entered.wait(1)
+        if disconnect:
+            websocket.close()
+        else:
+            assert websocket.receive_json()["code"] == "google_timeout"
+            with pytest.raises(WebSocketDisconnect) as closed:
+                websocket.receive_json()
+            assert closed.value.code == 1011
+        assert fake.closed_event.wait(1)
+        assert slots.released.wait(1)
+    assert fake.session.closed
+
+
+@pytest.mark.parametrize("trigger", ["stop", "session_limit", "upstream"])
+@pytest.mark.parametrize("slow_close", [False, True])
+def test_disconnect_during_final_drain_cancels_paid_request_without_retry(
+    google_client, monkeypatch, trigger, slow_close
+):
+    client, fake = google_client
+    fake.translation_release = threading.Event()
+    fake.exit_hangs = slow_close
+    monkeypatch.setattr(main, "_GOOGLE_CLOSE_TIMEOUT_SECONDS", 0.3)
+    slots = ObservedSlots()
+    monkeypatch.setattr(main, "_audio_session_slots", slots)
+    if trigger == "session_limit":
+        monkeypatch.setattr(main, "_SESSION_MAX_SECONDS", 0.01)
+    if trigger == "upstream":
+
+        class FailedSession(FakeGoogleSession):
+            def receive(self):
+                async def turn():
+                    yield _event(final="přijatý text", turn_complete=True)
+                    raise ValueError("provider failure")
+
+                return turn()
+
+        fake.session = FailedSession()
+
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        if trigger == "stop":
+            websocket.send_json({"type": "stop"})
+        else:
+            assert websocket.receive_json()["type"] == "error"
+        assert fake.translation_started.wait(1)
+        websocket.close()
+        # Cancellation must not wait for a stalled connection.__aexit__().
+        assert fake.translation_cancelled.wait(0.15)
+        assert fake.closed_event.wait(1)
+        assert slots.released.wait(1)
+    assert len(fake.translation_calls) == 1
+
+
+def test_shutdown_deadline_cancels_final_drain_and_releases_slot(
+    google_client, monkeypatch
+):
+    client, fake = google_client
+    fake.translation_release = threading.Event()
+    slots = ObservedSlots()
+    monkeypatch.setattr(main, "_audio_session_slots", slots)
+    monkeypatch.setattr(main, "_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        websocket.send_json({"type": "stop"})
+        assert fake.translation_started.wait(1)
+        assert websocket.receive_json()["code"] == "google_timeout"
+        with pytest.raises(WebSocketDisconnect):
+            websocket.receive_json()
+        assert fake.translation_cancelled.wait(1)
+        assert slots.released.wait(1)
+
+
+@pytest.mark.parametrize("phase", ["setup", "receive"])
+def test_provider_exception_payload_and_chain_never_enter_logs(
+    google_client, caplog, phase
+):
+    client, fake = google_client
+    marker = "PRIVATE_TRANSCRIPT_NEVER_LOG"
+    failure = ValueError(f"Failed to parse response: {marker}")
+    failure.__cause__ = RuntimeError(f"raw payload: {marker}")
+    if phase == "setup":
+        fake.connect_error = failure
+    else:
+
+        class FailedSession(FakeGoogleSession):
+            def receive(self):
+                async def turn():
+                    raise failure
+                    yield  # pragma: no cover
+
+                return turn()
+
+        fake.session = FailedSession()
+    with caplog.at_level("ERROR", logger="realtime_translator"):
+        with client.websocket_connect(
+            "/ws/audio", headers={"origin": "http://testserver"}
+        ) as websocket:
+            if phase == "receive":
+                assert websocket.receive_json() == {"type": "ready"}
+            assert websocket.receive_json()["code"] == "session_failed"
+            with pytest.raises(WebSocketDisconnect):
+                websocket.receive_json()
+    assert "ValueError" in caplog.text
+    assert marker not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)

@@ -53,8 +53,9 @@ python -m compileall app tests
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Python 3.10+ is required. No linter or formatter is pinned. Keep edits local;
-if available, `ruff check .` and `ruff format .` are suitable.
+Use Python 3.12, matching production and CI, and Node.js 24 for frontend tests.
+Other Python versions are not covered by CI. No linter or formatter is pinned.
+Keep edits local; if available, `ruff check .` and `ruff format .` are suitable.
 
 ## Invariants
 
@@ -69,6 +70,14 @@ if available, `ruff check .` and `ruff format .` are suitable.
   timeout (including HTTP 408), 429, or 5xx response.
 - Google SDK `AsyncSession.receive()` ends at each `turn_complete`; call it
   repeatedly for a continuous session.
+- Stop must not treat the first final or turn completion as a stream flush.
+  Keep receiving until upstream EOF or the bounded deadline; a timeout emits
+  `transcription_incomplete`, never a successful `ended`.
+- Keep exactly one browser reader alive during shutdown. Disconnect cancels
+  paid requests before closing upstream transports. Bound stream-end sends.
+- Bind worklet callbacks and Stop timers to a session generation/socket;
+  close the port on cleanup and cap the browser's queued audio at 16 000 B.
+- Failed finals leave permanent history warnings. Reset clears interim only.
 - Live Transcribe sessions last at most ten minutes; the app finishes at 9:45
   with a recoverable `session_limit` event.
 - Insert browser content with `textContent`, never `innerHTML`.

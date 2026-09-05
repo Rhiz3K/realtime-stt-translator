@@ -95,6 +95,7 @@
 
   .result { padding: 12px; }
   .result .pair { border: 0; }
+  .result-error { padding: 20px; color: var(--danger); border: 1px solid currentColor; }
 
   @media (max-width: 720px) {
     .hero { grid-template-columns: 1fr; align-items: start; }
@@ -166,6 +167,9 @@
   const liveRu = document.getElementById("live-ru");
   const history = document.getElementById("history");
   const resultTemplate = document.getElementById("result-template");
+  // Half a second of PCM. Abort explicitly before latency can grow into
+  // seconds or a recovered connection can exceed the server's burst limit.
+  const MAX_BUFFERED_AUDIO_BYTES = 16000;
 
   let socket = null;
   let mediaStream = null;
@@ -202,13 +206,31 @@
       google_timeout: "Google neodpověděl včas.",
       google_unavailable: "Google překlad je dočasně nedostupný.",
       translation_failed: "Jeden konečný překlad se nepodařilo vytvořit.",
+      transcription_incomplete: "Úplnost závěru řeči se nepodařilo potvrdit. Překlad může být neúplný.",
+      audio_backpressure: "Síť nestíhá přenášet zvuk. Relace byla zastavena; závěr může chybět.",
       translation_backlog_full: "Překlad nestíhá přijímanou řeč. Spusťte novou relaci.",
-      session_limit: "Relace dosáhla časového limitu. Můžete ihned spustit novou.",
+      session_limit: "Relace dosáhla časového limitu. Po dokončení překladů spusťte novou.",
       audio_unavailable: "Tento prohlížeč neumí bezpečně zpracovat mikrofon.",
       session_failed: "Relace byla přerušena. Zkuste ji spustit znovu."
     };
     errorShown = true;
-    setStatus(messages[code] || "Překlad se nepodařilo dokončit.", "error");
+    const message = messages[code] || "Překlad se nepodařilo dokončit.";
+    setStatus(message, "error");
+    if (["translation_failed", "transcription_incomplete", "audio_backpressure"].includes(code)) {
+      const gap = document.createElement("article");
+      gap.className = "panel result result-error";
+      gap.dataset.code = code;
+      gap.setAttribute("role", "status");
+      gap.textContent = message;
+      history.append(gap);
+      clearInterim();
+    }
+  }
+
+  function clearInterim() {
+    liveEn.textContent = "";
+    liveRu.textContent = "";
+    livePanel.hidden = true;
   }
 
   function renderInterim(en, ru) {
@@ -222,34 +244,44 @@
     fragment.querySelector(".result-en").textContent = en;
     fragment.querySelector(".result-ru").textContent = ru;
     history.append(fragment);
-    liveEn.textContent = "";
-    liveRu.textContent = "";
-    livePanel.hidden = true;
+    clearInterim();
   }
 
   async function releaseAudio() {
     if (sourceNode) sourceNode.disconnect();
-    if (captureNode) captureNode.disconnect();
+    if (captureNode) {
+      captureNode.port.onmessage = null;
+      captureNode.port.close();
+      captureNode.disconnect();
+    }
     if (silentGain) silentGain.disconnect();
     sourceNode = null;
     captureNode = null;
     silentGain = null;
     if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
     mediaStream = null;
-    if (audioContext && audioContext.state !== "closed") {
-      try { await audioContext.close(); } catch (_) { /* already closing */ }
-    }
+    const closingContext = audioContext;
     audioContext = null;
+    if (closingContext && closingContext.state !== "closed") {
+      try { await closingContext.close(); } catch (_) { /* already closing */ }
+    }
   }
 
   async function reset(closeSocket = true) {
+    const resetGeneration = ++generation;
     clearTimeout(flushTimer);
     flushTimer = null;
-    await releaseAudio();
-    if (closeSocket && socket && socket.readyState < WebSocket.CLOSING) {
-      socket.close(1000, "Client reset");
-    }
+    const closingSocket = socket;
     socket = null;
+    stopping = true;
+    setButton(false, true);
+    clearInterim();
+    const released = releaseAudio();
+    if (closeSocket && closingSocket && closingSocket.readyState < WebSocket.CLOSING) {
+      closingSocket.close(1000, "Client reset");
+    }
+    await released;
+    if (resetGeneration !== generation) return;
     running = false;
     starting = false;
     stopping = false;
@@ -258,40 +290,61 @@
     if (!errorShown) setStatus("Připraveno");
   }
 
-  function sendStop() {
-    if (stopSent) return;
+  function abortCongestedSession(run, activeSocket) {
+    if (run !== generation || socket !== activeSocket || stopSent) return;
+    showError("audio_backpressure");
+    stopSent = true;
+    const released = reset(false);
+    activeSocket.close(4000, "Audio network backlog");
+    void released;
+  }
+
+  function sendStop(run, activeSocket) {
+    if (run !== generation || socket !== activeSocket || stopSent) return;
+    if (activeSocket.bufferedAmount > MAX_BUFFERED_AUDIO_BYTES) {
+      abortCongestedSession(run, activeSocket);
+      return;
+    }
     stopSent = true;
     clearTimeout(flushTimer);
     flushTimer = null;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({type: "stop"}));
+    if (activeSocket.readyState === WebSocket.OPEN) {
+      activeSocket.send(JSON.stringify({type: "stop"}));
     } else {
       void reset();
     }
   }
 
   async function beginCapture(run) {
-    if (run !== generation || stopping) return;
+    if (run !== generation || stopping || captureNode) return;
     if (!audioContext || !mediaStream) throw new Error("Audio capture is not ready.");
-    if (run !== generation || stopping) return;
+    const activeSocket = socket;
+    const activeContext = audioContext;
 
     sourceNode = audioContext.createMediaStreamSource(mediaStream);
     captureNode = new AudioWorkletNode(audioContext, "pcm16-capture");
+    const activeCapture = captureNode;
     silentGain = audioContext.createGain();
     silentGain.gain.value = 0;
     captureNode.port.onmessage = (event) => {
+      if (run !== generation || socket !== activeSocket || captureNode !== activeCapture) return;
       if (event.data instanceof ArrayBuffer) {
-        if (socket && socket.readyState === WebSocket.OPEN && !stopSent) {
-          socket.send(event.data);
+        if (activeSocket.readyState === WebSocket.OPEN && !stopSent) {
+          if (activeSocket.bufferedAmount + event.data.byteLength > MAX_BUFFERED_AUDIO_BYTES) {
+            abortCongestedSession(run, activeSocket);
+            return;
+          }
+          activeSocket.send(event.data);
         }
-      } else if (event.data && event.data.type === "flushed") {
-        sendStop();
+      } else if (event.data && event.data.type === "flushed" && stopping) {
+        sendStop(run, activeSocket);
       }
     };
     sourceNode.connect(captureNode);
     captureNode.connect(silentGain);
     silentGain.connect(audioContext.destination);
-    if (audioContext.state !== "running") await audioContext.resume();
+    if (activeContext.state !== "running") await activeContext.resume();
+    if (run !== generation || socket !== activeSocket || stopping) return;
     running = true;
     starting = false;
     setButton(true, false);
@@ -303,6 +356,7 @@
     const run = ++generation;
     starting = true;
     errorShown = false;
+    clearInterim();
     setButton(false, true);
     setStatus("Čekám na mikrofon…");
     try {
@@ -357,7 +411,6 @@
           try { await beginCapture(run); }
           catch (error) {
             if (run !== generation || socket !== activeSocket) return;
-            console.error(error);
             showError("audio_unavailable");
             await reset();
           }
@@ -375,6 +428,9 @@
           showError(message.code);
           if (message.code !== "translation_failed") {
             stopping = true;
+            stopSent = true;
+            clearTimeout(flushTimer);
+            flushTimer = null;
             setButton(running, true);
             await releaseAudio();
           }
@@ -393,7 +449,6 @@
     } catch (error) {
       if (run !== generation) return;
       generation += 1;
-      console.error(error);
       errorShown = true;
       setStatus("Mikrofon není dostupný nebo nebyl povolen.", "error");
       await reset();
@@ -408,6 +463,8 @@
       return;
     }
     if (!running) return;
+    const run = generation;
+    const activeSocket = socket;
     stopping = true;
     setButton(true, true);
     setStatus("Dokončuji překlad…");
@@ -416,10 +473,10 @@
     if (captureNode) {
       // Port delivery can stall with a suspended worklet. Never leave a paid
       // Google session running just because the flush acknowledgement vanished.
-      flushTimer = setTimeout(sendStop, 250);
+      flushTimer = setTimeout(() => sendStop(run, activeSocket), 250);
       captureNode.port.postMessage({type: "flush"});
     } else {
-      sendStop();
+      sendStop(run, activeSocket);
     }
   }
 

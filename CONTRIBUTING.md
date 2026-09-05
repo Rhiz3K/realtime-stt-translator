@@ -6,7 +6,9 @@ and one atomic English/Russian result.
 
 ## Setup
 
-Requirements are Python 3.10+, Git, and a microphone-capable browser.
+Use Python 3.12 (the production and CI runtime), Node.js 24 for frontend
+regressions, Git, and a microphone-capable browser. Other Python versions are
+not part of the supported CI matrix.
 
 ```bash
 git clone https://github.com/<your-username>/realtime-stt-translator.git
@@ -28,6 +30,7 @@ pytest tests/test_main.py
 pytest -k interim
 pytest --cov=app --cov-report=term-missing
 python -m compileall app tests
+node --test tests/frontend-runtime.test.cjs
 ```
 
 No formatter is pinned. If available locally, use `ruff check .`,

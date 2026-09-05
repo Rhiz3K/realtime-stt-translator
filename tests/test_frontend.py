@@ -3,6 +3,8 @@ import re
 import shutil
 import subprocess
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
@@ -33,7 +35,7 @@ def test_pair_rendering_is_atomic_and_uses_text_content():
 
 def test_stop_flushes_audio_before_sending_control_message():
     flush_at = INDEX.index('captureNode.port.postMessage({type: "flush"})')
-    stop_function_at = INDEX.index("function sendStop()")
+    stop_function_at = INDEX.index("function sendStop(run, activeSocket)")
     assert stop_function_at < flush_at
     assert 'event.data.type === "flushed"' in INDEX
     assert INDEX.count('JSON.stringify({type: "stop"})') == 1
@@ -72,3 +74,17 @@ def test_worklet_javascript_parses_when_node_is_available():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_frontend_session_runtime_regressions():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required for browser API runtime regression tests")
+    result = subprocess.run(
+        [node, "--test", str(ROOT / "tests/frontend-runtime.test.cjs")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -6,6 +6,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** this branch now has one fixed Czech microphone → Google Live
+  Transcribe → atomic English/Russian Flash-Lite pipeline. Removed alternate
+  engines, browser Web Speech, text translation, language/model selectors, and
+  user-configurable audio buffering. See README for the supported env vars.
+- Production/CI runtime documentation consistently targets Python 3.12;
+  frontend regression tests use Node.js 24 without npm dependencies.
+
+### Fixed
+
+- Preserve multiple and delayed final transcripts after Stop; report an
+  unconfirmed input tail explicitly instead of falsely declaring success.
+- Bound stream-end sends and shutdown, release paid session slots on timeout,
+  and cancel paid requests promptly when the browser disconnects during drain.
+- Isolate worklet callbacks and fallback timers between sessions; stop visibly
+  if the network cannot keep up with the fixed PCM stream.
+- Retain missing-final warnings in history, clear stale interim text on reset,
+  and omit upstream exception payloads and chained tracebacks from logs.
+
 ## [1.1.0] - 2026-06-09
 
 ### Added

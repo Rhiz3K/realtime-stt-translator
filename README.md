@@ -24,7 +24,11 @@ mikrofon (PCM16, mono, 16 kHz)
 - Rychle se měnící interim hypotézy se slučují na jeden průběžný požadavek a
   jednu nejnovější čekající hodnotu; finální překlady mají vždy přednost.
 - Server přijímá audio nejvýše rychlostí reálného času a současně povolí čtyři
-  placené audio relace; tím omezuje škodu způsobenou vadným klientem.
+  placené audio relace **na proces**. Také limiter přihlášení je lokální procesu;
+  více workerů nebo replik násobí limity. Pro společný limit je nutná externí
+  koordinace; výchozí Docker spouští jeden worker.
+- Přenosová fronta prohlížeče má pevný limit 16 000 B (0,5 s PCM). Pokud síť
+  nestíhá, mikrofon se zastaví a v historii zůstane upozornění na možnou mezeru.
 - Audio se neukládá a STT probíhá výhradně v Google API.
 
 ## Cena a limit relace
@@ -41,13 +45,30 @@ Textová část bývá proti ceně audia malá, ale její přesná cena závisí
 řeči a počtu změn interim přepisu. Aktuální ceny vždy ověřte v
 [oficiálním ceníku Gemini API](https://ai.google.dev/gemini-api/docs/pricing).
 
-Google omezuje jednu Live Transcribe session na **10 minut**. Server proto relaci
-řízeně ukončí po 9 minutách a 45 sekundách, nechá doběhnout poslední final a v UI
-umožní okamžitě spustit novou relaci.
+Google omezuje jednu Live Transcribe session na **10 minut**. Server proto po
+9 minutách a 45 sekundách zastaví vstup a zahájí dokončování. Novou relaci lze
+spustit po uzavření té předchozí.
+
+Stop není potvrzení poslední promluvy. Odeslání `audio_stream_end` má timeout
+2 s a server potom přijímá výsledky napříč všemi tahy až 5 s, nikoli pouze do
+prvního finalu. [Live Transcribe](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)
+nedokumentuje potvrzení zpracování všech odeslaných vzorků. Pokud Google po Stop
+spojení sám řádně neukončí, aplikace po uplynutí této lhůty ohlásí
+`transcription_incomplete`, dokončí již přijaté finální překlady a uzavře spojení
+kódem 1011. Neodešle úspěšné `ended`. Toto upozornění tedy může přijít i tehdy,
+když se poslední překlad zobrazil; úplnost nelze potvrdit pouhým tichem nebo
+jedním finalem.
+
+Odpojení prohlížeče ruší rozpracované placené požadavky i během dokončování,
+bez dalšího retry. Ukončování má navíc celkový deadline zahrnující odeslání Stop,
+příjem a maximální dobu dokončení omezené fronty finalů. Chybějící finální
+překlad zůstává označený v historii i po dalších úspěšných výsledcích; při nové
+relaci se čistí pouze spekulativní interim, nikoli historie.
 
 ## Spuštění
 
-Požadavky: Python 3.12 a Google Gemini API klíč.
+Produkční a CI runtime: Python 3.12. Dále je potřeba Google Gemini API klíč;
+pro kompletní vývojové testy také Node.js 24 (bez npm závislostí).
 
 ```bash
 python -m venv .venv
@@ -115,6 +136,10 @@ Chyby mají stabilní kód bez detailů nebo API klíče:
 {"type":"error","code":"google_unavailable","recoverable":true}
 ```
 
+Po terminální chybě mohou dříve přijaté finaly ještě doběhnout před uzavřením.
+`translation_failed` označuje jeden chybějící final
+a relaci neukončuje. `transcription_incomplete` označuje neověřený konec vstupu.
+
 ## Docker
 
 ```bash
@@ -135,10 +160,13 @@ Za reverzní proxy povolte WebSocket upgrade, používejte HTTPS a správně nas
 python -m compileall app tests
 pytest
 pytest --cov=app --cov-report=term-missing
+node --test tests/frontend-runtime.test.cjs
 pip-audit -r requirements.txt
 docker build --check .
 docker build .
 ```
 
-CI provádí audit runtime závislostí, pytest, validaci Dockerfile a sestavení
-produkčního obrazu.
+CI provádí audit runtime závislostí, pytest (včetně Node regresí nad skutečným
+inline skriptem s náhradami browser API), validaci Dockerfile a sestavení
+produkčního obrazu. Tyto testy nevolají placené Google API a nenahrazují ověření
+skutečného mikrofonu a sítě v prohlížeči.

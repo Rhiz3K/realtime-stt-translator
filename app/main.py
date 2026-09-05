@@ -107,10 +107,18 @@ _login_attempts_lock = threading.Lock()
 _SESSION_MAX_SECONDS = 9 * 60 + 45
 _GOOGLE_SETUP_TIMEOUT_SECONDS = 15.0
 _GOOGLE_CLOSE_TIMEOUT_SECONDS = 2.0
-_FINAL_TRANSCRIPT_GRACE_SECONDS = 2.5
+_GOOGLE_SEND_TIMEOUT_SECONDS = 2.0
+_FINAL_TRANSCRIPT_GRACE_SECONDS = 5.0
 _FINAL_DRAIN_SECONDS = (MAX_FINAL_BACKLOG + 1) * (
     (2 * FINAL_TIMEOUT_SECONDS) + 0.25
 ) + 1
+_SHUTDOWN_TIMEOUT_SECONDS = (
+    _GOOGLE_SEND_TIMEOUT_SECONDS * 2
+    + _FINAL_TRANSCRIPT_GRACE_SECONDS
+    + _GOOGLE_CLOSE_TIMEOUT_SECONDS
+    + _FINAL_DRAIN_SECONDS
+    + 5.0
+)
 _AUDIO_BYTES_PER_SECOND = 16_000 * 2
 _AUDIO_BURST_BYTES = _AUDIO_BYTES_PER_SECOND * 2
 _MAX_CONCURRENT_AUDIO_SESSIONS = 4
@@ -452,6 +460,10 @@ class _ReportedSessionError(RuntimeError):
         self.reason = reason
 
 
+class _TranscriptionIncomplete(RuntimeError):
+    """The provider did not confirm completion before the finalization deadline."""
+
+
 class _AudioRateLimiter:
     """Bound paid audio bytes to realtime with a two-second jitter allowance."""
 
@@ -503,14 +515,23 @@ async def _connect_google_live(async_client: object):
         )
 
 
-async def _receive_browser_audio(websocket: WebSocket, google_session: object) -> bool:
-    """Forward fixed-format audio. Return True for a deliberate Stop."""
+async def _receive_browser_audio(
+    websocket: WebSocket,
+    google_session: object,
+    stop_requested: asyncio.Event,
+    send_lock: asyncio.Lock,
+) -> None:
+    """The sole browser reader; keep watching disconnect after Stop."""
 
     limiter = _AudioRateLimiter()
     while True:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
-            return False
+            return
+        if stop_requested.is_set():
+            # The server has told the client to stop. Do not buy more audio,
+            # but keep consuming until disconnect while accepted finals drain.
+            continue
 
         audio = message.get("bytes")
         if audio is not None:
@@ -524,9 +545,14 @@ async def _receive_browser_audio(websocket: WebSocket, google_session: object) -
                 raise _ClientProtocolError(
                     1008, "Audio sent faster than realtime", "audio_rate_exceeded"
                 )
-            await google_session.send_realtime_input(
-                audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
-            )
+            async with send_lock:
+                if not stop_requested.is_set():
+                    await asyncio.wait_for(
+                        google_session.send_realtime_input(
+                            audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
+                        ),
+                        timeout=_GOOGLE_SEND_TIMEOUT_SECONDS,
+                    )
             continue
 
         raw = message.get("text")
@@ -535,7 +561,8 @@ async def _receive_browser_audio(websocket: WebSocket, google_session: object) -
         except json.JSONDecodeError:
             control = None
         if control == {"type": "stop"}:
-            return True
+            stop_requested.set()
+            continue
         raise _ClientProtocolError(
             1003, "Unsupported client message", "invalid_message"
         )
@@ -545,25 +572,35 @@ async def _receive_google_transcripts(
     google_session: object,
     coordinator: TranslationCoordinator,
     stop_requested: asyncio.Event,
-    final_after_stop: asyncio.Event,
 ) -> None:
     # AsyncSession.receive() ends after every model turn, so reconnect the
     # iterator while keeping the same Live session open.
     while True:
         received = False
-        async for message in google_session.receive():
-            received = True
-            event = transcript_from_message(message)
-            if event is None:
-                continue
-            kind, text = event
-            coordinator.submit(kind, text)
-            if kind == "final" and stop_requested.is_set():
-                final_after_stop.set()
-        if stop_requested.is_set() and final_after_stop.is_set():
-            return
+        try:
+            async for message in google_session.receive():
+                received = True
+                event = transcript_from_message(message)
+                if event is not None:
+                    kind, text = event
+                    # Finals from earlier turns can arrive after Stop. Neither
+                    # input_transcription.finished nor turn_complete is a flush
+                    # acknowledgement for all audio sent to this connection.
+                    if kind == "final" or not stop_requested.is_set():
+                        coordinator.submit(kind, text)
+        except errors.APIError as exc:
+            # SDK translates a normal WebSocket EOF into APIError(1000).
+            if stop_requested.is_set() and _status_code_from_google_error(exc) == 1000:
+                return
+            raise
         if not received:
             raise RuntimeError("Google Live session ended without a response")
+
+
+async def _watch_browser_disconnect(websocket: WebSocket) -> None:
+    """Replace a failed reader only after it has finished, never concurrently."""
+    while (await websocket.receive())["type"] != "websocket.disconnect":
+        pass
 
 
 async def _cancel_tasks(*tasks: asyncio.Task[object] | None) -> None:
@@ -591,129 +628,170 @@ async def _drain_translations(
     await asyncio.wait_for(translation_task, timeout=_FINAL_DRAIN_SECONDS)
 
 
+async def _end_google_input(google_session: object, send_lock: asyncio.Lock) -> None:
+    # Serialize against an audio frame already in flight when a server-side
+    # limit fires. The enclosing timeout includes waiting for that frame.
+    async with send_lock:
+        await google_session.send_realtime_input(audio_stream_end=True)
+
+
+async def _finish_audio_session(
+    websocket: WebSocket,
+    sender: _JsonSender,
+    google_session: object,
+    google_task: asyncio.Task[None],
+    coordinator: TranslationCoordinator,
+    translation_task: asyncio.Task[None],
+    send_lock: asyncio.Lock,
+    terminal_error: Exception | None,
+) -> None:
+    if terminal_error is None:
+        try:
+            await asyncio.wait_for(
+                _end_google_input(google_session, send_lock),
+                timeout=_GOOGLE_SEND_TIMEOUT_SECONDS,
+            )
+            try:
+                # Keep reading across ALL turns. There is no documented
+                # stream-end acknowledgement in Live Transcribe. A final,
+                # turn_complete, or a quiet period cannot prove a full flush.
+                await asyncio.wait_for(
+                    asyncio.shield(google_task),
+                    timeout=_FINAL_TRANSCRIPT_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise _TranscriptionIncomplete() from exc
+        except Exception as exc:
+            terminal_error = exc
+
+    await _cancel_tasks(google_task)
+    # Close before any network await, so speculative work cannot be emitted
+    # after a terminal error, while every accepted final remains in the FIFO.
+    coordinator.close()
+    reported_error = (
+        await _report_terminal_error(sender, terminal_error)
+        if terminal_error is not None
+        else None
+    )
+    await _close_google_session(google_session)
+    await _drain_translations(coordinator, translation_task)
+    if reported_error is not None:
+        raise reported_error from None
+    await sender.send({"type": "ended"})
+    await websocket.close(code=1000, reason="Finished")
+
+
 async def _serve_audio_session(websocket: WebSocket, sender: _JsonSender) -> None:
     client = _create_google_client()
     async_client = client.aio
     coordinator: TranslationCoordinator | None = None
-    browser_task: asyncio.Task[bool] | None = None
+    browser_task: asyncio.Task[None] | None = None
     google_task: asyncio.Task[None] | None = None
     translation_task: asyncio.Task[None] | None = None
     limit_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[bool] | None = None
+    finish_task: asyncio.Task[None] | None = None
 
     try:
         async with _connect_google_live(async_client) as google_session:
             stop_requested = asyncio.Event()
-            final_after_stop = asyncio.Event()
+            send_lock = asyncio.Lock()
             coordinator = TranslationCoordinator(
                 GeminiPairTranslator(async_client), sender.send
             )
             translation_task = asyncio.create_task(coordinator.run())
             google_task = asyncio.create_task(
-                _receive_google_transcripts(
-                    google_session, coordinator, stop_requested, final_after_stop
-                )
+                _receive_google_transcripts(google_session, coordinator, stop_requested)
             )
             browser_task = asyncio.create_task(
-                _receive_browser_audio(websocket, google_session)
+                _receive_browser_audio(
+                    websocket, google_session, stop_requested, send_lock
+                )
             )
             limit_task = asyncio.create_task(asyncio.sleep(_SESSION_MAX_SECONDS))
+            stop_task = asyncio.create_task(stop_requested.wait())
 
             await sender.send({"type": "ready"})
             done, _ = await asyncio.wait(
-                {browser_task, google_task, translation_task, limit_task},
+                {browser_task, google_task, translation_task, limit_task, stop_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # On an upstream/queue failure, stop buying audio first, then drain
-            # every final already accepted before surfacing the terminal error.
-            if google_task in done:
+            terminal_error: Exception | None = None
+            if browser_task in done:
                 try:
-                    google_task.result()
-                except BaseException as exc:
+                    browser_task.result()
+                except Exception as exc:
                     terminal_error = exc
-                else:
-                    terminal_error = RuntimeError(
-                        "Google Live session ended unexpectedly"
+                    # The original reader has finished. This is now the sole
+                    # reader, including throughout finalization and drain.
+                    browser_task = asyncio.create_task(
+                        _watch_browser_disconnect(websocket)
                     )
-                google_task = None
-                await _cancel_tasks(browser_task, limit_task)
-                browser_task = None
-                limit_task = None
-                reported_error = await _report_terminal_error(sender, terminal_error)
-                await _close_google_session(google_session)
-                await _drain_translations(coordinator, translation_task)
-                translation_task = None
-                raise reported_error from terminal_error
+                else:
+                    # Cancel paid work BEFORE the connection context tries to
+                    # close its transport (that close can itself take seconds).
+                    coordinator.close()
+                    await _cancel_tasks(
+                        google_task, translation_task, limit_task, stop_task
+                    )
+                    return
+
             if translation_task in done:
                 translation_task.result()
                 raise RuntimeError("translation actor ended unexpectedly")
-
-            deliberate_stop = False
-            if browser_task in done:
+            if google_task in done:
                 try:
-                    deliberate_stop = browser_task.result()
-                except BaseException as exc:
-                    await _cancel_tasks(google_task, limit_task)
-                    google_task = None
-                    limit_task = None
-                    reported_error = await _report_terminal_error(sender, exc)
-                    await _close_google_session(google_session)
-                    await _drain_translations(coordinator, translation_task)
-                    translation_task = None
-                    raise reported_error from exc
-                if not deliberate_stop:
-                    return
-            elif limit_task in done:
+                    google_task.result()
+                except Exception as exc:
+                    terminal_error = terminal_error or exc
+                else:
+                    terminal_error = terminal_error or RuntimeError(
+                        "Google Live session ended unexpectedly"
+                    )
+
+            stop_requested.set()
+            if limit_task in done:
                 await sender.send(
                     {"type": "error", "code": "session_limit", "recoverable": True}
                 )
-                # No audio may follow audio_stream_end.  The user-triggered
-                # Stop path has already completed this task; the timed path has
-                # to stop it explicitly before finalizing Google.
-                await _cancel_tasks(browser_task)
-                browser_task = None
-                deliberate_stop = True
-
-            if deliberate_stop:
-                stop_requested.set()
-                upstream_error: BaseException | None = None
-                try:
-                    await google_session.send_realtime_input(audio_stream_end=True)
-                    with suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(
-                            final_after_stop.wait(),
-                            timeout=_FINAL_TRANSCRIPT_GRACE_SECONDS,
-                        )
-                    # A final and turn-complete can arrive in separate frames.
-                    await asyncio.sleep(0.10)
-                except Exception as exc:
-                    upstream_error = exc
-
-                if google_task is not None:
-                    if not google_task.done():
-                        google_task.cancel()
-                    result = (
-                        await asyncio.gather(google_task, return_exceptions=True)
-                    )[0]
-                    if (
-                        isinstance(result, BaseException)
-                        and not isinstance(result, asyncio.CancelledError)
-                        and upstream_error is None
-                    ):
-                        upstream_error = result
-                google_task = None
-
-                await _close_google_session(google_session)
-                await _drain_translations(coordinator, translation_task)
-                translation_task = None
-                if upstream_error is not None:
-                    raise upstream_error
-                await sender.send({"type": "ended"})
-                await websocket.close(code=1000, reason="Finished")
+            await _cancel_tasks(limit_task, stop_task)
+            finish_task = asyncio.create_task(
+                asyncio.wait_for(
+                    _finish_audio_session(
+                        websocket,
+                        sender,
+                        google_session,
+                        google_task,
+                        coordinator,
+                        translation_task,
+                        send_lock,
+                        terminal_error,
+                    ),
+                    timeout=_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            )
+            done, _ = await asyncio.wait(
+                {finish_task, browser_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if browser_task in done:
+                browser_task.result()
+                coordinator.close()
+                await _cancel_tasks(finish_task, google_task, translation_task)
+                return
+            finish_task.result()
     finally:
         if coordinator is not None:
             coordinator.close()
-        await _cancel_tasks(browser_task, google_task, translation_task, limit_task)
+        await _cancel_tasks(
+            browser_task,
+            google_task,
+            translation_task,
+            limit_task,
+            stop_task,
+            finish_task,
+        )
         with suppress(Exception):
             await asyncio.wait_for(
                 async_client.aclose(), timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS
@@ -752,6 +830,11 @@ async def _report_terminal_error(
         recoverable = False
         close_code = 1013
         reason = "Try again later"
+    elif isinstance(exc, _TranscriptionIncomplete):
+        code = "transcription_incomplete"
+        recoverable = True
+        close_code = 1011
+        reason = "Transcription completion unconfirmed"
     elif isinstance(exc, errors.APIError):
         status = _status_code_from_google_error(exc)
         if status == 429:
@@ -770,10 +853,9 @@ async def _report_terminal_error(
         close_code = 1011
         reason = "Google timeout"
     else:
-        logger.error(
-            "Audio translation session failed",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
+        # SDK exception messages and chained tracebacks can contain raw server
+        # responses, including transcripts. Log only the exception's class.
+        logger.error("Audio translation session failed (type=%s)", type(exc).__name__)
         code = "session_failed"
         recoverable = True
         close_code = 1011
@@ -835,8 +917,10 @@ async def audio_websocket(websocket: WebSocket):
         except asyncio.TimeoutError:
             await _best_effort_error(sender, "google_timeout", recoverable=True)
             await _best_effort_close(websocket, 1011, "Google timeout")
-        except Exception:
-            logger.exception("Audio translation session failed")
+        except Exception as exc:
+            logger.error(
+                "Audio translation session failed (type=%s)", type(exc).__name__
+            )
             await _best_effort_error(sender, "session_failed", recoverable=True)
             await _best_effort_close(websocket, 1011, "Session failed")
     finally:
