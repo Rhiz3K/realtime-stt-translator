@@ -14,24 +14,26 @@
   {% include 'components/toolbar.html' %}
   <div class="workspace">
     <div class="workspace__heading">
-      <h2>Dokončené překlady <span id="history-count">0</span></h2>
-      <span>Oba jazyky vždy společně. Žádné nastavování.</span>
+      <div class="language-headings">
+        <h2 id="language-en-heading" lang="en">EN</h2>
+        <h2 id="language-ru-heading" lang="ru">RU</h2>
+      </div>
+      <span id="history-count" class="sr-only">0</span>
       <p id="presentation-notice" class="presentation-notice" role="status" hidden></p>
     </div>
-    <div id="history-scroll" class="history-scroll" tabindex="0" role="region" aria-label="Historie překladu">
-      <div id="history-empty" class="empty-state"><p>Mluvte česky. Čtěte anglicky i rusky.</p><small>Spusťte mikrofon. Průběžný překlad uvidíte dole.</small></div>
-      <div id="history" class="history" role="log" aria-label="Dokončené překlady" aria-live="polite" aria-relevant="additions"></div>
-    </div>
-    <section id="live-panel" class="live-panel" data-state="idle" aria-labelledby="live-title" tabindex="0">
-      <div class="live-panel__heading"><h2 id="live-title">Průběžný překlad</h2><p id="live-note" role="status">Připraveno na českou řeč</p></div>
+    <section id="live-panel" class="live-panel" data-state="idle" aria-labelledby="live-title">
+      <div class="live-panel__heading"><h2 id="live-title">Průběžně</h2><p id="live-note" role="status">Připraveno na českou řeč</p></div>
       {{ translation_pair(live=true) }}
     </section>
+    <div id="history-scroll" class="history-scroll" tabindex="0" role="region" aria-label="Historie překladu">
+      <div id="history-empty" class="empty-state"><p>Zde budou dokončené překlady.</p><small>Nejnovější nahoře, starší níž.</small></div>
+      <div id="history" class="history" role="log" aria-label="Dokončené překlady" aria-live="polite" aria-relevant="additions"></div>
+    </div>
   </div>
 </main>
 
 <template id="result-template">
   <article class="result">
-    <div class="result__meta"><span class="result-number"></span><span>Finální překlad</span></div>
     {{ translation_pair() }}
   </article>
 </template>

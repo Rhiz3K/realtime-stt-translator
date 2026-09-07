@@ -30,6 +30,7 @@ function harness({saved = null, storageBlocked = false, fullscreenFails = false}
     }
     setAttribute(name, value) { this[name] = value; }
     append(value) { this.children.push(value); }
+    prepend(value) { this.children.unshift(value); this.onPrepend?.(value); }
     async dispatch(type, event = {}) {
       for (const listener of this.listeners[type] || []) await listener(event);
       await settle();
@@ -48,8 +49,7 @@ function harness({saved = null, storageBlocked = false, fullscreenFails = false}
     cloneNode() {
       const en = new Element();
       const ru = new Element();
-      const number = new Element();
-      return {en, ru, number, querySelector: selector => ({'.result-en': en, '.result-ru': ru, '.result-number': number})[selector]};
+      return {en, ru, querySelector: selector => ({'.result-en': en, '.result-ru': ru})[selector]};
     }
   };
   const sockets = [];
@@ -223,9 +223,9 @@ test('failed final leaves a permanent gap despite later successful translations'
   assert.equal(gap.dataset.code, 'translation_failed');
   assert.match(gap.textContent, /nepodařilo/);
   await socket.message({type: 'final', en: 'Done', ru: 'Готово'});
-  assert.equal(h.ids.history.children[0], gap);
-  assert.equal(h.ids.history.children[1].en.textContent, 'Done');
-  assert.equal(h.ids.history.children[1].ru.textContent, 'Готово');
+  assert.equal(h.ids.history.children[1], gap);
+  assert.equal(h.ids.history.children[0].en.textContent, 'Done');
+  assert.equal(h.ids.history.children[0].ru.textContent, 'Готово');
 });
 
 test('reset clears speculative text while preserving final history and gaps', async () => {
@@ -343,23 +343,30 @@ test('fullscreen responds to Escape and permission errors without disturbing cap
   assert.match(blocked.ids['presentation-notice'].textContent, /nepovolil/);
 });
 
-test('following history can be paused while paired interim stays visible', async () => {
+test('newest-first history preserves the reading position while following is paused', async () => {
   const h = harness();
   const socket = await h.start();
   await socket.message({type: 'final', en: 'first', ru: 'первый'});
-  assert.equal(h.ids['history-scroll'].scrollTop, 600);
-  h.ids['history-scroll'].scrollTop = 10;
+  assert.equal(h.ids['history-scroll'].scrollTop, 0);
+  h.ids['history-scroll'].scrollTop = 120;
   await h.ids['history-scroll'].dispatch('scroll');
   assert.equal(h.ids['follow-latest'].checked, false);
+  h.ids.history.onPrepend = () => { h.ids['history-scroll'].scrollHeight += 180; };
   await socket.message({type: 'final', en: 'second', ru: 'второй'});
-  assert.equal(h.ids['history-scroll'].scrollTop, 10);
+  assert.equal(h.ids['history-scroll'].scrollTop, 300);
+  assert.equal(h.ids.history.children[0].en.textContent, 'second');
+  assert.equal(h.ids.history.children[1].en.textContent, 'first');
+  await socket.message({type: 'error', code: 'translation_failed'});
+  assert.equal(h.ids['history-scroll'].scrollTop, 480);
   await socket.message({type: 'interim', en: '<img onerror=bad>', ru: '<script>bad</script>'});
   assert.equal(h.ids['live-en'].textContent, '<img onerror=bad>');
   assert.equal(h.ids['live-ru'].textContent, '<script>bad</script>');
   assert.equal(h.ids['live-panel'].hidden, false);
   h.ids['follow-latest'].checked = true;
   await h.ids['follow-latest'].dispatch('change');
-  assert.equal(h.ids['history-scroll'].scrollTop, 600);
+  assert.equal(h.ids['history-scroll'].scrollTop, 0);
+  await h.ids['history-scroll'].dispatch('scroll');
+  assert.equal(h.ids['follow-latest'].checked, true);
 });
 
 test('session stats reset on restart but final history and error warnings survive', async () => {
@@ -377,7 +384,9 @@ test('session stats reset on restart but final history and error warnings surviv
   assert.equal(h.ids.history.children.length, 2);
   await next.message({type: 'final', en: 'next', ru: 'дальше'});
   assert.equal(h.ids['history-count'].textContent, '2');
-  assert.equal(h.ids.history.children[2].number.textContent, 'Úsek 2');
+  assert.equal(h.ids.history.children[0].en.textContent, 'next');
+  assert.equal(h.ids.history.children[1].dataset.code, 'translation_failed');
+  assert.equal(h.ids.history.children[2].en.textContent, 'saved');
 });
 
 test('terminal error releases audio immediately and final cannot restore live status', async () => {
@@ -388,5 +397,22 @@ test('terminal error releases audio immediately and final cannot restore live st
   assert.equal(h.tracks[0].stopped, true);
   assert.equal(h.worklets[0].port.closed, true);
   assert.match(h.ids.status.textContent, /Úplnost/);
-  assert.equal(h.ids.history.children[0].dataset.code, 'transcription_incomplete');
+  assert.equal(h.ids.history.children[1].dataset.code, 'transcription_incomplete');
+});
+
+test('complete final pairs stay newest first beneath a separate interim', async () => {
+  const h = harness();
+  const socket = await h.start();
+  const en = 'A complete final paragraph. '.repeat(80);
+  const ru = 'Полный окончательный перевод. '.repeat(80);
+  await socket.message({type: 'final', en: 'older', ru: 'раньше'});
+  await socket.message({type: 'final', en, ru});
+  await socket.message({type: 'interim', en: 'live', ru: 'сейчас'});
+  assert.equal(h.ids.history.children.length, 2);
+  assert.equal(h.ids.history.children[0].en.textContent, en);
+  assert.equal(h.ids.history.children[0].ru.textContent, ru);
+  assert.equal(h.ids.history.children[1].en.textContent, 'older');
+  assert.equal(h.ids['live-en'].textContent, 'live');
+  assert.equal(h.ids['live-ru'].textContent, 'сейчас');
+  assert.equal(h.ids['history-scroll'].scrollTop, 0);
 });

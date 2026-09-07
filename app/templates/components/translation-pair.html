@@ -1,8 +1,7 @@
 {% macro translation_pair(live=false) -%}
 <div class="translation-pair">
-  {% for code, name, tag in [('en', 'English', 'EN'), ('ru', 'Русский', 'RU')] %}
-  <section class="language-panel" lang="{{ code }}">
-    <h3 class="language-label"><span class="language-tag">{{ tag }}</span>{{ name }}</h3>
+  {% for code in ['en', 'ru'] %}
+  <section class="language-panel" lang="{{ code }}" aria-labelledby="language-{{ code }}-heading">
     <p {% if live %}id="live-{{ code }}" tabindex="0"{% endif %} class="translation{% if not live %} result-{{ code }}{% endif %}"></p>
   </section>
   {% endfor %}

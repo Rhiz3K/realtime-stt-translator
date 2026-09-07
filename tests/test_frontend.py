@@ -11,6 +11,7 @@ TOOLBAR = (ROOT / "app/templates/components/toolbar.html").read_text(encoding="u
 UI = (ROOT / "app/static/translator-ui.js").read_text(encoding="utf-8")
 SESSION = (ROOT / "app/static/audio-session.js").read_text(encoding="utf-8")
 WORKLET = (ROOT / "app/static/pcm-worklet.js").read_text(encoding="utf-8")
+PAIR = (ROOT / "app/templates/components/translation-pair.html").read_text(encoding="utf-8")
 
 
 def test_frontend_has_presentation_controls_but_no_pipeline_configuration():
@@ -44,6 +45,18 @@ def test_pair_rendering_is_atomic_and_uses_text_content():
     assert "innerHTML" not in UI + SESSION
     assert "{{ translation_pair(live=true) }}" in INDEX
     assert "{{ translation_pair() }}" in INDEX
+
+
+def test_compact_layout_puts_interim_first_and_labels_each_language_once():
+    assert INDEX.index('id="language-en-heading"') < INDEX.index('id="live-panel"')
+    assert INDEX.index('id="live-panel"') < INDEX.index('id="history-scroll"')
+    assert INDEX.count('id="language-en-heading"') == 1
+    assert INDEX.count('id="language-ru-heading"') == 1
+    assert 'aria-labelledby="language-{{ code }}-heading"' in PAIR
+    assert "<h3" not in PAIR
+    assert "result-number" not in INDEX + UI
+    assert "result__meta" not in INDEX
+    assert "history.prepend(fragment)" in UI
 
 
 def test_stop_flushes_audio_before_sending_control_message():

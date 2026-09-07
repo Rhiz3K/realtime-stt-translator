@@ -40,10 +40,13 @@ textu 18–64 px, světlý/tmavý motiv, sbalení lišty a sledování poslední
 Nejde o nastavení překladu: žádná volba modelu, jazyka nebo bufferu se nevrací.
 Do localStorage se ukládají pouze tyto prezentační preference, nikdy obsah.
 
-Průběžný EN/RU pár je trvale dostupný v samostatném panelu pod posuvnou
-historií. Rozpracovaný náhled se mění, final přejde do společné historie.
-Posunutí historie nahoru vypne automatické sledování; zaškrtnutím „Sledovat
-text“ se lze vrátit na konec. U krátkých promluv může final předběhnout interim.
+Průběžný EN/RU pár je trvale dostupný nahoře. Pod ním je nejnovější celý final,
+starší výsledky následují směrem dolů. Společné záhlaví EN/RU platí pro oba
+sloupce na desktopu i mobilu; u jednotlivých vět se hlavičky ani čísla neopakují.
+Rozpracovaný náhled se mění, final přejde do společné historie bez zkracování.
+Posunutí historie dolů vypne automatické sledování; nové výsledky potom zachovají
+rozečtené místo. Zaškrtnutím „Sledovat text“ se lze vrátit k nejnovějšímu finalu
+nahoře. U krátkých promluv může final předběhnout interim.
 Pokud interim selže, zůstane viditelné upozornění a mikrofon i finaly pokračují.
 
 Statistiky aktuální relace ukazují délku odeslaného audia, úroveň mikrofonu,

@@ -85,7 +85,20 @@
     }
     function followLatest() {
       if (!prefs.follow) return;
-      historyScroll.scrollTop = historyScroll.scrollHeight;
+      historyScroll.scrollTop = 0;
+      lastHistoryScrollTop = historyScroll.scrollTop;
+    }
+    function prependHistory(fragment) {
+      const previousHeight = historyScroll.scrollHeight;
+      const previousTop = historyScroll.scrollTop;
+      const wasEmpty = history.children.length === 0;
+      history.prepend(fragment);
+      el("history-empty").hidden = true;
+      // CSS scroll anchoring is disabled here: preserve the reader's place
+      // exactly once when new rows are inserted above older text.
+      historyScroll.scrollTop = prefs.follow || wasEmpty
+        ? 0
+        : previousTop + Math.max(0, historyScroll.scrollHeight - previousHeight);
       lastHistoryScrollTop = historyScroll.scrollTop;
     }
     function phase(text, state = "live") {
@@ -119,13 +132,11 @@
       const fragment = template.content.cloneNode(true);
       fragment.querySelector(".result-en").textContent = en;
       fragment.querySelector(".result-ru").textContent = ru;
-      fragment.querySelector(".result-number").textContent = `Úsek ${++totalFinals}`;
-      history.append(fragment);
-      el("history-empty").hidden = true;
+      totalFinals += 1;
       el("history-count").textContent = String(totalFinals);
       el("stat-final").textContent = String(++finalCount);
       clearInterim();
-      followLatest();
+      prependHistory(fragment);
     }
     function showError(code, message) {
       if (code === "interim_translation_failed") {
@@ -139,10 +150,8 @@
         gap.dataset.code = code;
         gap.setAttribute("role", "status");
         gap.textContent = message;
-        history.append(gap);
-        el("history-empty").hidden = true;
         clearInterim();
-        followLatest();
+        prependHistory(gap);
       }
       phase(message, "error");
     }
@@ -196,7 +205,7 @@
     el("font-up").addEventListener("click", () => { applyFont(prefs.font + 2); save(); });
     follow.addEventListener("change", () => { prefs.follow = follow.checked; save(); followLatest(); });
     historyScroll.addEventListener("scroll", () => {
-      if (prefs.follow && historyScroll.scrollTop < lastHistoryScrollTop && historyScroll.scrollHeight - historyScroll.scrollTop - historyScroll.clientHeight > 80) {
+      if (prefs.follow && historyScroll.scrollTop > lastHistoryScrollTop && historyScroll.scrollTop > 80) {
         prefs.follow = false; follow.checked = false; save();
       }
       lastHistoryScrollTop = historyScroll.scrollTop;
