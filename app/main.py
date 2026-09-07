@@ -523,6 +523,7 @@ async def _receive_browser_audio(
     google_session: object,
     stop_requested: asyncio.Event,
     send_lock: asyncio.Lock,
+    coordinator: TranslationCoordinator | None = None,
 ) -> None:
     """The sole browser reader; keep watching disconnect after Stop."""
 
@@ -550,6 +551,8 @@ async def _receive_browser_audio(
                 )
             async with send_lock:
                 if not stop_requested.is_set():
+                    if coordinator is not None:
+                        coordinator.note_audio()
                     await asyncio.wait_for(
                         google_session.send_realtime_input(
                             audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
@@ -700,7 +703,7 @@ async def _serve_audio_session(websocket: WebSocket, sender: _JsonSender) -> Non
             stop_requested = asyncio.Event()
             send_lock = asyncio.Lock()
             coordinator = TranslationCoordinator(
-                GeminiPairTranslator(async_client), sender.send
+                GeminiPairTranslator(async_client), sender.send, report=sender.send
             )
             translation_task = asyncio.create_task(coordinator.run())
             google_task = asyncio.create_task(
@@ -708,7 +711,7 @@ async def _serve_audio_session(websocket: WebSocket, sender: _JsonSender) -> Non
             )
             browser_task = asyncio.create_task(
                 _receive_browser_audio(
-                    websocket, google_session, stop_requested, send_lock
+                    websocket, google_session, stop_requested, send_lock, coordinator
                 )
             )
             limit_task = asyncio.create_task(asyncio.sleep(_SESSION_MAX_SECONDS))

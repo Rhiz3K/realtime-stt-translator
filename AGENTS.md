@@ -38,7 +38,10 @@ buffering. Do not add configuration messages to the WebSocket protocol.
 - `app/main.py`: auth, security headers, health routes, and the sole audio WS.
 - `app/google_audio.py`: fixed Google models/configuration and cost-aware actor.
 - `app/static/pcm-worklet.js`: fixed 100 ms PCM16 capture/resampling.
-- `app/templates/index.html`: one Start/Stop action and EN/RU output.
+- `app/templates/index.html`: page composed from `components/` Jinja macros.
+- `app/static/design-tokens.css`, `translator.css`: tokens, atoms, molecules, layout.
+- `app/static/translator-ui.js`: presentation, paired rendering, and telemetry.
+- `app/static/audio-session.js`: the sole Start/Stop and audio lifecycle.
 - `tests/`: provider-free fakes; tests never call Google over the network.
 
 ## Commands
@@ -78,6 +81,11 @@ Keep edits local; if available, `ruff check .` and `ruff format .` are suitable.
 - Bind worklet callbacks and Stop timers to a session generation/socket;
   close the port on cleanup and cap the browser's queued audio at 16 000 B.
 - Failed finals leave permanent history warnings. Reset clears interim only.
+- Interim failures are visible but do not stop capture or discard final work.
+- Only presentation preferences (font, theme, compact toolbar, follow text)
+  may be saved locally; never save transcripts or add provider settings.
+- Telemetry is additive and transcript-free. Label the first STT delay honestly:
+  it starts with the first audio frame and includes any leading silence.
 - Live Transcribe sessions last at most ten minutes; the app finishes at 9:45
   with a recoverable `session_limit` event.
 - Insert browser content with `textContent`, never `innerHTML`.
@@ -86,7 +94,7 @@ Keep edits local; if available, `ruff check .` and `ruff format .` are suitable.
 ## Fixed model choices
 
 - STT: `gemini-3.5-transcribe-live`, `cs-CZ`, `SMART`.
-- Interim: `gemini-2.5-flash-lite`, thinking disabled.
+- Interim: `gemini-3.1-flash-lite`, minimal thinking.
 - Final: `gemini-3.5-flash-lite`, minimal thinking.
 - Audio: signed little-endian PCM16, mono, 16 kHz, 100 ms frames.
 

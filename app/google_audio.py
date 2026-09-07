@@ -17,7 +17,7 @@ from google.genai import types
 
 
 TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live"
-INTERIM_TRANSLATION_MODEL = "gemini-2.5-flash-lite"
+INTERIM_TRANSLATION_MODEL = "gemini-3.1-flash-lite"
 FINAL_TRANSLATION_MODEL = "gemini-3.5-flash-lite"
 
 SOURCE_LANGUAGE = "cs-CZ"
@@ -135,16 +135,10 @@ class GeminiPairTranslator:
         model = (
             FINAL_TRANSLATION_MODEL if kind == "final" else INTERIM_TRANSLATION_MODEL
         )
-        thinking = (
-            types.ThinkingConfig(thinking_level="MINIMAL")
-            if kind == "final"
-            else types.ThinkingConfig(thinking_budget=0)
-        )
+        thinking = types.ThinkingConfig(thinking_level="MINIMAL")
         config = types.GenerateContentConfig(
             system_instruction=TRANSLATION_INSTRUCTION,
-            # Gemini 3.x quality is tuned for its default sampling.  Keep the
-            # deterministic override only on the older, disposable interim.
-            temperature=0 if kind == "interim" else None,
+            # Both fixed models are Gemini 3.x: retain default sampling.
             # This is a ceiling, not reserved/billed output.  A generous final
             # limit prevents long utterances from becoming truncated JSON.
             max_output_tokens=8_192 if kind == "final" else 2_048,
@@ -211,6 +205,7 @@ class _TranslationWork:
     text: str
     revision: int
     eligible_at: float | None
+    received_at: float
 
 
 class _LatestTranslationQueue:
@@ -234,6 +229,7 @@ class _LatestTranslationQueue:
             text=text,
             revision=self.revision,
             eligible_at=eligible_at,
+            received_at=time.monotonic(),
         )
         if kind == "final":
             if len(self._finals) >= MAX_FINAL_BACKLOG:
@@ -267,9 +263,19 @@ class _LatestTranslationQueue:
 class TranslationCoordinator:
     """Cost-aware latest-interim/final translation actor for one audio session."""
 
-    def __init__(self, translator: GeminiPairTranslator, emit: EmitJson) -> None:
+    def __init__(
+        self,
+        translator: GeminiPairTranslator,
+        emit: EmitJson,
+        report: EmitJson | None = None,
+    ) -> None:
         self._translator = translator
         self._emit = emit
+        self._report = report
+        self._hypotheses = 0
+        self._finals_received = 0
+        self._audio_started_at: float | None = None
+        self._first_stt_ms: int | None = None
         self._queue = _LatestTranslationQueue()
         self._active_interim: asyncio.Task[None] | None = None
         self._active_interim_in_flight = False
@@ -279,10 +285,38 @@ class TranslationCoordinator:
         self._latest_final_revision = 0
         self._closing = False
 
+    def note_audio(self) -> None:
+        if self._audio_started_at is None:
+            self._audio_started_at = time.monotonic()
+
+    async def _telemetry(
+        self, kind: TranscriptKind, stage: str, **timings: int
+    ) -> None:
+        if self._report is not None:
+            await self._report(
+                {
+                    "type": "telemetry",
+                    "kind": kind,
+                    "stage": stage,
+                    "hypotheses": self._hypotheses,
+                    "finals_received": self._finals_received,
+                    "first_stt_ms": self._first_stt_ms,
+                    **timings,
+                }
+            )
+
     def submit(self, kind: TranscriptKind, text: str) -> bool:
         text = text.strip()
         if not text:
             return False
+        if self._first_stt_ms is None and self._audio_started_at is not None:
+            self._first_stt_ms = max(
+                0, round((time.monotonic() - self._audio_started_at) * 1000)
+            )
+        if kind == "interim":
+            self._hypotheses += 1
+        else:
+            self._finals_received += 1
         if kind == "interim" and len(text) > MAX_TRANSCRIPT_CHARS:
             text = text[:MAX_TRANSCRIPT_CHARS]
         if kind == "interim" and text == self._last_interim_text:
@@ -353,26 +387,38 @@ class TranslationCoordinator:
         if work.kind == "interim":
             self._active_interim_in_flight = True
         try:
+            queue_ms = max(0, round((time.monotonic() - work.received_at) * 1000))
+            await self._telemetry(work.kind, "translating", queue_ms=queue_ms)
+            started_at = time.monotonic()
             try:
                 pair = await self._translator.translate(work.text, work.kind)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if work.kind == "final":
-                    await self._emit(
-                        {
-                            "type": "error",
-                            "code": "translation_failed",
-                            "recoverable": True,
-                        }
-                    )
+                await self._emit(
+                    {
+                        "type": "error",
+                        "code": "translation_failed"
+                        if work.kind == "final"
+                        else "interim_translation_failed",
+                        "recoverable": True,
+                    }
+                )
+                await self._telemetry(work.kind, "failed", queue_ms=queue_ms)
                 return
 
             if work.kind == "interim" and (
                 self._closing or work.revision < self._latest_final_revision
             ):
                 return
+            translation_ms = max(0, round((time.monotonic() - started_at) * 1000))
             await self._emit({"type": work.kind, "en": pair["en"], "ru": pair["ru"]})
+            await self._telemetry(
+                work.kind,
+                "translated",
+                queue_ms=queue_ms,
+                translation_ms=translation_ms,
+            )
         finally:
             if work.kind == "interim":
                 self._active_interim_in_flight = False

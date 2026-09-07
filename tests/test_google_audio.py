@@ -68,10 +68,10 @@ def test_interim_translation_uses_cheapest_model_and_one_pair_request():
     assert pair == {"en": "Hello", "ru": "Привет"}
     assert len(models.calls) == 1
     call = models.calls[0]
-    assert call["model"] == "gemini-2.5-flash-lite"
+    assert call["model"] == "gemini-3.1-flash-lite"
     assert call["contents"] == "Ahoj"
-    assert call["config"].thinking_config.thinking_budget == 0
-    assert call["config"].temperature == 0
+    assert call["config"].thinking_config.thinking_level.value == "MINIMAL"
+    assert call["config"].temperature is None
     assert call["config"].max_output_tokens == 2048
     assert call["config"].response_json_schema == google_audio.TRANSLATION_SCHEMA
 
@@ -356,3 +356,105 @@ def test_close_drains_every_committed_final_in_fifo_order():
         {"type": "final", "en": "EN:two", "ru": "RU:two"},
         {"type": "final", "en": "EN:three", "ru": "RU:three"},
     ]
+
+
+def test_interim_failure_is_reported_without_retry_and_next_final_survives(monkeypatch):
+    monkeypatch.setattr(google_audio, "INTERIM_DEBOUNCE_SECONDS", 0.0)
+
+    class MissingModel(RuntimeError):
+        code = 404
+
+    translator, models = _translator(
+        [
+            MissingModel("private provider detail"),
+            SimpleNamespace(parsed={"en": "Final", "ru": "Финал"}),
+        ]
+    )
+
+    async def scenario():
+        emitted = []
+        failed = asyncio.Event()
+
+        async def emit(value):
+            emitted.append(value)
+            if value["type"] == "error":
+                failed.set()
+
+        coordinator = google_audio.TranslationCoordinator(translator, emit)
+        worker = asyncio.create_task(coordinator.run())
+        coordinator.submit("interim", "private transcript")
+        await asyncio.wait_for(failed.wait(), timeout=1)
+        coordinator.submit("final", "hotovo")
+        coordinator.close()
+        await worker
+        return emitted
+
+    assert asyncio.run(scenario()) == [
+        {"type": "error", "code": "interim_translation_failed", "recoverable": True},
+        {"type": "final", "en": "Final", "ru": "Финал"},
+    ]
+    assert len(models.calls) == 2
+
+
+def test_telemetry_measures_provider_time_not_browser_send_time(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(google_audio.time, "monotonic", lambda: clock[0])
+
+    class Translator:
+        async def translate(self, text, kind):
+            clock[0] += 0.4
+            return {"en": "Done", "ru": "Готово"}
+
+    async def scenario():
+        reports = []
+
+        async def emit(value):
+            clock[0] += 1.0  # A slow browser must not inflate provider latency.
+
+        async def report(value):
+            reports.append(value)
+
+        coordinator = google_audio.TranslationCoordinator(Translator(), emit, report)
+        coordinator.note_audio()
+        clock[0] += 0.25
+        coordinator.submit("final", "private transcript")
+        clock[0] += 0.05
+        coordinator.close()
+        await coordinator.run()
+        return reports
+
+    reports = asyncio.run(scenario())
+    assert [report["stage"] for report in reports] == ["translating", "translated"]
+    assert reports[-1] == {
+        "type": "telemetry",
+        "kind": "final",
+        "stage": "translated",
+        "hypotheses": 0,
+        "finals_received": 1,
+        "first_stt_ms": 250,
+        "queue_ms": 50,
+        "translation_ms": 400,
+    }
+    assert "private transcript" not in str(reports)
+
+
+def test_missing_audio_timestamp_does_not_fabricate_stt_latency():
+    async def scenario():
+        translator, _ = _translator(
+            [SimpleNamespace(parsed={"en": "Hi", "ru": "Привет"})]
+        )
+        reports = []
+
+        async def emit(value):
+            pass
+
+        async def report(value):
+            reports.append(value)
+
+        coordinator = google_audio.TranslationCoordinator(translator, emit, report)
+        coordinator.submit("final", "Ahoj")
+        coordinator.close()
+        await coordinator.run()
+        return reports
+
+    assert all(report["first_stt_ms"] is None for report in asyncio.run(scenario()))

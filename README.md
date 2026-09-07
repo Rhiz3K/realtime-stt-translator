@@ -17,7 +17,9 @@ mikrofon (PCM16, mono, 16 kHz)
 
 - Google Live Transcribe používá `gemini-3.5-transcribe-live`, jazyk `cs-CZ` a
   režim `SMART`.
-- Pro časté průběžné překlady se používá levný `gemini-2.5-flash-lite`.
+- Pro časté průběžné překlady se používá `gemini-3.1-flash-lite` s minimálním
+  thinking. Původní 2.5 v nasazeném projektu vracel 404; dostupnost 3.1 byla
+  ověřena skutečným strukturovaným požadavkem.
 - Každý finální přepis se ihned překládá přes `gemini-3.5-flash-lite`.
 - EN a RU vzniknou v jednom structured-output požadavku a do prohlížeče dorazí
   atomicky v jednom JSON objektu.
@@ -31,6 +33,32 @@ mikrofon (PCM16, mono, 16 kHz)
   nestíhá, mikrofon se zastaví a v historii zůstane upozornění na možnou mezeru.
 - Audio se neukládá a STT probíhá výhradně v Google API.
 
+## Ovládání a živý náhled
+
+Horní lišta obsahuje Start/Stop, fullscreen (ukončení také přes Esc), velikost
+textu 18–64 px, světlý/tmavý motiv, sbalení lišty a sledování posledního textu.
+Nejde o nastavení překladu: žádná volba modelu, jazyka nebo bufferu se nevrací.
+Do localStorage se ukládají pouze tyto prezentační preference, nikdy obsah.
+
+Průběžný EN/RU pár je trvale dostupný v samostatném panelu pod posuvnou
+historií. Rozpracovaný náhled se mění, final přejde do společné historie.
+Posunutí historie nahoru vypne automatické sledování; zaškrtnutím „Sledovat
+text“ se lze vrátit na konec. U krátkých promluv může final předběhnout interim.
+Pokud interim selže, zůstane viditelné upozornění a mikrofon i finaly pokračují.
+
+Statistiky aktuální relace ukazují délku odeslaného audia, úroveň mikrofonu,
+počty zobrazených interim/final párů a počty STT hypotéz/finalů. Časy v ms:
+
+- **STT první:** první audio rámec na serveru → první přepis, včetně úvodního
+  ticha; nejde o průběžnou end-to-end latenci každé věty.
+- **Překlad:** poslední Google překladový požadavek, včetně retry finalu.
+- **Čekání:** fronta a slučování před spuštěním vybraného překladu.
+- **Připojení:** WebSocket a příprava Google, bez povolování mikrofonu; není RTT.
+
+Rozhraní používá atomic design bez dalšího frameworku: sdílené CSS tokeny,
+atomy tlačítek/ikon/statistik, molekuly jazykového páru a lištu jako organismus.
+Prezentační JavaScript je oddělený od životního cyklu audia.
+
 ## Cena a limit relace
 
 Live Transcribe stojí orientačně **$0.009 za minutu audia**, tedy přibližně
@@ -38,7 +66,7 @@ Live Transcribe stojí orientačně **$0.009 za minutu audia**, tedy přibližn�
 
 | Model | Vstup / 1M tokenů | Výstup / 1M tokenů |
 |---|---:|---:|
-| `gemini-2.5-flash-lite` (interim) | $0.10 | $0.40 |
+| `gemini-3.1-flash-lite` (interim) | $0.25 | $1.50 |
 | `gemini-3.5-flash-lite` (final) | $0.30 | $2.50 |
 
 Textová část bývá proti ceně audia malá, ale její přesná cena závisí na délce
@@ -125,7 +153,9 @@ Server odpovídá stavem a překlady:
 
 ```json
 {"type":"ready"}
+{"type":"telemetry","kind":"interim","stage":"translating","hypotheses":3,"finals_received":0,"first_stt_ms":850,"queue_ms":350}
 {"type":"interim","en":"Hello","ru":"Здравствуйте"}
+{"type":"telemetry","kind":"interim","stage":"translated","hypotheses":3,"finals_received":0,"first_stt_ms":850,"queue_ms":350,"translation_ms":450}
 {"type":"final","en":"Hello.","ru":"Здравствуйте."}
 {"type":"ended"}
 ```
@@ -137,8 +167,11 @@ Chyby mají stabilní kód bez detailů nebo API klíče:
 ```
 
 Po terminální chybě mohou dříve přijaté finaly ještě doběhnout před uzavřením.
-`translation_failed` označuje jeden chybějící final
-a relaci neukončuje. `transcription_incomplete` označuje neověřený konec vstupu.
+`translation_failed` označuje jeden chybějící final a relaci neukončuje.
+`interim_translation_failed` označuje neúspěšný náhled, neukončuje mikrofon a
+nemá retry. `transcription_incomplete` označuje neověřený konec vstupu.
+`telemetry` neobsahuje přepis ani klíče; časy, které nejsou změřené, chybí nebo
+jsou `null`. Zprávy EN/RU zůstávají společné a beze změny.
 
 ## Docker
 
@@ -173,6 +206,6 @@ docker build .
 ```
 
 CI provádí audit runtime závislostí, pytest (včetně Node regresí nad skutečným
-inline skriptem s náhradami browser API), validaci Dockerfile a sestavení
+prezentačním a audio skriptem s náhradami browser API), validaci Dockerfile a sestavení
 produkčního obrazu. Tyto testy nevolají placené Google API a nenahrazují ověření
 skutečného mikrofonu a sítě v prohlížeči.

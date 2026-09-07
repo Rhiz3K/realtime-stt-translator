@@ -1,0 +1,40 @@
+{% from 'components/atoms.html' import icon, icon_button, metric %}
+<header id="toolbar" class="toolbar">
+  <div id="toolbar-details" class="toolbar__details">
+    <div class="brand"><h1>Live Translator<span class="brand__dot">.</span></h1><p>Česká řeč → anglicky a rusky</p></div>
+    <div class="presentation-controls" role="group" aria-label="Zobrazení překladu">
+      <div class="font-control" role="group" aria-label="Velikost textu">
+        <button id="font-down" class="ui-button ui-button--small" type="button" aria-label="Zmenšit text">A−</button>
+        <label class="sr-only" for="font-size">Velikost textu překladu</label>
+        <input id="font-size" type="range" min="18" max="64" step="2" value="28">
+        <button id="font-up" class="ui-button ui-button--small" type="button" aria-label="Zvětšit text">A+</button>
+        <output id="font-value" for="font-size">28 px</output>
+      </div>
+      <label class="ui-check"><input id="follow-latest" type="checkbox" checked> Sledovat text</label>
+    </div>
+  </div>
+  <div class="toolbar__actions">
+    <div class="button-group" role="group" aria-label="Ovládání stránky">
+      {{ icon_button('compact-toggle', 'Sbalit horní lištu', 'compact') }}
+      {{ icon_button('fullscreen-toggle', 'Celá obrazovka', 'fullscreen') }}
+      {{ icon_button('theme-toggle', 'Přepnout barevný motiv', 'theme') }}
+      <a class="ui-button ui-button--icon" href="https://github.com/Rhiz3K/realtime-stt-translator" target="_blank" rel="noopener noreferrer" aria-label="Zdrojový kód na GitHubu" title="Zdrojový kód na GitHubu">{{ icon('github') }}</a>
+    </div>
+    <div class="session-controls">
+      <span class="ui-badge">Google Live <span aria-hidden="true">·</span> CS → EN + RU</span>
+      <div id="status" class="status" data-state="idle" role="status" aria-live="polite">Připraveno</div>
+      <button id="toggle" class="ui-button ui-button--primary" type="button" data-active="false">Spustit mikrofon</button>
+    </div>
+  </div>
+  <dl class="metrics" aria-label="Statistiky aktuální relace">
+    {{ metric('stat-audio', 'Audio', '00:00', 'Délka skutečně odeslaného audia v aktuální relaci.') }}
+    {{ metric('stat-interim', 'Interim', '0', 'Počet zobrazených průběžných párů EN/RU v této relaci.') }}
+    {{ metric('stat-final', 'Final', '0', 'Počet zobrazených finálních párů EN/RU v této relaci.') }}
+    {{ metric('stat-stt', 'STT první', '—', 'Od prvního audio rámce na serveru do prvního přepisu; zahrnuje i úvodní ticho. Nejde o latenci každé věty.') }}
+    {{ metric('stat-translation', 'Překlad', '—', 'Délka posledního Google překladového požadavku, včetně případného retry finalu. Bez čekání ve frontě.') }}
+    {{ metric('stat-queue', 'Čekání', '—', 'Od přijetí vybraného přepisu do spuštění překladu, včetně slučování interim.') }}
+    {{ metric('stat-hypotheses', 'STT I / F', '0 / 0', 'Počet průběžných hypotéz / finálních přepisů od Google; aktualizováno při překladových požadavcích.') }}
+    {{ metric('stat-connect', 'Připojení', '—', 'Čas připojení WebSocketu a přípravy Google; nezahrnuje povolování mikrofonu. Není to RTT.') }}
+    <div class="metric metric--meter"><dt id="level-label">Mikrofon</dt><dd><meter id="audio-level" min="0" max="100" value="0" aria-labelledby="level-label"></meter></dd></div>
+  </dl>
+</header>

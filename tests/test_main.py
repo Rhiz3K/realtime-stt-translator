@@ -11,6 +11,13 @@ from starlette.websockets import WebSocketDisconnect
 from app import google_audio, main
 
 
+def _receive_app_message(websocket):
+    """Existing lifecycle assertions ignore additive, separately tested telemetry."""
+    while (message := websocket.receive_json()).get("type") == "telemetry":
+        pass
+    return message
+
+
 def _event(*, interim=None, final=None, turn_complete=False):
     return SimpleNamespace(
         server_content=SimpleNamespace(
@@ -329,14 +336,15 @@ def test_security_headers_only_allow_same_origin_microphone(open_client):
 def test_single_purpose_page_has_no_settings_or_legacy_engines(open_client):
     html = open_client.get("/").text.lower()
     assert "<select" not in html
-    assert 'type="range"' not in html
+    assert html.count('type="range"') == 1
+    assert 'id="font-size"' in html
     assert "webspeech" not in html
     assert "deepgram" not in html
     assert "elevenlabs" not in html
     assert "nemotron" not in html
     assert "parakeet" not in html
     assert "chunk" not in html
-    assert "/ws/audio" in html
+    assert "/static/audio-session.js" in html
     assert 'lang="en"' in html
     assert 'lang="ru"' in html
 
@@ -358,12 +366,12 @@ def test_ws_forwards_pcm_and_emits_atomic_interim_and_final(google_client):
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.send_bytes(pcm)
-        interim = websocket.receive_json()
+        interim = _receive_app_message(websocket)
         websocket.send_text(json.dumps({"type": "stop"}))
-        final = websocket.receive_json()
-        ended = websocket.receive_json()
+        final = _receive_app_message(websocket)
+        ended = _receive_app_message(websocket)
 
     assert interim == {"type": "interim", "en": "EN:ahoj", "ru": "RU:ahoj"}
     assert final == {"type": "final", "en": "EN:ahoj", "ru": "RU:ahoj"}
@@ -377,7 +385,7 @@ def test_ws_forwards_pcm_and_emits_atomic_interim_and_final(google_client):
     assert fake.session.sent[0]["audio"].mime_type == "audio/pcm;rate=16000"
     assert fake.session.sent[-1] == {"audio_stream_end": True}
     assert [call["model"] for call in fake.translation_calls] == [
-        "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
     ]
     assert all(
@@ -386,6 +394,30 @@ def test_ws_forwards_pcm_and_emits_atomic_interim_and_final(google_client):
     )
     assert fake.session.closed
     assert fake.client_closed
+
+
+def test_ws_sends_safe_progress_and_timings_without_changing_pair_contract(
+    google_client,
+):
+    client, _ = google_client
+    with client.websocket_connect(
+        "/ws/audio", headers={"origin": "http://testserver"}
+    ) as websocket:
+        assert websocket.receive_json() == {"type": "ready"}
+        websocket.send_bytes(b"\x01\x00" * 1600)
+        progress = websocket.receive_json()
+        pair = websocket.receive_json()
+        timing = websocket.receive_json()
+        assert progress["type"] == "telemetry"
+        assert progress["stage"] == "translating"
+        assert progress["kind"] == "interim"
+        assert progress["hypotheses"] == 1
+        assert progress["first_stt_ms"] >= 0
+        assert pair == {"type": "interim", "en": "EN:ahoj", "ru": "RU:ahoj"}
+        assert timing["stage"] == "translated"
+        assert timing["translation_ms"] >= 0
+        assert timing["queue_ms"] >= 0
+        assert "ahoj" not in json.dumps([progress, timing])
 
 
 @pytest.mark.parametrize(
@@ -411,18 +443,18 @@ def test_ws_rejects_configuration_and_invalid_audio(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         if "text" in payload:
             websocket.send_text(payload["text"])
         else:
             websocket.send_bytes(payload["bytes"])
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {
             "type": "error",
             "code": error_code,
             "recoverable": False,
         }
         with pytest.raises(WebSocketDisconnect) as closed:
-            websocket.receive_json()
+            _receive_app_message(websocket)
     assert closed.value.code == close_code
     assert not fake.translation_calls
 
@@ -481,13 +513,13 @@ def test_google_live_setup_timeout_reports_error_and_releases_slot(monkeypatch):
         with client.websocket_connect(
             "/ws/audio", headers={"origin": "http://testserver"}
         ) as websocket:
-            assert websocket.receive_json() == {
+            assert _receive_app_message(websocket) == {
                 "type": "error",
                 "code": "google_timeout",
                 "recoverable": True,
             }
             with pytest.raises(WebSocketDisconnect) as closed:
-                websocket.receive_json()
+                _receive_app_message(websocket)
 
     assert closed.value.code == 1011
     assert fake.closed_event.wait(timeout=1.0)
@@ -535,21 +567,21 @@ def test_terminal_error_precedes_drain_without_dropping_accepted_final(monkeypat
         with client.websocket_connect(
             "/ws/audio", headers={"origin": "http://testserver"}
         ) as websocket:
-            assert websocket.receive_json() == {"type": "ready"}
-            assert websocket.receive_json() == {
+            assert _receive_app_message(websocket) == {"type": "ready"}
+            assert _receive_app_message(websocket) == {
                 "type": "error",
                 "code": "session_failed",
                 "recoverable": True,
             }
             assert fake.translation_started.wait(timeout=1.0)
             fake.translation_release.set()
-            assert websocket.receive_json() == {
+            assert _receive_app_message(websocket) == {
                 "type": "final",
                 "en": "EN:přijatý finální text",
                 "ru": "RU:přijatý finální text",
             }
             with pytest.raises(WebSocketDisconnect) as closed:
-                websocket.receive_json()
+                _receive_app_message(websocket)
 
     assert closed.value.code == 1011
     assert fake.client_closed
@@ -577,13 +609,13 @@ def test_ws_rejects_new_session_when_fixed_global_cap_is_full(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {
             "type": "error",
             "code": "server_busy",
             "recoverable": True,
         }
         with pytest.raises(WebSocketDisconnect) as closed:
-            websocket.receive_json()
+            _receive_app_message(websocket)
     assert closed.value.code == 1013
     assert not fake.connect_calls
 
@@ -628,7 +660,7 @@ def test_browser_disconnect_closes_google_and_workers(google_client):
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.close()
         assert fake.closed_event.wait(timeout=1.0)
     assert fake.session.closed
@@ -644,18 +676,18 @@ def test_session_limit_stops_input_before_stream_end_and_drains_final(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {"type": "ready"}
+        assert _receive_app_message(websocket) == {
             "type": "error",
             "code": "session_limit",
             "recoverable": True,
         }
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {
             "type": "final",
             "en": "EN:ahoj",
             "ru": "RU:ahoj",
         }
-        assert websocket.receive_json() == {"type": "ended"}
+        assert _receive_app_message(websocket) == {"type": "ended"}
 
     assert fake.session.sent == [{"audio_stream_end": True}]
 
@@ -698,21 +730,21 @@ def test_stop_receives_earlier_and_last_final_across_sdk_turns(google_client, de
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.send_json({"type": "stop"})
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {
             "type": "final",
             "en": "EN:předchozí věta",
             "ru": "RU:předchozí věta",
         }
-        assert websocket.receive_json() == {
+        assert _receive_app_message(websocket) == {
             "type": "final",
             "en": "EN:poslední věta",
             "ru": "RU:poslední věta",
         }
-        assert websocket.receive_json() == {"type": "ended"}
+        assert _receive_app_message(websocket) == {"type": "ended"}
         with pytest.raises(WebSocketDisconnect) as closed:
-            websocket.receive_json()
+            _receive_app_message(websocket)
     assert closed.value.code == 1000
     assert fake.closed_event.wait(1)
 
@@ -727,12 +759,12 @@ def test_stop_timeout_never_claims_complete_even_after_a_final(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.send_json({"type": "stop"})
         received = []
         with pytest.raises(WebSocketDisconnect) as closed:
             while True:
-                received.append(websocket.receive_json())
+                received.append(_receive_app_message(websocket))
     assert [r["type"] for r in received] == ["final"] * len(results) + ["error"]
     assert received[-1]["code"] == "transcription_incomplete"
     assert closed.value.code == 1011
@@ -771,15 +803,15 @@ def test_blocked_stream_end_releases_handler_and_paid_slot(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.send_json({"type": "stop"})
         assert entered.wait(1)
         if disconnect:
             websocket.close()
         else:
-            assert websocket.receive_json()["code"] == "google_timeout"
+            assert _receive_app_message(websocket)["code"] == "google_timeout"
             with pytest.raises(WebSocketDisconnect) as closed:
-                websocket.receive_json()
+                _receive_app_message(websocket)
             assert closed.value.code == 1011
         assert fake.closed_event.wait(1)
         assert slots.released.wait(1)
@@ -814,11 +846,11 @@ def test_disconnect_during_final_drain_cancels_paid_request_without_retry(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         if trigger == "stop":
             websocket.send_json({"type": "stop"})
         else:
-            assert websocket.receive_json()["type"] == "error"
+            assert _receive_app_message(websocket)["type"] == "error"
         assert fake.translation_started.wait(1)
         websocket.close()
         # Cancellation must not wait for a stalled connection.__aexit__().
@@ -839,12 +871,12 @@ def test_shutdown_deadline_cancels_final_drain_and_releases_slot(
     with client.websocket_connect(
         "/ws/audio", headers={"origin": "http://testserver"}
     ) as websocket:
-        assert websocket.receive_json() == {"type": "ready"}
+        assert _receive_app_message(websocket) == {"type": "ready"}
         websocket.send_json({"type": "stop"})
         assert fake.translation_started.wait(1)
-        assert websocket.receive_json()["code"] == "google_timeout"
+        assert _receive_app_message(websocket)["code"] == "google_timeout"
         with pytest.raises(WebSocketDisconnect):
-            websocket.receive_json()
+            _receive_app_message(websocket)
         assert fake.translation_cancelled.wait(1)
         assert slots.released.wait(1)
 
@@ -875,10 +907,10 @@ def test_provider_exception_payload_and_chain_never_enter_logs(
             "/ws/audio", headers={"origin": "http://testserver"}
         ) as websocket:
             if phase == "receive":
-                assert websocket.receive_json() == {"type": "ready"}
-            assert websocket.receive_json()["code"] == "session_failed"
+                assert _receive_app_message(websocket) == {"type": "ready"}
+            assert _receive_app_message(websocket)["code"] == "session_failed"
             with pytest.raises(WebSocketDisconnect):
-                websocket.receive_json()
+                _receive_app_message(websocket)
     assert "ValueError" in caplog.text
     assert marker not in caplog.text
     assert not any(record.exc_info for record in caplog.records)
