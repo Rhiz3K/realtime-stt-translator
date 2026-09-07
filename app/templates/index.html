@@ -5,14 +5,16 @@
 
 {% block head %}
 <link rel="stylesheet" href="/static/translator.css">
+<script src="/static/interim-layout.js" defer></script>
 <script src="/static/translator-ui.js" defer></script>
+<script src="/static/web-speech.js" defer></script>
 <script src="/static/audio-session.js" defer></script>
 {% endblock %}
 
 {% block body %}
 <main id="dashboard" class="dashboard">
   {% include 'components/toolbar.html' %}
-  <div class="workspace">
+  <div id="workspace" class="workspace">
     <div class="workspace__heading">
       <div class="language-headings">
         <h2 id="language-en-heading" lang="en">EN</h2>
@@ -22,7 +24,7 @@
       <p id="presentation-notice" class="presentation-notice" role="status" hidden></p>
     </div>
     <section id="live-panel" class="live-panel" data-state="idle" aria-labelledby="live-title">
-      <div class="live-panel__heading"><h2 id="live-title">Průběžně</h2><p id="live-note" role="status">Připraveno na českou řeč</p></div>
+      <div id="live-heading" class="live-panel__heading"><h2 id="live-title">Průběžně</h2><p id="live-note" role="status">Připraveno na českou řeč</p></div>
       {{ translation_pair(live=true) }}
     </section>
     <div id="history-scroll" class="history-scroll" tabindex="0" role="region" aria-label="Historie překladu">

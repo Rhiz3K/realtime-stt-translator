@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import struct
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -29,6 +31,15 @@ AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 MAX_AUDIO_CHUNK_BYTES = 3_200
 MAX_TRANSCRIPT_CHARS = 12_000
 MAX_FINAL_BACKLOG = 32
+
+# Fixed endpointing: prefer a pause, but don't repeatedly translate an
+# ever-growing paragraph when a speaker (or background music) never goes quiet.
+SEGMENT_MIN_SECONDS = 2.0
+SEGMENT_TARGET_SECONDS = 6.0
+SEGMENT_MAX_SECONDS = 12.0
+# Do not reopen a manual activity while Google is still finalizing it. This
+# acknowledgement gates the next activity only, never confirms a stream flush.
+TURN_FINALIZATION_TIMEOUT_SECONDS = 1.0
 
 # Translating every rapidly-changing ASR hypothesis wastes tokens and makes the
 # UI flicker.  The first useful preview arrives quickly, then updates at most
@@ -89,11 +100,116 @@ def live_transcription_config() -> types.LiveConnectConfig:
 
     return types.LiveConnectConfig(
         response_modalities=["TEXT"],
+        # Explicit, serialized activity boundaries keep interim recognition
+        # alive without relying on repeated hybrid audio_stream_end resets.
+        realtime_input_config=types.RealtimeInputConfig(
+            activity_handling="NO_INTERRUPTION",
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True,
+            ),
+        ),
         input_audio_transcription=types.AudioTranscriptionConfig(
             language_codes=[SOURCE_LANGUAGE],
             mode="SMART",
         ),
     )
+
+
+class AudioSegmenter:
+    """Request upstream finalization without dropping/replaying any PCM.
+
+    This is a cheap endpoint hint, not an STT engine or a proof of silence.
+    Only Google's final text is committed. Activity starts before the first
+    PCM frame, including leading silence, so no prefix audio is clipped.
+    Count samples rather than wall time so jitter cannot create extra turns.
+    """
+
+    def __init__(self) -> None:
+        self._elapsed = 0.0
+        self._quiet = 0.0
+        self._envelope = 0.0
+        self._active = False
+
+    def boundary_after(self, audio: bytes) -> bool:
+        duration = len(audio) / 32_000
+        samples = len(audio) // 2
+        if not samples:
+            return False
+        energy = sum(value * value for (value,) in struct.iter_unpack("<h", audio))
+        rms = math.sqrt(energy / samples) / 32_768
+        self._envelope = max(rms, self._envelope * math.exp(-duration / 3))
+        threshold = max(0.003, min(0.04, self._envelope * 0.22))
+        quiet = rms < threshold
+        if not quiet:
+            self._active = True
+        if not self._active:
+            return False
+        self._elapsed += duration
+        self._quiet = self._quiet + duration if quiet else 0.0
+        pause = 0.2 if self._elapsed >= SEGMENT_TARGET_SECONDS else 0.4
+        if self._elapsed + 1e-9 >= SEGMENT_MAX_SECONDS or (
+            self._elapsed >= SEGMENT_MIN_SECONDS and self._quiet + 1e-9 >= pause
+        ):
+            self._elapsed = self._quiet = 0.0
+            self._active = False
+            return True
+        return False
+
+
+class GoogleAudioSession:
+    """Ordered manual activities over one Google connection.
+
+    The caller serializes send_audio/end_input and bounds transport sends.
+    One concurrent receive iterator must stay alive to observe generation
+    completion. Never reopen after a missing acknowledgement: fail visibly
+    instead of silently accumulating one long turn or losing live previews.
+    """
+
+    def __init__(self, session: object) -> None:
+        self._session = session
+        self._segmenter = AudioSegmenter()
+        self._activity_open = False
+        self._turn_done = asyncio.Event()
+        self._boundary_failed = False
+
+    async def send_audio(self, audio: bytes) -> None:
+        if self._boundary_failed:
+            raise TimeoutError("Previous audio activity did not finish")
+        if not self._activity_open:
+            await self._session.send_realtime_input(
+                activity_start=types.ActivityStart()
+            )
+            self._activity_open = True
+        await self._session.send_realtime_input(
+            audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
+        )
+        if self._segmenter.boundary_after(audio):
+            # Leave the guard set on *any* failure/cancellation, including a
+            # blocked end send whose delivery cannot safely be retried.
+            self._boundary_failed = True
+            await self.end_input()
+            await asyncio.wait_for(
+                self._turn_done.wait(), timeout=TURN_FINALIZATION_TIMEOUT_SECONDS
+            )
+            self._boundary_failed = False
+
+    async def end_input(self) -> None:
+        # Stop sends at most one end for the current activity. It does NOT
+        # await this per-turn signal as evidence that all input was processed.
+        if self._activity_open:
+            self._turn_done.clear()
+            await self._session.send_realtime_input(activity_end=types.ActivityEnd())
+            self._activity_open = False
+
+    async def receive(self):
+        async for message in self._session.receive():
+            content = getattr(message, "server_content", None)
+            if getattr(content, "generation_complete", False):
+                self._turn_done.set()
+            yield message
+
+    async def close(self) -> None:
+        await self._session.close()
 
 
 def _clean_text(value: object) -> str:
@@ -254,6 +370,10 @@ class _LatestTranslationQueue:
             self._event.clear()
             await self._event.wait()
 
+    def clear_interim(self) -> None:
+        self.revision += 1
+        self._interim = None
+
     def close(self) -> None:
         self._closed = True
         self._interim = None
@@ -288,6 +408,19 @@ class TranslationCoordinator:
     def note_audio(self) -> None:
         if self._audio_started_at is None:
             self._audio_started_at = time.monotonic()
+
+    @property
+    def has_input(self) -> bool:
+        """Whether any audio was attempted or a transcript was received.
+
+        Check actual input, not rounded UI seconds or detected speech: even a
+        short/silent frame may still have an unconfirmed upstream result.
+        """
+        return (
+            self._audio_started_at is not None
+            or self._hypotheses > 0
+            or self._finals_received > 0
+        )
 
     async def _telemetry(
         self, kind: TranscriptKind, stage: str, **timings: int
@@ -349,6 +482,14 @@ class TranslationCoordinator:
             if kind == "final" or not self._active_interim_in_flight:
                 self._active_interim.cancel()
         return True
+
+    def clear_interim(self) -> None:
+        """Withdraw a browser hypothesis without discarding committed finals."""
+        self._queue.clear_interim()
+        self._last_interim_text = ""
+        self._interim_deadline = None
+        if self._active_interim and not self._active_interim.done():
+            self._active_interim.cancel()
 
     def close(self) -> None:
         self._closing = True

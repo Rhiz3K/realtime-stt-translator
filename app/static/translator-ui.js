@@ -24,9 +24,17 @@
     let audioBytes = 0;
     let connectingAt = null;
     let active = false;
+    let finishing = false;
+    let completionWarning = false;
+    let completionWarningRow = null;
     let lastPreviewAt = null;
     let previewWarning = false;
     let lastHistoryScrollTop = 0;
+    const interimLayout = window.createInterimLayout({
+      panel: livePanel, heading: el("live-heading"), workspace: el("workspace"),
+      texts: [liveEn, liveRu], getFontSize: () => prefs.font,
+      getFollow: () => prefs.follow, onLayout: followLatest
+    });
 
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey));
@@ -54,6 +62,7 @@
       el("font-value").textContent = `${prefs.font} px`;
       el("font-down").disabled = prefs.font === 18;
       el("font-up").disabled = prefs.font === 64;
+      interimLayout.schedule();
       followLatest();
     }
     function applyCompact() {
@@ -64,6 +73,7 @@
       const label = prefs.compact ? "Rozbalit horní lištu" : "Sbalit horní lištu";
       compact.setAttribute("aria-label", label);
       compact.title = label;
+      interimLayout.schedule();
       followLatest();
     }
     function darkTheme() {
@@ -104,13 +114,17 @@
     function phase(text, state = "live") {
       liveNote.textContent = text;
       livePanel.dataset.state = state;
+      interimLayout.schedule();
     }
     function clearInterim() {
       liveEn.textContent = "";
       liveRu.textContent = "";
+      interimLayout.reset();
       lastPreviewAt = null;
       previewWarning = false;
-      phase(active ? "Čekám na další řeč…" : "Připraveno na českou řeč", active ? "live" : "idle");
+      if (completionWarning) phase("Zastaveno · závěr nepotvrzen", "warning");
+      else if (finishing) phase("Dokončuji závěr řeči…", "busy");
+      else phase(active ? "Čekám na další řeč…" : "Připraveno na českou řeč", active ? "live" : "idle");
     }
     function renderInterim(en, ru) {
       // Both writes happen in one synchronous task, before the next paint.
@@ -120,10 +134,6 @@
       previewWarning = false;
       phase("Živý náhled · text se může ještě změnit");
       el("stat-interim").textContent = String(++interimCount);
-      if (prefs.follow) {
-        liveEn.scrollTop = liveEn.scrollHeight;
-        liveRu.scrollTop = liveRu.scrollHeight;
-      }
       // Preview growth changes the history viewport height. Follow after
       // layout, so the newest committed paragraph is still fully reachable.
       followLatest();
@@ -144,16 +154,23 @@
         phase("Interim se nepodařil · čekám na další náhled nebo final", "error");
         return; // Keep last preview and microphone; this is not a missing final.
       }
+      if (code === "transcription_incomplete") {
+        // One completion warning per session, even if both the server and
+        // transport report it. Never deduplicate distinct failed final work.
+        if (completionWarning) return;
+        completionWarning = true;
+      }
       if (["translation_failed", "transcription_incomplete", "audio_backpressure"].includes(code)) {
         const gap = document.createElement("article");
-        gap.className = "result result-error";
+        gap.className = code === "transcription_incomplete" ? "result result-warning" : "result result-error";
         gap.dataset.code = code;
         gap.setAttribute("role", "status");
         gap.textContent = message;
-        clearInterim();
+        if (code === "transcription_incomplete") completionWarningRow = gap;
+        else clearInterim();
         prependHistory(gap);
       }
-      phase(message, "error");
+      phase(message, code === "transcription_incomplete" ? "warning" : "error");
     }
     function ms(id, value) {
       if (Number.isFinite(value) && value >= 0) el(id).textContent = `${Math.round(value)} ms`;
@@ -165,7 +182,7 @@
       if (Number.isInteger(message.hypotheses) && Number.isInteger(message.finals_received)) {
         el("stat-hypotheses").textContent = `${message.hypotheses} / ${message.finals_received}`;
       }
-      if (message.stage === "translating") {
+      if (message.stage === "translating" && !completionWarning) {
         if (message.kind === "final") phase("Dokončuji finální překlad…", "busy");
         else if (!previewWarning) {
           const age = lastPreviewAt === null ? "" : ` · náhled před ${Math.floor((performance.now() - lastPreviewAt) / 1000)} s`;
@@ -175,6 +192,10 @@
     }
     function beginSession() {
       active = true;
+      finishing = false;
+      completionWarning = false;
+      completionWarningRow = null;
+      livePanel.dataset.active = "true";
       interimCount = 0; finalCount = 0; audioBytes = 0;
       for (const id of ["stat-interim", "stat-final"]) el(id).textContent = "0";
       for (const id of ["stat-stt", "stat-translation", "stat-queue", "stat-connect"]) el(id).textContent = "—";
@@ -183,10 +204,26 @@
       el("audio-level").value = 0;
       clearInterim();
     }
-    function endSession() {
+    function endSession(message = "Zastaveno", state = "idle") {
+      // Wait until accepted finals have drained: an arriving final clears its
+      // preview. Only a still-unconfirmed tail is preserved, explicitly NOT as
+      // a final, and it never increments the final counters.
+      if (completionWarningRow && liveEn.textContent && liveRu.textContent) {
+        const label = document.createElement("p");
+        label.className = "unconfirmed-label";
+        label.textContent = "Poslední průběžný náhled · nepotvrzený překlad";
+        const fragment = template.content.cloneNode(true);
+        fragment.querySelector(".result-en").textContent = liveEn.textContent;
+        fragment.querySelector(".result-ru").textContent = liveRu.textContent;
+        completionWarningRow.append(label);
+        completionWarningRow.append(fragment);
+      }
       active = false;
+      finishing = false;
+      livePanel.dataset.active = "false";
       el("audio-level").value = 0;
       clearInterim();
+      phase(message, state);
     }
     function audioFrame(buffer) {
       audioBytes += buffer.byteLength;
@@ -231,6 +268,7 @@
 
     return {
       clearInterim, renderInterim, renderFinal, showError, telemetry, beginSession, endSession, audioFrame,
+      stopping() { finishing = true; phase("Dokončuji závěr řeči…", "busy"); },
       connecting() { connectingAt = performance.now(); },
       connected() { if (connectingAt !== null) ms("stat-connect", performance.now() - connectingAt); phase("Poslouchám · čekám na první průběžný překlad…"); }
     };

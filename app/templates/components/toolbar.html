@@ -21,20 +21,20 @@
       <a class="ui-button ui-button--icon" href="https://github.com/Rhiz3K/realtime-stt-translator" target="_blank" rel="noopener noreferrer" aria-label="Zdrojový kód na GitHubu" title="Zdrojový kód na GitHubu">{{ icon('github') }}</a>
     </div>
     <div class="session-controls">
-      <span class="ui-badge">Google Live <span aria-hidden="true">·</span> CS → EN + RU</span>
+      <span class="ui-badge"><span id="stt-engine">Web Speech · Google záloha</span> <span aria-hidden="true">·</span> CS → EN + RU</span>
       <div id="status" class="status" data-state="idle" role="status" aria-live="polite">Připraveno</div>
       <button id="toggle" class="ui-button ui-button--primary" type="button" data-active="false">Spustit mikrofon</button>
     </div>
   </div>
   <dl class="metrics" aria-label="Statistiky aktuální relace">
-    {{ metric('stat-audio', 'Audio', '00:00', 'Délka skutečně odeslaného audia v aktuální relaci.') }}
+    {{ metric('stat-audio', 'Audio', '00:00', 'Délka zachyceného audia v aktuální relaci. U Web Speech slouží PCM jen místnímu měření.') }}
     {{ metric('stat-interim', 'Interim', '0', 'Počet zobrazených průběžných párů EN/RU v této relaci.') }}
     {{ metric('stat-final', 'Final', '0', 'Počet zobrazených finálních párů EN/RU v této relaci.') }}
-    {{ metric('stat-stt', 'STT první', '—', 'Od prvního audio rámce na serveru do prvního přepisu; zahrnuje i úvodní ticho. Nejde o latenci každé věty.') }}
+    {{ metric('stat-stt', 'STT první', '—', 'Od prvního PCM rámce do prvního přepisu: Web Speech měří prohlížeč, Google zálohu server. Zahrnuje úvodní ticho; nejde o latenci každé věty.') }}
     {{ metric('stat-translation', 'Překlad', '—', 'Délka posledního Google překladového požadavku, včetně případného retry finalu. Bez čekání ve frontě.') }}
     {{ metric('stat-queue', 'Čekání', '—', 'Od přijetí vybraného přepisu do spuštění překladu, včetně slučování interim.') }}
-    {{ metric('stat-hypotheses', 'STT I / F', '0 / 0', 'Počet průběžných hypotéz / finálních přepisů od Google; aktualizováno při překladových požadavcích.') }}
-    {{ metric('stat-connect', 'Připojení', '—', 'Čas připojení WebSocketu a přípravy Google; nezahrnuje povolování mikrofonu. Není to RTT.') }}
+    {{ metric('stat-hypotheses', 'STT I / F', '0 / 0', 'Počet přijatých průběžných hypotéz / finálních přepisů; aktualizováno při překladových požadavcích.') }}
+    {{ metric('stat-connect', 'Připojení', '—', 'Čas připojení WebSocketu (u zálohy i Google STT); nezahrnuje povolování mikrofonu ani start Web Speech. Není to RTT.') }}
     <div class="metric metric--meter"><dt id="level-label">Mikrofon</dt><dd><meter id="audio-level" min="0" max="100" value="0" aria-labelledby="level-label"></meter></dd></div>
   </dl>
 </header>

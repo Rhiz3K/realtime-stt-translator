@@ -22,6 +22,12 @@
   let generation = 0;
   let flushTimer = null;
   let errorShown = false;
+  let sessionEnded = false;
+  let audioSent = false;
+  let terminalErrorReceived = false;
+  let speech = null;
+  let primary = false;
+  let fallbackPending = false;
 
   function setStatus(text, state = "idle") {
     status.textContent = text;
@@ -30,7 +36,7 @@
 
   function setButton(active, disabled = false) {
     toggle.dataset.active = active ? "true" : "false";
-    toggle.textContent = active ? "Zastavit" : "Spustit mikrofon";
+    toggle.textContent = active ? (stopping ? "Dokončuji…" : "Zastavit") : "Spustit mikrofon";
     toggle.disabled = disabled;
   }
 
@@ -39,13 +45,17 @@
       audio_too_large: "Zvukový rámec je příliš velký.",
       audio_rate_exceeded: "Zvuk přicházel rychleji než v reálném čase.",
       invalid_audio: "Prohlížeč odeslal neplatný zvuk.",
+      invalid_message: "Prohlížeč odeslal neplatný přepis.",
+      transcript_too_large: "Přepis překročil bezpečnou délku. Spusťte novou relaci.",
+      transcript_rate_exceeded: "Přepisy přicházely příliš rychle. Relace byla zastavena.",
+      speech_denied: "Rozpoznávání nebo mikrofon nebyl povolen. Povolte jej v prohlížeči.",
       server_busy: "Server právě obsluhuje maximum živých relací.",
       google_rate_limited: "Google je právě vytížený. Zkuste to za chvíli.",
       google_timeout: "Google neodpověděl včas.",
       google_unavailable: "Google překlad je dočasně nedostupný.",
       interim_translation_failed: "Průběžný překlad je dočasně nedostupný. Finální překlad pokračuje.",
       translation_failed: "Jeden konečný překlad se nepodařilo vytvořit.",
-      transcription_incomplete: "Úplnost závěru řeči se nepodařilo potvrdit. Překlad může být neúplný.",
+      transcription_incomplete: "Závěr řeči nebyl potvrzen. Hotové překlady zůstávají; poslední část může chybět.",
       audio_backpressure: "Síť nestíhá přenášet zvuk. Relace byla zastavena; závěr může chybět.",
       translation_backlog_full: "Překlad nestíhá přijímanou řeč. Spusťte novou relaci.",
       session_limit: "Relace dosáhla časového limitu. Po dokončení překladů spusťte novou.",
@@ -54,7 +64,11 @@
     };
     errorShown = true;
     const message = messages[code] || "Překlad se nepodařilo dokončit.";
-    setStatus(message, "error");
+    if (code === "transcription_incomplete") {
+      setStatus("Zastaveno · závěr nepotvrzen", "warning");
+    } else {
+      setStatus(message, "error");
+    }
     ui.showError(code, message);
   }
 
@@ -82,12 +96,12 @@
     const resetGeneration = ++generation;
     clearTimeout(flushTimer);
     flushTimer = null;
+    speech?.dispose();
+    speech = null;
     const closingSocket = socket;
     socket = null;
     stopping = true;
     setButton(false, true);
-    clearInterim();
-    ui.endSession();
     const released = releaseAudio();
     if (closeSocket && closingSocket && closingSocket.readyState < WebSocket.CLOSING) {
       closingSocket.close(1000, "Client reset");
@@ -99,7 +113,8 @@
     stopping = false;
     stopSent = false;
     setButton(false, false);
-    if (!errorShown) setStatus("Připraveno");
+    if (!errorShown) setStatus(sessionEnded ? "Zastaveno" : "Připraveno");
+    ui.endSession(status.textContent, status.dataset.state);
   }
 
   function abortCongestedSession(run, activeSocket) {
@@ -127,6 +142,50 @@
     }
   }
 
+  function speechFailed(run, activeSocket, code) {
+    if (run !== generation || socket !== activeSocket || stopping) return;
+    const denied = ["not-allowed", "service-not-allowed"].includes(code);
+    fallbackPending = !denied;
+    stopping = true;
+    if (denied) showError("speech_denied");
+    else {
+      errorShown = true;
+      ui.showError("transcription_incomplete", "Web Speech vypadl. Přechod na Google zálohu může vynechat rozpracovanou řeč; přijaté finaly se dopřeloží.");
+      setStatus("Web Speech nedostupný · dokončuji finaly a připojím Google zálohu…", "warning");
+    }
+    // Keep the Stop control usable during the drain so the user can cancel
+    // automatic fallback. No audio is secretly recorded/queued in this gap.
+    setButton(true, denied);
+    if (!denied) toggle.textContent = "Zrušit přepnutí";
+    void releaseAudio();
+    sendStop(run, activeSocket);
+  }
+
+  function beginSpeech(run, activeSocket) {
+    speech = window.createSpeechCapture({
+      audioTrack: mediaStream.getAudioTracks()[0],
+      onTranscript(type, text) {
+        if (run !== generation || socket !== activeSocket || stopSent) return;
+        if (activeSocket.bufferedAmount > MAX_BUFFERED_AUDIO_BYTES) {
+          abortCongestedSession(run, activeSocket);
+          return;
+        }
+        activeSocket.send(JSON.stringify({type, text}));
+      },
+      onFirstStt(value) {
+        if (run === generation && socket === activeSocket) ui.telemetry({first_stt_ms: value});
+      },
+      onFailure(code) { speechFailed(run, activeSocket, code); },
+      onStopped(confirmed) {
+        if (run !== generation || socket !== activeSocket) return;
+        if (!confirmed) showError("transcription_incomplete");
+        void releaseAudio();
+        sendStop(run, activeSocket);
+      }
+    });
+    speech.start();
+  }
+
   async function beginCapture(run) {
     if (run !== generation || stopping || captureNode) return;
     if (!audioContext || !mediaStream) throw new Error("Audio capture is not ready.");
@@ -142,11 +201,21 @@
       if (run !== generation || socket !== activeSocket || captureNode !== activeCapture) return;
       if (event.data instanceof ArrayBuffer) {
         if (activeSocket.readyState === WebSocket.OPEN && !stopSent) {
+          if (primary) {
+            // Meter and watchdog only: never send PCM to Google on this path.
+            if (!stopping) {
+              audioSent = true;
+              ui.audioFrame(event.data);
+              speech?.audioFrame(event.data);
+            }
+            return;
+          }
           if (activeSocket.bufferedAmount + event.data.byteLength > MAX_BUFFERED_AUDIO_BYTES) {
             abortCongestedSession(run, activeSocket);
             return;
           }
           activeSocket.send(event.data);
+          audioSent = true;
           ui.audioFrame(event.data);
         }
       } else if (event.data && event.data.type === "flushed" && stopping) {
@@ -163,16 +232,23 @@
     starting = false;
     setButton(true, false);
     setStatus("Poslouchám…", "live");
+    if (primary) beginSpeech(run, activeSocket);
   }
 
-  async function start() {
+  async function start(forceBackup = false) {
     if (starting || running || stopping) return;
     const run = ++generation;
     starting = true;
     errorShown = false;
+    sessionEnded = false;
+    audioSent = false;
+    terminalErrorReceived = false;
+    fallbackPending = false;
+    primary = !forceBackup && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+    document.getElementById("stt-engine").textContent = primary ? "Web Speech" : "Google záloha";
     ui.beginSession();
     clearInterim();
-    setButton(false, true);
+    setButton(true, false);
     setStatus("Čekám na mikrofon…");
     try {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -210,12 +286,12 @@
       if (run !== generation || !acquiredStream) return;
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       ui.connecting();
-      const activeSocket = new WebSocket(`${protocol}//${location.host}/ws/audio`);
+      const activeSocket = new WebSocket(`${protocol}//${location.host}/ws/${primary ? "transcript" : "audio"}`);
       socket = activeSocket;
       activeSocket.binaryType = "arraybuffer";
       activeSocket.addEventListener("open", () => {
         if (run === generation && socket === activeSocket) {
-          setStatus("Připojuji Google…");
+          setStatus(primary ? "Připojuji překlad…" : "Připojuji Google zálohu…");
         }
       });
       activeSocket.addEventListener("message", async (event) => {
@@ -230,10 +306,13 @@
             showError("audio_unavailable");
             await reset();
           }
+        } else if (message.type === "interim_reset") {
+          if (!stopping) clearInterim();
         } else if (
           (message.type === "interim" || message.type === "final") &&
           typeof message.en === "string" && typeof message.ru === "string"
         ) {
+          if (message.type === "interim" && stopping) return;
           if (message.type === "interim") renderInterim(message.en, message.ru);
           else renderFinal(message.en, message.ru);
           if (running && !stopping) {
@@ -243,8 +322,15 @@
         } else if (message.type === "telemetry") {
           ui.telemetry(message);
         } else if (message.type === "error") {
+          if (message.code === "interim_translation_failed" && stopping) return;
           showError(message.code);
           if (!["translation_failed", "interim_translation_failed"].includes(message.code)) {
+            fallbackPending = false;
+            speech?.dispose();
+            if (primary && message.code === "session_limit" && audioSent) {
+              ui.showError("transcription_incomplete", "Časový limit přerušil Web Speech. Rozpracovaný závěr nemusí být úplný.");
+            }
+            terminalErrorReceived = message.code !== "session_limit";
             stopping = true;
             stopSent = true;
             clearTimeout(flushTimer);
@@ -253,16 +339,28 @@
             await releaseAudio();
           }
         } else if (message.type === "ended") {
-          if (!errorShown) setStatus("Dokončeno");
+          sessionEnded = true;
+          if (!errorShown) setStatus("Zastaveno");
         }
       });
       activeSocket.addEventListener("error", () => {
         if (run === generation && socket === activeSocket) {
+          fallbackPending = false;
           showError("session_failed");
         }
       });
-      activeSocket.addEventListener("close", () => {
-        if (socket === activeSocket) void reset(false);
+      activeSocket.addEventListener("close", async () => {
+        if (run !== generation || socket !== activeSocket) return;
+        // A transport close alone does not confirm that Stop drained the tail.
+        if (!sessionEnded && !terminalErrorReceived) {
+          if (stopping && audioSent) showError("transcription_incomplete");
+          else if (!stopping && !errorShown) showError("session_failed");
+        }
+        const useBackup = fallbackPending && sessionEnded;
+        fallbackPending = false;
+        await reset(false);
+        // reset increments exactly once; a newer user session supersedes this.
+        if (useBackup && generation === run + 1) await start(true);
       });
     } catch (error) {
       if (run !== generation) return;
@@ -274,6 +372,12 @@
   }
 
   async function stop() {
+    if (fallbackPending) {
+      fallbackPending = false;
+      setButton(true, true);
+      setStatus("Dokončuji překlad…");
+      return;
+    }
     if (stopping) return;
     if (starting && !running) {
       generation += 1;
@@ -286,6 +390,13 @@
     stopping = true;
     setButton(true, true);
     setStatus("Dokončuji překlad…");
+    ui.stopping();
+    if (primary) {
+      // Recognition owns its microphone. Give stop() its final-result chance
+      // before closing either the recognizer or the translation WebSocket.
+      speech?.stop();
+      return;
+    }
     if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
     if (sourceNode) sourceNode.disconnect();
     if (captureNode) {
@@ -304,6 +415,8 @@
   });
 
   window.addEventListener("beforeunload", () => {
+    fallbackPending = false;
+    speech?.dispose();
     if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
     if (socket && socket.readyState === WebSocket.OPEN) socket.close();
   });

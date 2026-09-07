@@ -1,4 +1,5 @@
 import asyncio
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +26,177 @@ def test_live_config_is_fixed_clean_czech_transcription():
     assert [value.value for value in config.response_modalities] == ["TEXT"]
     assert config.input_audio_transcription.language_codes == ["cs-CZ"]
     assert config.input_audio_transcription.mode.value == "SMART"
+    activity = config.realtime_input_config.automatic_activity_detection
+    assert config.realtime_input_config.activity_handling.value == "NO_INTERRUPTION"
+    assert activity.disabled is True
+    assert activity.model_dump(exclude_none=True) == {"disabled": True}
     assert google_audio.TRANSCRIBE_MODEL == "gemini-3.5-transcribe-live"
     assert google_audio.AUDIO_MIME_TYPE == "audio/pcm;rate=16000"
+
+
+def _pcm(value=8000, samples=1600):
+    return struct.pack("<h", value) * samples
+
+
+def test_endpointing_does_not_turn_initial_or_continued_silence_into_speech():
+    segmenter = google_audio.AudioSegmenter()
+    assert not any(segmenter.boundary_after(_pcm(0)) for _ in range(150))
+    assert not any(segmenter.boundary_after(_pcm()) for _ in range(25))
+    assert [segmenter.boundary_after(_pcm(0)) for _ in range(4)] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert not any(segmenter.boundary_after(_pcm(0)) for _ in range(150))
+
+
+def test_endpointing_prefers_short_pause_after_target_and_bounds_continuous_speech():
+    segmenter = google_audio.AudioSegmenter()
+    assert not any(segmenter.boundary_after(_pcm()) for _ in range(65))
+    assert not segmenter.boundary_after(_pcm(0))
+    assert segmenter.boundary_after(_pcm(0))
+    boundaries = [segmenter.boundary_after(_pcm()) for _ in range(240)]
+    assert [index + 1 for index, boundary in enumerate(boundaries) if boundary] == [
+        120,
+        240,
+    ]
+
+
+def test_endpointing_counts_partial_frames_and_little_endian_audio():
+    segmenter = google_audio.AudioSegmenter()
+    # Same 12 seconds split into 10 ms frames, including negative PCM samples.
+    boundaries = [segmenter.boundary_after(_pcm(-10000, 160)) for _ in range(1200)]
+    assert sum(boundaries) == 1
+    assert boundaries[-1]
+
+
+class _ManualUpstream:
+    def __init__(self):
+        self.sent = []
+        self.messages = asyncio.Queue()
+        self.end_sent = asyncio.Event()
+        self.closed = False
+
+    async def send_realtime_input(self, **kwargs):
+        self.sent.append(kwargs)
+        if "activity_end" in kwargs:
+            self.end_sent.set()
+
+    async def receive(self):
+        yield await self.messages.get()
+
+    async def close(self):
+        self.closed = True
+
+
+def test_manual_activity_waits_for_generation_before_reopening_without_losing_pcm(
+    monkeypatch,
+):
+    monkeypatch.setattr(google_audio, "SEGMENT_MAX_SECONDS", 0.2)
+
+    async def scenario():
+        upstream = _ManualUpstream()
+        session = google_audio.GoogleAudioSession(upstream)
+        received = []
+
+        async def read():
+            while True:
+                async for message in session.receive():
+                    received.append(message)
+
+        reader = asyncio.create_task(read())
+        frames = [_pcm(0, 1), _pcm(1000), _pcm(-2000), _pcm(3000, 5)]
+        try:
+            # Silence and a partial prefix must follow activity_start too.
+            await session.send_audio(frames[0])
+            await session.send_audio(frames[1])
+            boundary = asyncio.create_task(session.send_audio(frames[2]))
+            await upstream.end_sent.wait()
+            assert [next(iter(item)) for item in upstream.sent] == [
+                "activity_start",
+                "audio",
+                "audio",
+                "audio",
+                "activity_end",
+            ]
+            final = _message(final="hotovo")
+            final.server_content.turn_complete = True
+            await upstream.messages.put(final)
+            # A final/turn_complete alone is not this activity's generation ack.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not boundary.done()
+            completion = SimpleNamespace(
+                server_content=SimpleNamespace(generation_complete=True)
+            )
+            await upstream.messages.put(completion)
+            await asyncio.wait_for(boundary, 0.1)
+            await session.send_audio(frames[3])
+            await session.end_input()
+            await session.end_input()
+            assert [
+                item["audio"].data for item in upstream.sent if "audio" in item
+            ] == frames
+            assert [next(iter(item)) for item in upstream.sent][-4:] == [
+                "activity_end",
+                "activity_start",
+                "audio",
+                "activity_end",
+            ]
+            assert received == [final, completion]
+            assert not any("audio_stream_end" in item for item in upstream.sent)
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            await session.close()
+        assert upstream.closed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_manual_boundary_cannot_reopen_after_timeout_or_cancel_or_use_stale_ack(
+    monkeypatch, cancel
+):
+    monkeypatch.setattr(google_audio, "SEGMENT_MAX_SECONDS", 0.1)
+    monkeypatch.setattr(google_audio, "TURN_FINALIZATION_TIMEOUT_SECONDS", 0.02)
+
+    async def scenario():
+        upstream = _ManualUpstream()
+        session = google_audio.GoogleAudioSession(upstream)
+        # Previous completion must be cleared before issuing a new end.
+        await upstream.messages.put(
+            SimpleNamespace(server_content=SimpleNamespace(generation_complete=True))
+        )
+        async for _ in session.receive():
+            pass
+        task = asyncio.create_task(session.send_audio(_pcm()))
+        await upstream.end_sent.wait()
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+            await task
+        with pytest.raises(TimeoutError):
+            await session.send_audio(_pcm())
+        await session.end_input()
+        assert [next(iter(item)) for item in upstream.sent] == [
+            "activity_start",
+            "audio",
+            "activity_end",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_empty_manual_session_does_not_send_an_activity_end():
+    async def scenario():
+        upstream = _ManualUpstream()
+        session = google_audio.GoogleAudioSession(upstream)
+        await session.end_input()
+        assert upstream.sent == []
+
+    asyncio.run(scenario())
 
 
 def test_final_transcript_wins_when_message_contains_both_fields():

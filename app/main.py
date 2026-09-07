@@ -29,16 +29,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from google import genai
-from google.genai import errors, types
+from google.genai import errors
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.google_audio import (
-    AUDIO_MIME_TYPE,
     FINAL_TIMEOUT_SECONDS,
     MAX_AUDIO_CHUNK_BYTES,
     MAX_FINAL_BACKLOG,
+    MAX_TRANSCRIPT_CHARS,
     TRANSCRIBE_MODEL,
     GeminiPairTranslator,
+    GoogleAudioSession,
     TranslationBacklogFull,
     TranslationCoordinator,
     live_transcription_config,
@@ -503,7 +504,7 @@ async def _connect_google_live(async_client: object):
         connection.__aenter__(), timeout=_GOOGLE_SETUP_TIMEOUT_SECONDS
     )
     try:
-        yield google_session
+        yield GoogleAudioSession(google_session)
     except BaseException as exc:
         suppressed = await asyncio.wait_for(
             connection.__aexit__(type(exc), exc, exc.__traceback__),
@@ -554,9 +555,7 @@ async def _receive_browser_audio(
                     if coordinator is not None:
                         coordinator.note_audio()
                     await asyncio.wait_for(
-                        google_session.send_realtime_input(
-                            audio=types.Blob(data=audio, mime_type=AUDIO_MIME_TYPE)
-                        ),
+                        google_session.send_audio(audio),
                         timeout=_GOOGLE_SEND_TIMEOUT_SECONDS,
                     )
             continue
@@ -638,7 +637,7 @@ async def _end_google_input(google_session: object, send_lock: asyncio.Lock) -> 
     # Serialize against an audio frame already in flight when a server-side
     # limit fires. The enclosing timeout includes waiting for that frame.
     async with send_lock:
-        await google_session.send_realtime_input(audio_stream_end=True)
+        await google_session.end_input()
 
 
 async def _finish_audio_session(
@@ -651,7 +650,11 @@ async def _finish_audio_session(
     send_lock: asyncio.Lock,
     terminal_error: Exception | None,
 ) -> None:
-    if terminal_error is None:
+    # A genuinely empty connection has nothing to flush. Google can keep the
+    # live transport open after activity_end, so waiting for EOF here would
+    # turn an immediate Start/Stop into a false incomplete-transcription error.
+    # note_audio() happens before sending, including sends that stall/fail.
+    if terminal_error is None and coordinator.has_input:
         try:
             await asyncio.wait_for(
                 _end_google_input(google_session, send_lock),
@@ -804,6 +807,156 @@ async def _serve_audio_session(websocket: WebSocket, sender: _JsonSender) -> Non
             )
 
 
+async def _receive_browser_transcripts(
+    websocket: WebSocket,
+    sender: _JsonSender,
+    coordinator: TranslationCoordinator,
+    stop_requested: asyncio.Event,
+) -> None:
+    """One reader, including during final drain. No audio or provider options."""
+    # Bound message frequency separately from the actor's paid-request throttle.
+    tokens = 40.0
+    updated_at = time.monotonic()
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        if stop_requested.is_set():
+            continue
+        raw = message.get("text")
+        if not isinstance(raw, str):
+            raise _ClientProtocolError(1008, "Text required", "invalid_message")
+        if len(raw) > MAX_TRANSCRIPT_CHARS * 6 + 128:
+            raise _ClientProtocolError(
+                1009, "Transcript too large", "transcript_too_large"
+            )
+        try:
+            payload = json.loads(raw)
+        except (ValueError, RecursionError):
+            payload = None
+        if payload == {"type": "stop"}:
+            stop_requested.set()
+            continue
+        now = time.monotonic()
+        tokens = min(40.0, tokens + max(0, now - updated_at) * 20)
+        updated_at = now
+        if tokens < 1:
+            raise _ClientProtocolError(
+                1008, "Transcript rate exceeded", "transcript_rate_exceeded"
+            )
+        tokens -= 1
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"type", "text"}
+            or payload["type"] not in ("interim", "final")
+            or not isinstance(payload["text"], str)
+        ):
+            raise _ClientProtocolError(1008, "Invalid transcript", "invalid_message")
+        text = payload["text"]
+        if len(text) > MAX_TRANSCRIPT_CHARS:
+            raise _ClientProtocolError(
+                1009, "Transcript too large", "transcript_too_large"
+            )
+        if not text.strip():
+            if payload["type"] == "final":
+                raise _ClientProtocolError(1008, "Empty final", "invalid_message")
+            coordinator.clear_interim()
+            await sender.send({"type": "interim_reset"})
+        else:
+            coordinator.submit(payload["type"], text)
+
+
+async def _finish_transcript_session(
+    websocket: WebSocket,
+    sender: _JsonSender,
+    coordinator: TranslationCoordinator,
+    translation_task: asyncio.Task[None],
+    terminal_error: Exception | None,
+    limit_reached: bool,
+) -> None:
+    coordinator.close()
+    if limit_reached:
+        await sender.send(
+            {"type": "error", "code": "session_limit", "recoverable": True}
+        )
+    reported = (
+        await _report_terminal_error(sender, terminal_error)
+        if terminal_error is not None
+        else None
+    )
+    await _drain_translations(coordinator, translation_task)
+    if reported:
+        raise reported
+    await sender.send({"type": "ended"})
+    await websocket.close(code=1000, reason="Finished")
+
+
+async def _serve_transcript_session(websocket: WebSocket, sender: _JsonSender) -> None:
+    """Translate Web Speech results; never create a paid Live STT connection."""
+    async_client = _create_google_client().aio
+    coordinator = TranslationCoordinator(
+        GeminiPairTranslator(async_client), sender.send, report=sender.send
+    )
+    stop_requested = asyncio.Event()
+    translation_task = asyncio.create_task(coordinator.run())
+    browser_task = asyncio.create_task(
+        _receive_browser_transcripts(websocket, sender, coordinator, stop_requested)
+    )
+    limit_task = asyncio.create_task(asyncio.sleep(_SESSION_MAX_SECONDS))
+    stop_task = asyncio.create_task(stop_requested.wait())
+    finish_task = None
+    try:
+        await sender.send({"type": "ready"})
+        done, _ = await asyncio.wait(
+            {browser_task, translation_task, limit_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        terminal_error = None
+        if browser_task in done:
+            try:
+                browser_task.result()
+            except Exception as exc:
+                terminal_error = exc
+                browser_task = asyncio.create_task(_watch_browser_disconnect(websocket))
+            else:
+                return
+        if translation_task in done:
+            translation_task.result()
+            raise RuntimeError("Translation actor ended unexpectedly")
+        stop_requested.set()
+        coordinator.close()
+        await _cancel_tasks(limit_task, stop_task)
+        finish_task = asyncio.create_task(
+            asyncio.wait_for(
+                _finish_transcript_session(
+                    websocket,
+                    sender,
+                    coordinator,
+                    translation_task,
+                    terminal_error,
+                    limit_task in done,
+                ),
+                timeout=_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        )
+        done, _ = await asyncio.wait(
+            {browser_task, finish_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if browser_task in done:
+            browser_task.result()
+            return
+        finish_task.result()
+    finally:
+        coordinator.close()
+        await _cancel_tasks(
+            browser_task, translation_task, limit_task, stop_task, finish_task
+        )
+        with suppress(Exception):
+            await asyncio.wait_for(
+                async_client.aclose(), timeout=_GOOGLE_CLOSE_TIMEOUT_SECONDS
+            )
+
+
 def _status_code_from_google_error(exc: BaseException) -> int | None:
     value = getattr(exc, "code", None)
     if isinstance(value, int):
@@ -876,6 +1029,7 @@ async def _best_effort_close(websocket: WebSocket, code: int, reason: str) -> No
         await websocket.close(code=code, reason=reason)
 
 
+@app.websocket("/ws/transcript")
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
     if not await _require_ws_auth(websocket):
@@ -897,7 +1051,10 @@ async def audio_websocket(websocket: WebSocket):
         await websocket.accept()
         sender = _JsonSender(websocket)
         try:
-            await _serve_audio_session(websocket, sender)
+            if websocket.url.path == "/ws/transcript":
+                await _serve_transcript_session(websocket, sender)
+            else:
+                await _serve_audio_session(websocket, sender)
         except WebSocketDisconnect:
             return
         except _ReportedSessionError as exc:

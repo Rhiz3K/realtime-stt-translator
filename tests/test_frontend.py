@@ -11,7 +11,9 @@ TOOLBAR = (ROOT / "app/templates/components/toolbar.html").read_text(encoding="u
 UI = (ROOT / "app/static/translator-ui.js").read_text(encoding="utf-8")
 SESSION = (ROOT / "app/static/audio-session.js").read_text(encoding="utf-8")
 WORKLET = (ROOT / "app/static/pcm-worklet.js").read_text(encoding="utf-8")
-PAIR = (ROOT / "app/templates/components/translation-pair.html").read_text(encoding="utf-8")
+PAIR = (ROOT / "app/templates/components/translation-pair.html").read_text(
+    encoding="utf-8"
+)
 
 
 def test_frontend_has_presentation_controls_but_no_pipeline_configuration():
@@ -28,8 +30,6 @@ def test_frontend_has_presentation_controls_but_no_pipeline_configuration():
     for source in (INDEX, TOOLBAR, UI, SESSION):
         assert "<select" not in source.lower()
         assert 'type="number"' not in source.lower()
-        assert "WebSpeech" not in source
-        assert "SpeechRecognition" not in source
         assert 'type: "config"' not in source
     assert 'JSON.stringify({type: "stop"})' in SESSION
     assert "localStorage" not in SESSION
@@ -75,7 +75,10 @@ def test_worklet_emits_fixed_pcm16_100ms_frames():
     assert "this.ratio = sampleRate / this.targetRate" in WORKLET
 
 
-@pytest.mark.parametrize("script", ["translator-ui.js", "audio-session.js"])
+@pytest.mark.parametrize(
+    "script",
+    ["interim-layout.js", "translator-ui.js", "web-speech.js", "audio-session.js"],
+)
 def test_application_javascript_parses_when_node_is_available(script):
     node = shutil.which("node")
     if not node:
