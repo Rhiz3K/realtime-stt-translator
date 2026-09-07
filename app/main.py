@@ -146,7 +146,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             ),
         )
         response.headers.setdefault("Permissions-Policy", "microphone=(self)")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # Preserve Origin on native same-origin form POSTs (notably /login).
+        # no-referrer makes browsers send Origin: null; same-origin still
+        # prevents leaking referrers to other sites.
+        response.headers.setdefault("Referrer-Policy", "same-origin")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")

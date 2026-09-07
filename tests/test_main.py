@@ -242,7 +242,28 @@ def test_login_sets_http_only_cookie_and_unlocks_app(monkeypatch):
     assert page.status_code == 200
 
 
-def test_login_rejects_cross_origin_and_bad_password(monkeypatch):
+def test_login_form_preserves_same_origin_for_native_post(monkeypatch):
+    monkeypatch.setattr(main, "AUTH_ENABLED", True)
+    monkeypatch.setattr(main, "APP_PASSWORD", "heslo")
+    monkeypatch.setattr(main, "AUTH_SECRET", "secret")
+    with TestClient(main.app) as client:
+        page = client.get("/login")
+        wrong = client.post(
+            "/login",
+            data={"password": "wrong"},
+            headers={"origin": "http://testserver"},
+        )
+    assert page.status_code == 200
+    assert wrong.status_code == 401
+    for response in (page, wrong):
+        # no-referrer makes native form POSTs send Origin: null in browsers.
+        assert response.headers["referrer-policy"] == "same-origin"
+        assert '<form method="post" action="/login">' in response.text
+        assert "form-action 'self'" in response.headers["content-security-policy"]
+
+
+@pytest.mark.parametrize("origin", ["https://attacker.example", "null"])
+def test_login_rejects_cross_origin_and_bad_password(monkeypatch, origin):
     monkeypatch.setattr(main, "AUTH_ENABLED", True)
     monkeypatch.setattr(main, "APP_PASSWORD", "heslo")
     monkeypatch.setattr(main, "AUTH_SECRET", "secret")
@@ -250,7 +271,7 @@ def test_login_rejects_cross_origin_and_bad_password(monkeypatch):
         cross_origin = client.post(
             "/login",
             data={"password": "heslo"},
-            headers={"origin": "https://attacker.example"},
+            headers={"origin": origin},
         )
         wrong = client.post(
             "/login",
@@ -258,6 +279,8 @@ def test_login_rejects_cross_origin_and_bad_password(monkeypatch):
             headers={"origin": "http://testserver"},
         )
     assert cross_origin.status_code == 403
+    assert cross_origin.json() == {"detail": "Cross-origin login not allowed"}
+    assert "set-cookie" not in cross_origin.headers
     assert wrong.status_code == 401
     assert "Nesprávné heslo" in wrong.text
 
