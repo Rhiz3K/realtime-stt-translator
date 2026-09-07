@@ -12,7 +12,7 @@ def test_dockerfile_is_small_runtime_only_image():
     assert "requirements-parakeet-prep" not in dockerfile
     assert "prepare_" not in dockerfile
     assert "app.nemotron_assets" not in dockerfile
-    assert "/health/ready" in dockerfile
+    assert 'CMD ["python", "-m", "app.healthcheck"]' in dockerfile
     assert "USER appuser" in dockerfile
     assert "uvicorn app.main:app" in dockerfile
 

@@ -151,6 +151,12 @@ Kontejner běží pod neprivilegovaným uživatelem. `GET /health/live` ověřuj
 procesu a `GET /health/ready` vrací 200 pouze s použitelnou Google a auth
 konfigurací. Docker `HEALTHCHECK` používá `/health/ready`.
 
+V Coolify vyberte build pack **Dockerfile**, soubor `/Dockerfile` a port `8000`.
+Pokud nastavujete vlastní Healthcheck v Coolify, použijte typ **CMD** a příkaz
+`python -m app.healthcheck` (interval 30 s, timeout 5 s, start period 10 s,
+3 pokusy). Kontrola používá pouze Python a runtime `PORT`; HTTP kontrola z UI
+Coolify vyžaduje `curl` nebo `wget`, které tento malý image neobsahuje.
+
 Za reverzní proxy povolte WebSocket upgrade, používejte HTTPS a správně nastavte
 `FORWARDED_ALLOW_IPS` i `ALLOWED_ORIGINS`.
 
