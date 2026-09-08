@@ -41,6 +41,7 @@ configuration messages to either WebSocket protocol.
 
 - `app/main.py`: auth, security headers, health and protected audio/transcript WS.
 - `app/google_audio.py`: fixed Google models/configuration and cost-aware actor.
+- `app/diagnostics.py`: allowlisted, content-free server session/request logs.
 - `app/static/pcm-worklet.js`: fixed 100 ms PCM16 capture/resampling.
 - `app/templates/index.html`: page composed from `components/` Jinja macros.
 - `app/static/design-tokens.css`, `translator.css`: tokens, atoms, molecules, layout.
@@ -133,6 +134,12 @@ Keep edits local; if available, `ruff check .` and `ruff format .` are suitable.
   with a recoverable `session_limit` event.
 - Insert browser content with `textContent`, never `innerHTML`.
 - Do not log transcripts, passwords, cookies, or API keys.
+- Diagnostics use server-generated per-session IDs and per-work IDs, UTC JSON
+  records on Uvicorn's INFO logger, and only allowlisted enums/numeric fields.
+  Never enable SDK/HTTP DEBUG or log exception text/tracebacks/provider bodies.
+  Count every accepted input but coalesce interim progress logging; keep
+  request outcomes, retries and shutdown summaries distinct. No diagnostic
+  configuration or new browser messages; browser-only failures remain unknown.
 
 ## Fixed model choices
 

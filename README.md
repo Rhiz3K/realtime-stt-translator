@@ -275,6 +275,45 @@ nemá retry. `transcription_incomplete` označuje neověřený konec vstupu.
 `telemetry` neobsahuje přepis ani klíče; časy, které nejsou změřené, chybí nebo
 jsou `null`. Zprávy EN/RU zůstávají společné a beze změny.
 
+## Diagnostické logy v Coolify
+
+Kontejner zapisuje při výchozím spuštění řádky `translator {JSON}` přes logger
+Uvicornu (INFO, chyby WARNING). Nevyžadují nové env vars ani SDK DEBUG logování.
+Každá relace má náhodné serverové `session_id`, každý vybraný překlad `work_id`.
+Čas `timestamp` je vždy UTC; čas zobrazený Coolify může používat jinou zónu.
+
+- `session_open`, `session_ready`, `session_stop_requested`,
+  `session_disconnect`, `session_close_requested`, `session_close`: životní
+  cyklus, cesta `web_speech` / `google_audio`, close kód a výsledek ukončení.
+- `stt_progress`: počty přijatých přepisů a délka vstupu ve znacích. První přepis
+  a každý final jsou viditelné; interim souhrn nejvýše jednou za 5 s.
+- `translation_started`, `translation_succeeded`, `translation_failed`,
+  `translation_cancelled`: vybraný model, čekání ve frontě, délka požadavku,
+  čekající finaly a zrušení například kvůli novému finalu nebo ukončení relace.
+- `translation_attempt_failed`, `translation_retry`: jednotlivé pokusy,
+  HTTP status (např. 429/503), timeout nebo validace JSON. U neplatné odpovědi
+  se může objevit bezpečný `finish_reason`, např. `MAX_TOKENS`.
+- `session_error`: stejný bezpečný chybový kód jako v prohlížeči. Závěrečný
+  `session_close` obsahuje počty přijatých, spuštěných, úspěšných, neúspěšných
+  a zrušených překladů i retry. `completed` znamená dokončené ukončení relace,
+  nikoli záruku úspěchu všech překladů; zkontrolujte také počty selhání.
+
+`first_transcript_ms_since_session` měří čas od otevření serverové relace,
+nikoli od začátku řeči. `first_stt_ms` je na serveru dostupné pouze u Google
+audio zálohy. `audio_bytes` počítá PCM pokusně předané Google záloze (nepotvrzuje
+jeho zpracování); na Web Speech cestě je vždy nula. Úspěšný překlad v logu
+znamená odeslání do WebSocketu, nikoli potvrzené vykreslení na klientovi.
+`timeout_ms` je limit jednoho pokusu; `translation_ms` u finalu zahrnuje
+i případný retry. Zrušený požadavek negarantuje nulovou cenu na straně Googlu.
+
+Logy neobsahují přepisy, překlady, audio, cookies, klíče, celé providerové
+odpovědi ani texty výjimek. Povolené jsou jen pevné kódy a číselné metriky.
+Chyby browserové služby Web Speech a kliknutí na Stop se neposílají novým
+diagnostickým protokolem: server vidí přepisy, doručený Stop a odpojení,
+neumí ale z nich s jistotou určit důvod chyby uvnitř prohlížeče. Pro tento
+případ je stále důležitý screenshot hlášky/statistik nebo konzole prohlížeče.
+Historické události před nasazením této diagnostiky nelze zpětně doplnit.
+
 ## Docker
 
 ```bash

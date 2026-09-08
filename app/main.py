@@ -32,6 +32,7 @@ from google import genai
 from google.genai import errors
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app import diagnostics
 from app.google_audio import (
     FINAL_TIMEOUT_SECONDS,
     MAX_AUDIO_CHUNK_BYTES,
@@ -443,8 +444,21 @@ class _JsonSender:
         self._lock = asyncio.Lock()
 
     async def send(self, payload: dict[str, object]) -> None:
+        if payload.get("type") == "error":
+            code = payload.get("code")
+            diagnostics.event("session_error", error_code=code)
+            if code not in {
+                "translation_failed",
+                "interim_translation_failed",
+                "session_limit",
+            }:
+                diagnostics.outcome("terminal_error")
         async with self._lock:
             await self._websocket.send_json(payload)
+        if payload.get("type") == "ready":
+            diagnostics.event("session_ready")
+        elif payload.get("type") == "ended":
+            diagnostics.outcome("completed")
 
 
 class _ClientProtocolError(RuntimeError):
@@ -532,6 +546,7 @@ async def _receive_browser_audio(
     while True:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
+            diagnostics.disconnect(message.get("code"))
             return
         if stop_requested.is_set():
             # The server has told the client to stop. Do not buy more audio,
@@ -554,6 +569,7 @@ async def _receive_browser_audio(
                 if not stop_requested.is_set():
                     if coordinator is not None:
                         coordinator.note_audio()
+                    diagnostics.count("audio_bytes", len(audio))
                     await asyncio.wait_for(
                         google_session.send_audio(audio),
                         timeout=_GOOGLE_SEND_TIMEOUT_SECONDS,
@@ -566,6 +582,7 @@ async def _receive_browser_audio(
         except json.JSONDecodeError:
             control = None
         if control == {"type": "stop"}:
+            diagnostics.stop_requested()
             stop_requested.set()
             continue
         raise _ClientProtocolError(
@@ -604,8 +621,11 @@ async def _receive_google_transcripts(
 
 async def _watch_browser_disconnect(websocket: WebSocket) -> None:
     """Replace a failed reader only after it has finished, never concurrently."""
-    while (await websocket.receive())["type"] != "websocket.disconnect":
-        pass
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            diagnostics.disconnect(message.get("code"))
+            return
 
 
 async def _cancel_tasks(*tasks: asyncio.Task[object] | None) -> None:
@@ -687,6 +707,7 @@ async def _finish_audio_session(
     if reported_error is not None:
         raise reported_error from None
     await sender.send({"type": "ended"})
+    diagnostics.event("session_close_requested", close_code=1000)
     await websocket.close(code=1000, reason="Finished")
 
 
@@ -820,6 +841,7 @@ async def _receive_browser_transcripts(
     while True:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
+            diagnostics.disconnect(message.get("code"))
             return
         if stop_requested.is_set():
             continue
@@ -835,6 +857,7 @@ async def _receive_browser_transcripts(
         except (ValueError, RecursionError):
             payload = None
         if payload == {"type": "stop"}:
+            diagnostics.stop_requested()
             stop_requested.set()
             continue
         now = time.monotonic()
@@ -888,6 +911,7 @@ async def _finish_transcript_session(
     if reported:
         raise reported
     await sender.send({"type": "ended"})
+    diagnostics.event("session_close_requested", close_code=1000)
     await websocket.close(code=1000, reason="Finished")
 
 
@@ -1020,11 +1044,15 @@ async def _report_terminal_error(
         close_code = 1011
         reason = "Session failed"
 
+    diagnostics.event(
+        "session_exception", error_code=code, **diagnostics.error_fields(exc)
+    )
     await _best_effort_error(sender, code, recoverable=recoverable)
     return _ReportedSessionError(close_code, reason)
 
 
 async def _best_effort_close(websocket: WebSocket, code: int, reason: str) -> None:
+    diagnostics.event("session_close_requested", close_code=code)
     with suppress(Exception):
         await websocket.close(code=code, reason=reason)
 
@@ -1032,9 +1060,19 @@ async def _best_effort_close(websocket: WebSocket, code: int, reason: str) -> No
 @app.websocket("/ws/transcript")
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
+    stt = "web_speech" if websocket.url.path == "/ws/transcript" else "google_audio"
+    with diagnostics.session(stt):
+        await _handle_audio_websocket(websocket)
+
+
+async def _handle_audio_websocket(websocket: WebSocket):
     if not await _require_ws_auth(websocket):
+        diagnostics.outcome("auth_rejected")
+        diagnostics.event("session_close_requested", close_code=1008)
         return
     if configuration_errors():
+        diagnostics.outcome("not_configured")
+        diagnostics.event("session_close_requested", close_code=1011)
         await websocket.close(code=1011, reason="Server not configured")
         return
 
@@ -1044,6 +1082,7 @@ async def audio_websocket(websocket: WebSocket):
         sender = _JsonSender(websocket)
         await _best_effort_error(sender, "server_busy", recoverable=True)
         await _best_effort_close(websocket, 1013, "Server busy")
+        diagnostics.outcome("server_busy")
         return
     try:
         # accept() is inside the slot's finally scope: an aborted handshake must
@@ -1055,7 +1094,8 @@ async def audio_websocket(websocket: WebSocket):
                 await _serve_transcript_session(websocket, sender)
             else:
                 await _serve_audio_session(websocket, sender)
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as exc:
+            diagnostics.disconnect(exc.code)
             return
         except _ReportedSessionError as exc:
             # Its JSON error was sent before the possibly long final drain.
@@ -1067,6 +1107,7 @@ async def audio_websocket(websocket: WebSocket):
             await _best_effort_error(sender, "translation_backlog_full")
             await _best_effort_close(websocket, 1013, "Try again later")
         except errors.APIError as exc:
+            diagnostics.event("upstream_error", **diagnostics.error_fields(exc))
             status = _status_code_from_google_error(exc)
             if status == 429:
                 await _best_effort_error(
@@ -1077,10 +1118,12 @@ async def audio_websocket(websocket: WebSocket):
                 logger.warning("Google API session failed (status=%s)", status)
                 await _best_effort_error(sender, "google_unavailable", recoverable=True)
                 await _best_effort_close(websocket, 1011, "Google unavailable")
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            diagnostics.event("upstream_error", **diagnostics.error_fields(exc))
             await _best_effort_error(sender, "google_timeout", recoverable=True)
             await _best_effort_close(websocket, 1011, "Google timeout")
         except Exception as exc:
+            diagnostics.event("session_exception", **diagnostics.error_fields(exc))
             logger.error(
                 "Audio translation session failed (type=%s)", type(exc).__name__
             )

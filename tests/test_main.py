@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -161,6 +162,125 @@ def google_client(monkeypatch):
     monkeypatch.setattr(google_audio, "INTERIM_MIN_INTERVAL_SECONDS", 0.0)
     with TestClient(main.app) as client:
         yield client, fake
+
+
+def _diagnostic_records(caplog):
+    return [
+        json.loads(record.getMessage().removeprefix("translator "))
+        for record in caplog.records
+        if record.getMessage().startswith("translator ")
+    ]
+
+
+def test_translation_diagnostics_cover_the_real_ws_path_without_content(
+    google_client, caplog
+):
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    client, fake = google_client
+    private_text = "PRIVATE_TRANSCRIPT_CANARY"
+    with client.websocket_connect(
+        "/ws/transcript",
+        headers={"origin": "http://testserver", "cookie": "PRIVATE_COOKIE_CANARY"},
+    ) as ws:
+        assert _receive_app_message(ws) == {"type": "ready"}
+        ws.send_json({"type": "interim", "text": private_text})
+        assert _receive_app_message(ws)["type"] == "interim"
+        ws.send_json({"type": "final", "text": private_text})
+        ws.send_json({"type": "stop"})
+        assert _receive_app_message(ws)["type"] == "final"
+        assert _receive_app_message(ws) == {"type": "ended"}
+    data = _diagnostic_records(caplog)
+    assert len({row["session_id"] for row in data}) == 1
+    assert data[0]["event"] == "session_open"
+    assert any(row["event"] == "session_ready" for row in data)
+    summary = data[-1]
+    assert summary["event"] == "session_close"
+    assert summary["outcome"] == "completed"
+    assert summary["stop_requested"] is True
+    assert summary["interim_received"] == summary["interim_succeeded"] == 1
+    assert summary["final_received"] == summary["final_succeeded"] == 1
+    assert summary["audio_bytes"] == 0
+    successes = [row for row in data if row["event"] == "translation_succeeded"]
+    assert len(successes) == 2
+    assert all(row["translation_ms"] >= 0 and row["queue_ms"] >= 0 for row in successes)
+    assert all(
+        value not in caplog.text
+        for value in [
+            private_text,
+            "PRIVATE_COOKIE_CANARY",
+            "test-google-key",
+            "test-secret",
+        ]
+    )
+    assert fake.connect_calls == []
+
+
+@pytest.mark.parametrize("path", ["/ws/audio", "/ws/transcript"])
+def test_empty_and_rejected_sessions_are_visible_without_sdk_calls(
+    google_client, caplog, path
+):
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    client, fake = google_client
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            path, headers={"origin": "http://PRIVATE_ORIGIN_CANARY"}
+        ):
+            pass
+    rejected = _diagnostic_records(caplog)[-1]
+    assert rejected["outcome"] == "auth_rejected"
+    assert fake.connect_calls == []
+    assert "PRIVATE_ORIGIN_CANARY" not in caplog.text
+    caplog.clear()
+    with client.websocket_connect(path, headers={"origin": "http://testserver"}) as ws:
+        assert _receive_app_message(ws) == {"type": "ready"}
+        ws.send_json({"type": "stop"})
+        assert _receive_app_message(ws) == {"type": "ended"}
+    summary = _diagnostic_records(caplog)[-1]
+    assert summary["outcome"] == "completed"
+    assert summary["interim_received"] == summary["final_received"] == 0
+    assert summary["stt"] == ("google_audio" if path == "/ws/audio" else "web_speech")
+    assert fake.translation_calls == []
+
+
+def test_disconnect_logs_cancelled_paid_work_and_not_a_success(google_client, caplog):
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    client, fake = google_client
+    fake.translation_release = threading.Event()
+    with client.websocket_connect(
+        "/ws/transcript", headers={"origin": "http://testserver"}
+    ) as ws:
+        assert _receive_app_message(ws) == {"type": "ready"}
+        ws.send_json({"type": "final", "text": "PRIVATE_CANCELLED_CANARY"})
+        assert fake.translation_started.wait(2)
+        ws.send_json({"type": "stop"})
+        ws.close(code=1000, reason="PRIVATE_CLOSE_REASON_CANARY")
+    assert fake.translation_cancelled.wait(2)
+    data = _diagnostic_records(caplog)
+    assert data[-1]["outcome"] == "client_disconnect"
+    assert data[-1]["final_cancelled"] == 1
+    assert data[-1]["final_succeeded"] == 0
+    assert "PRIVATE_CANCELLED_CANARY" not in caplog.text
+    assert "PRIVATE_CLOSE_REASON_CANARY" not in caplog.text
+
+
+def test_protocol_failure_logs_only_the_sanitized_code(google_client, caplog):
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    client, _ = google_client
+    with client.websocket_connect(
+        "/ws/transcript", headers={"origin": "http://testserver"}
+    ) as ws:
+        assert _receive_app_message(ws) == {"type": "ready"}
+        ws.send_json(
+            {"type": "PRIVATE_MESSAGE_CANARY", "text": "PRIVATE_CONTENT_CANARY"}
+        )
+        assert _receive_app_message(ws)["code"] == "invalid_message"
+        with pytest.raises(WebSocketDisconnect):
+            _receive_app_message(ws)
+    data = _diagnostic_records(caplog)
+    assert data[-1]["outcome"] == "terminal_error"
+    assert any(row.get("error_code") == "invalid_message" for row in data)
+    assert "PRIVATE_MESSAGE_CANARY" not in caplog.text
+    assert "PRIVATE_CONTENT_CANARY" not in caplog.text
 
 
 def test_liveness_does_not_depend_on_google_configuration(monkeypatch):
@@ -733,6 +853,14 @@ def test_ws_sends_safe_progress_and_timings_without_changing_pair_contract(
         assert timing["translation_ms"] >= 0
         assert timing["queue_ms"] >= 0
         assert "ahoj" not in json.dumps([progress, timing])
+        # Finish explicitly: implicit TestClient teardown can race the live
+        # actor's cancellation and raise concurrent.futures.CancelledError.
+        websocket.send_json({"type": "stop"})
+        assert _receive_app_message(websocket)["type"] == "final"
+        assert _receive_app_message(websocket) == {"type": "ended"}
+        with pytest.raises(WebSocketDisconnect) as closed:
+            _receive_app_message(websocket)
+        assert closed.value.code == 1000
 
 
 @pytest.mark.parametrize(

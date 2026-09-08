@@ -17,6 +17,8 @@ from typing import Awaitable, Callable, Literal, TypedDict
 
 from google.genai import types
 
+from app import diagnostics
+
 
 TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live"
 INTERIM_TRANSLATION_MODEL = "gemini-3.1-flash-lite"
@@ -80,6 +82,10 @@ translate only the words present and never complete the speaker's thought.
 
 class TranslationFailure(RuntimeError):
     """The model did not return one valid English/Russian pair."""
+
+    def __init__(self, message: str, code: str = "invalid_response") -> None:
+        super().__init__(message)
+        self.diagnostic_code = code
 
 
 class TranslationBacklogFull(RuntimeError):
@@ -265,6 +271,8 @@ class GeminiPairTranslator:
 
         attempts = 2 if kind == "final" else 1
         for attempt in range(attempts):
+            started = time.monotonic()
+            response = None
             try:
                 response = await asyncio.wait_for(
                     self._client.models.generate_content(
@@ -282,8 +290,32 @@ class GeminiPairTranslator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                failure = diagnostics.error_fields(exc)
+                candidates = getattr(response, "candidates", None)
+                finish_reason = (
+                    getattr(candidates[0], "finish_reason", None)
+                    if candidates
+                    else None
+                )
+                diagnostics.event(
+                    "translation_attempt_failed",
+                    kind=kind,
+                    model=model,
+                    attempt=attempt + 1,
+                    attempt_ms=max(0, round((time.monotonic() - started) * 1000)),
+                    finish_reason=getattr(finish_reason, "value", finish_reason),
+                    **failure,
+                )
                 if attempt + 1 >= attempts or not _is_transient_error(exc):
                     raise
+                diagnostics.count("retries")
+                diagnostics.event(
+                    "translation_retry",
+                    kind=kind,
+                    model=model,
+                    attempt=attempt + 2,
+                    **failure,
+                )
                 # Retry only a committed final.  Retrying speculative interims
                 # costs money and usually returns after a newer hypothesis.
                 await asyncio.sleep(0.20)
@@ -298,20 +330,26 @@ class GeminiPairTranslator:
         if not isinstance(value, dict):
             raw = getattr(response, "text", None)
             if not isinstance(raw, str):
-                raise TranslationFailure("translation response has no JSON text")
+                raise TranslationFailure(
+                    "translation response has no JSON text", "missing_json"
+                )
             try:
                 value = json.loads(raw)
             except (TypeError, json.JSONDecodeError) as exc:
                 raise TranslationFailure(
-                    "translation response is invalid JSON"
+                    "translation response is invalid JSON", "invalid_json"
                 ) from exc
 
         if set(value) != {"en", "ru"}:
-            raise TranslationFailure("translation response has unexpected fields")
+            raise TranslationFailure(
+                "translation response has unexpected fields", "unexpected_fields"
+            )
         en = _clean_text(value.get("en"))
         ru = _clean_text(value.get("ru"))
         if not en or not ru:
-            raise TranslationFailure("translation response contains an empty language")
+            raise TranslationFailure(
+                "translation response contains an empty language", "empty_language"
+            )
         return {"en": en, "ru": ru}
 
 
@@ -333,6 +371,10 @@ class _LatestTranslationQueue:
         self._event = asyncio.Event()
         self._closed = False
         self.revision = 0
+
+    @property
+    def pending_finals(self) -> int:
+        return len(self._finals)
 
     def put(
         self, kind: TranscriptKind, text: str, eligible_at: float | None = None
@@ -450,6 +492,7 @@ class TranslationCoordinator:
             self._hypotheses += 1
         else:
             self._finals_received += 1
+        diagnostics.transcript(kind, len(text), self._first_stt_ms)
         if kind == "interim" and len(text) > MAX_TRANSCRIPT_CHARS:
             text = text[:MAX_TRANSCRIPT_CHARS]
         if kind == "interim" and text == self._last_interim_text:
@@ -485,6 +528,7 @@ class TranslationCoordinator:
 
     def clear_interim(self) -> None:
         """Withdraw a browser hypothesis without discarding committed finals."""
+        diagnostics.count("interim_withdrawn")
         self._queue.clear_interim()
         self._last_interim_text = ""
         self._interim_deadline = None
@@ -500,7 +544,9 @@ class TranslationCoordinator:
 
     async def run(self) -> None:
         while (work := await self._queue.get()) is not None:
-            task = asyncio.create_task(self._process(work))
+            # The child task inherits the ID; concurrent sessions remain isolated.
+            with diagnostics.work(work.revision):
+                task = asyncio.create_task(self._process(work))
             if work.kind == "interim":
                 self._active_interim = task
             try:
@@ -529,13 +575,58 @@ class TranslationCoordinator:
             self._active_interim_in_flight = True
         try:
             queue_ms = max(0, round((time.monotonic() - work.received_at) * 1000))
+            diagnostics.count(f"{work.kind}_started")
+            diagnostics.event(
+                "translation_started",
+                kind=work.kind,
+                input_chars=len(work.text),
+                model=FINAL_TRANSLATION_MODEL
+                if work.kind == "final"
+                else INTERIM_TRANSLATION_MODEL,
+                timeout_ms=round(
+                    1000
+                    * (
+                        FINAL_TIMEOUT_SECONDS
+                        if work.kind == "final"
+                        else INTERIM_TIMEOUT_SECONDS
+                    )
+                ),
+                queue_ms=queue_ms,
+                pending_finals=self._queue.pending_finals,
+            )
             await self._telemetry(work.kind, "translating", queue_ms=queue_ms)
             started_at = time.monotonic()
             try:
                 pair = await self._translator.translate(work.text, work.kind)
             except asyncio.CancelledError:
+                diagnostics.count(f"{work.kind}_cancelled")
+                cancel_reason = "actor_cancelled"
+                if self._closing:
+                    cancel_reason = "session_shutdown"
+                elif work.revision < self._latest_final_revision:
+                    cancel_reason = "final_preempted"
+                elif work.revision < self._queue.revision:
+                    cancel_reason = "interim_withdrawn"
+                diagnostics.event(
+                    "translation_cancelled",
+                    kind=work.kind,
+                    cancel_reason=cancel_reason,
+                    translation_ms=max(
+                        0, round((time.monotonic() - started_at) * 1000)
+                    ),
+                )
                 raise
-            except Exception:
+            except Exception as exc:
+                diagnostics.count(f"{work.kind}_failed")
+                diagnostics.event(
+                    "translation_failed",
+                    kind=work.kind,
+                    queue_ms=queue_ms,
+                    translation_ms=max(
+                        0, round((time.monotonic() - started_at) * 1000)
+                    ),
+                    **diagnostics.error_fields(exc),
+                )
                 await self._emit(
                     {
                         "type": "error",
@@ -554,6 +645,13 @@ class TranslationCoordinator:
                 return
             translation_ms = max(0, round((time.monotonic() - started_at) * 1000))
             await self._emit({"type": work.kind, "en": pair["en"], "ru": pair["ru"]})
+            diagnostics.count(f"{work.kind}_succeeded")
+            diagnostics.event(
+                "translation_succeeded",
+                kind=work.kind,
+                translation_ms=translation_ms,
+                queue_ms=queue_ms,
+            )
             await self._telemetry(
                 work.kind,
                 "translated",
