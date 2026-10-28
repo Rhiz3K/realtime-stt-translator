@@ -21,7 +21,7 @@ re-exported to ONNX by [`altunenes/parakeet-rs`](https://huggingface.co/altunene
 
 ## Building the model assets
 
-The engine needs `models/{encoder_fp16.onnx,encoder_fp16.onnx.data,decoder_joint.onnx,config.json,vocab.json}`.
+The engine needs `models/{encoder_fp16.onnx,encoder_fp16_concat16.onnx,encoder_fp16_concat8.onnx,encoder_fp16.onnx.data,decoder_joint.onnx,config.json,vocab.json}`.
 These are large and generated, not committed. Build them once:
 
 ```bash
@@ -32,7 +32,10 @@ python3.12 -m venv .venv-nemotron-prep
 
 The script downloads the fp32 ONNX export (~2.6 GB), converts the encoder to fp16
 (~1.2 GB — fits the browser's ~2 GB ArrayBuffer limit and halves WebGPU VRAM),
-copies the fp32 decoder, and extracts `vocab.json`.
+adds small Concat-limited encoder graph variants for WebGPU adapters with
+`maxStorageBuffersPerShaderStage` 16 or 8, copies the fp32 decoder, and extracts
+`vocab.json`. The `concat16`/`concat8` graph files reuse the same
+`encoder_fp16.onnx.data` weights file; they do not duplicate the 1.2 GB weights.
 Set `NEMOTRON_MODEL_DIR=/path/to/models` when you need the script to write to a
 non-default model directory.
 
@@ -40,7 +43,10 @@ In Docker/Coolify, `python -m app.nemotron_assets` runs in the background while
 Uvicorn starts. When `ENABLED_ENGINES` contains `nemotron`, it creates `models/`
 and runs the same preparation script if any required file is missing. Set
 `NEMOTRON_AUTO_PREPARE=false` to disable automatic generation when prebuilt assets
-are mounted. `NEMOTRON_PREPARE_TIMEOUT_SECONDS` controls the preparation
+are mounted. If an older persistent volume already has the base fp16 encoder but
+is missing only `encoder_fp16_concat16.onnx` / `encoder_fp16_concat8.onnx`, the
+prepare script generates those graph variants from the existing fp16 ONNX file
+without redownloading the upstream fp32 model. `NEMOTRON_PREPARE_TIMEOUT_SECONDS` controls the preparation
 subprocess timeout (default 1800 seconds; `0` disables it). The Nemotron engine is
 usable once the model files are present.
 

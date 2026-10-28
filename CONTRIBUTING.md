@@ -118,7 +118,7 @@ pytest -k translate
 pytest --cov=app --cov-report=term-missing
 ```
 
-**Known test issues:** Three Deepgram-related tests (`test_ws_deepgram_happy_path_emits_interim_and_final`, `test_ws_deepgram_init_failure_sends_error`, `test_ws_deepgram_missing_sdk_returns_error`) may hang due to threading/SDK interactions. If you are working on Deepgram code, run these tests individually and be prepared to terminate them manually if they hang.
+**Deepgram tests:** these drive a real SDK listener thread, which reaches the event loop through separate `call_soon_threadsafe` callbacks — so a test that asserts a fixed interim-before-final ordering is a scheduling coin flip. The old happy-path test did that and looked like a hang (it waited forever for an interim that had been coalesced away); it now reads until the final arrives. Write new Deepgram tests order-agnostically, and run them under `timeout` while iterating on Deepgram code.
 
 ### Linting and Formatting
 

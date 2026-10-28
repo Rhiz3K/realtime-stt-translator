@@ -2,12 +2,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg)](https://fastapi.tiangolo.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.136.3-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED.svg)](Dockerfile)
 
 Real-time speech-to-text and translation web application. Speak into a microphone, see transcription appear instantly, and get live translations into two target languages simultaneously.
 
-Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchangeable STT engines, and designed to run anywhere -- locally, in Docker, or behind a reverse proxy.
+Built with [FastAPI](https://fastapi.tiangolo.com/), powered by seven interchangeable STT engines, and designed to run anywhere -- locally, in Docker, or behind a reverse proxy.
 
 ![UI screenshot](https://github.com/user-attachments/assets/4f4323e9-7cea-4cd3-a8c9-ad8b4d896147)
 
@@ -43,17 +43,19 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 ## Features
 
-- **Five STT engines** -- switchable in the UI at any time:
+- **Seven STT engines** -- switchable in the UI at any time:
 
   | Engine | Runs on | API Key | Notes |
   |---|---|---|---|
-  | **Web Speech API** | Browser | None | Chrome/Edge recommended; no server cost |
-  | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js (WebGPU with CPU/WASM fallback); selectable models tiny…large-v3-turbo (~75 MB–800 MB, cached); runs on desktop and Android Chrome 121+; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
+  | **Web Speech API** | Browser API | None | Chrome/Edge recommended; may use the browser vendor's remote service unless experimental `processLocally` is enabled and available |
+  | **Whisper (local)** | Browser | None | On-device ONNX via Transformers.js; in Auto device mode tiny/base/small fall back to CPU/WASM when WebGPU is unavailable (forcing WebGPU reports the failure instead), while large-v3-turbo requires WebGPU; selectable models are ~75 MB–800 MB and cached; inspired by [whisper_android](https://github.com/vilassn/whisper_android) |
   | **Nemotron (local)** | Browser | None | On-device streaming ONNX ([nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)) via onnxruntime-web; **WebGPU strongly recommended** (CPU/WASM works but isn't real-time); ~1.2 GB one-time download; model must be built first ([guide](app/static/nemotron/README.md)) |
+  | **Parakeet v3 (local)** | Browser | None | On-device ONNX ([nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), TDT) via onnxruntime-web; multilingual incl. Czech (~11% FLEURS WER); **WebGPU recommended**; ~930 MB int8 one-time download; build assets first with `scripts/prepare_parakeet_onnx.py` |
   | **Deepgram Nova-3** | Server | Required | High accuracy, low latency |
   | **ElevenLabs Scribe v2** | Server or Browser | Required | Server-side proxy or direct browser connection |
+  | **Azure AI Speech** | Browser → Azure | Required | Browser-direct Speech SDK connection using a short-lived token |
 
-- **Real-time translation** into two configurable target languages (powered by [googletrans](https://github.com/ssut/py-googletrans))
+- **Real-time translation** into two configurable target languages -- [googletrans](https://github.com/ssut/py-googletrans) by default, optional [DeepL](https://www.deepl.com/pro-api) with automatic switch-over while Google rate-limits the server (or pick one provider in Settings)
 - **Interim + final results** -- partial transcriptions shown live before the utterance is committed
 - **Interim throttling** -- server-side message versioning skips stale translations to prevent queue buildup
 - **Password-protected** -- cookie-based auth with HMAC-signed tokens (can be disabled for VPN/proxy setups)
@@ -73,24 +75,30 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 │             │  WS   │                               │
 │  Web Speech ├──────►│  /ws          (text → translate)│
 │  Whisper    ├──────►│  /ws          (text → translate)│
+│  Nemotron   ├──────►│  /ws          (text → translate)│
+│  Parakeet   ├──────►│  /ws          (text → translate)│
 │  Deepgram   ├──────►│  /ws/deepgram (audio → STT → tr.)│
 │  ElevenLabs ├──────►│  /ws/elevenlabs (audio → STT → tr.)│
 │             │       │                               │
 │  ElevenLabs ├──────►│  ElevenLabs WS (browser mode) │
 │  (browser)  │  WS   │  ↕ /ws for translation only   │
+│  Azure      ├──────►│  Azure Speech (browser direct) │
+│             │       │  ↕ /ws for translation only   │
 └─────────────┘       └──────────┬───────────────────┘
                                  │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-              Deepgram API  ElevenLabs API  googletrans
-              (Nova-3 STT)  (Scribe v2)    (translation)
+                    ┌────────────┼────────────┬────────────┐
+                    ▼            ▼            ▼            ▼
+              Deepgram API  ElevenLabs API  Azure Speech  googletrans
+              (Nova-3 STT)  (Scribe v2)     (STT)         (translation)
 ```
 
-**Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT locally; recognized text is sent to `/ws` for translation only.
+**Web Speech** -- The browser's built-in `SpeechRecognition` API handles STT and sends recognized text to `/ws` for translation only. Recognition itself is not necessarily private/on-device: with the default `processLocally=false`, the browser may use a vendor service. Settings can require experimental on-device processing and explicitly install a language pack when the browser supports [`processLocally`](https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition/processLocally), `available()`, and `install()`.
 
 **Whisper (local)** -- The browser downloads a Whisper model ([onnx-community](https://huggingface.co/onnx-community) ONNX) and runs it on-device via Transformers.js, with [Silero VAD](https://github.com/snakers4/silero-vad) (also in-browser ONNX) segmenting speech from silence. It uses **WebGPU** when available (recommended, including Android Chrome 121+) and otherwise runs on **CPU/WASM** -- multi-threaded when the page is cross-origin isolated (the app sends the required COOP/COEP headers). The backend is selectable in Settings. Audio never leaves the client; only transcribed text is sent to `/ws` for translation. Similar in spirit to the native [whisper_android](https://github.com/vilassn/whisper_android), but runs entirely in the browser.
 
 **Nemotron (local)** -- The browser runs NVIDIA's [Nemotron-3.5-ASR streaming](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) model (a cache-aware FastConformer encoder + RNN-T decoder, 40 language-locales) fully on-device via onnxruntime-web. The encoder runs on **WebGPU** (strongly recommended — real-time) with a CPU/WASM fallback that works but isn't real-time for this 600 M model. Because it streams, it shows a growing live transcription and commits a final on each pause; audio never leaves the client, only text goes to `/ws`. The model assets (~1.2 GB fp16) are generated, not committed — build them once with `scripts/prepare_nemotron_onnx.py` (see [app/static/nemotron/README.md](app/static/nemotron/README.md)).
+
+**Parakeet v3 (local)** -- The browser runs NVIDIA's [Parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer encoder + TDT decoder, 25 languages incl. Czech) fully on-device via onnxruntime-web, reusing the Nemotron log-mel front-end. Unlike Nemotron the int8 export is offline, so the engine re-encodes the growing utterance buffer for interims and commits a final on each pause. **WebGPU recommended**; audio never leaves the client, only text goes to `/ws`. The ~930 MB int8 assets are downloaded (not committed) by `scripts/prepare_parakeet_onnx.py` (see [app/static/parakeet/README.md](app/static/parakeet/README.md)).
 
 **Deepgram** -- Raw PCM audio streams from the browser to `/ws/deepgram`. The server proxies it to the Deepgram SDK for transcription, then translates via googletrans.
 
@@ -98,13 +106,15 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), powered by four interchange
 
 **ElevenLabs (browser mode)** -- The browser fetches a single-use token via `POST /api/elevenlabs/token`, connects directly to the ElevenLabs WS, and sends recognized text to `/ws` for translation (same flow as Web Speech).
 
+**Azure AI Speech (browser-direct)** -- The browser fetches a short-lived token via `POST /api/azure/token`, then the Azure SpeechSDK streams mic audio directly to Azure and sends recognized text to `/ws` for translation (same flow as ElevenLabs browser mode). Good Czech support; free **F0** tier ~5 hrs/month.
+
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+ (uses `X | None` union syntax)
 - A microphone-capable browser (Chrome or Edge recommended for Web Speech)
-- API keys for Deepgram and/or ElevenLabs (optional -- Web Speech works without any)
+- API keys for Deepgram, ElevenLabs, and/or Azure (optional -- Web Speech and local engines need none)
 
 ### Local Development
 
@@ -175,26 +185,41 @@ Copy [`.env.example`](.env.example) and edit to taste. All variables have sensib
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `deepgram`, `elevenlabs`. Disabled engines appear grayed out in the UI. (`nemotron` requires building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md).) |
+| `ENABLED_ENGINES` | No | `webspeech` | Comma-separated list: `webspeech`, `whisper`, `nemotron`, `parakeet`, `deepgram`, `elevenlabs`, `azure`. Disabled engines appear grayed out in the UI. (`nemotron`/`parakeet` require building the model first — see [app/static/nemotron/README.md](app/static/nemotron/README.md) / [app/static/parakeet/README.md](app/static/parakeet/README.md).) |
 | `NEMOTRON_AUTO_PREPARE` | No | `true` | When `nemotron` is enabled, create `app/static/nemotron/models` and build missing model assets in the background on container start. First run downloads ~2.6 GB and writes ~1.3 GB. Set `false` if you mount prebuilt assets and do not want automatic generation. |
 | `NEMOTRON_PREPARE_TIMEOUT_SECONDS` | No | `1800` | Timeout for the Nemotron model preparation subprocess. Set `0` to disable, or increase it for slow disks/network. |
 | `DEEPGRAM_API_KEY` | For Deepgram | -- | API key from [console.deepgram.com](https://console.deepgram.com/) |
-| `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Internal queue size for Deepgram transcription results. |
+| `DEEPGRAM_RESULT_QUEUE_SIZE` | No | `100` | Maximum queued Deepgram final transcripts. Pending interims are coalesced; an overloaded session is stopped instead of dropping a final. |
 | `ELEVENLABS_API_KEY` | For ElevenLabs | -- | API key from [elevenlabs.io](https://elevenlabs.io/app/settings/api-keys) |
+| `AZURE_SPEECH_KEY` | For Azure | -- | Speech resource key from the [Azure Portal](https://portal.azure.com/). Browser-direct mode; users may also supply their own key in the UI. |
+| `AZURE_SPEECH_REGION` | For Azure | -- | Azure region of the Speech resource (e.g. `westeurope`). Free **F0** tier gives ~5 audio hours/month. |
 
 #### Translation
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `MAX_TEXT_LENGTH` | No | `5000` | Maximum accepted input text length per WebSocket message. |
-| `TRANSLATE_TIMEOUT_SECONDS` | No | `10` | Timeout for a single googletrans call (seconds). |
+| `TRANSLATE_TIMEOUT_SECONDS` | No | `10` | Timeout for a single translation call (seconds). |
+| `DEEPL_API_KEY` | No | -- | Adds [DeepL](https://www.deepl.com/pro-api) as a translation provider (free keys end with `:fx`, 500k chars/month). |
+| `DEEPL_API_URL` | No | derived from key | Override the DeepL translate endpoint (`api-free.deepl.com` for `:fx` keys, else `api.deepl.com`). |
+| `TRANSLATE_PROVIDER` | No | `auto` | `auto` = googletrans first, switch to DeepL while Google answers HTTP 429; `google` / `deepl` pins one (never switches); `deepl,google` = explicit order. Users can override per session in Settings. |
+| `TRANSLATE_FALLBACK_COOLDOWN_SECONDS` | No | `600` | How long `auto` skips a provider after a rate-limit answer. |
+| `NEMOTRON_MODEL_DIR` | No | `app/static/nemotron/models` | Read by `scripts/prepare_nemotron_onnx.py` only — where to write the generated assets. |
+| `PARAKEET_MODEL_DIR` | No | `app/static/parakeet/models` | Read by `scripts/prepare_parakeet_onnx.py` only — where to write the downloaded assets. |
+
+#### Deployment (Docker / reverse proxy)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PORT` | No | `8000` | Port uvicorn listens on inside the container (`Dockerfile` CMD; Coolify usually sets it). |
+| `FORWARDED_ALLOW_IPS` | Behind a proxy | `127.0.0.1` | Read by **uvicorn**: `X-Forwarded-For` / `X-Forwarded-Proto` are trusted only from these IPs/CIDRs (comma-separated). Set it to the proxy's address or docker network, otherwise all visitors share the proxy's IP for login rate limiting and the auto-detected scheme is `http`. `*` only if the uvicorn port is not reachable directly. |
 
 ### Engine Selection
 
 Engines are enabled via the `ENABLED_ENGINES` environment variable:
 
 ```bash
-# Browser-only, no API keys (Web Speech + local Whisper)
+# No vendor API keys (Web Speech + local Whisper)
 ENABLED_ENGINES=webspeech,whisper
 
 # Browser-only with the on-device Nemotron streaming model (build the model first)
@@ -203,7 +228,7 @@ NEMOTRON_AUTO_PREPARE=true
 NEMOTRON_PREPARE_TIMEOUT_SECONDS=1800
 
 # All engines
-ENABLED_ENGINES=webspeech,whisper,nemotron,deepgram,elevenlabs
+ENABLED_ENGINES=webspeech,whisper,nemotron,parakeet,deepgram,elevenlabs,azure
 
 # Deepgram + ElevenLabs only
 ENABLED_ENGINES=deepgram,elevenlabs
@@ -223,6 +248,7 @@ Disabled engines appear in the UI dropdown but are grayed out and cannot be sele
 | `POST` | `/login` | No | Form login (`password`, `next`). Sets auth cookie. Rate-limited. |
 | `GET` | `/api/translate/languages` | Yes\* | Lists available translation languages. |
 | `POST` | `/api/elevenlabs/token` | Yes\* | Creates single-use ElevenLabs Scribe token. Accepts optional `{"api_key": "..."}` body. |
+| `POST` | `/api/azure/token` | Yes\* | Creates a short-lived Azure Speech token. Accepts optional `{"api_key": "...", "region": "..."}` body. |
 
 \*Auth is required only when `AUTH_ENABLED=true` (default).
 
@@ -230,11 +256,11 @@ Disabled engines appear in the UI dropdown but are grayed out and cannot be sele
 
 | Path | Input | Description |
 |---|---|---|
-| `/ws` | JSON text messages | Translates text (Web Speech, local Whisper, local Nemotron, and ElevenLabs browser mode). |
+| `/ws` | JSON text messages | Translates text (Web Speech, local Whisper/Nemotron/Parakeet, ElevenLabs browser mode, and Azure). |
 | `/ws/deepgram` | Binary PCM audio | Streams audio to Deepgram for STT + translation. |
 | `/ws/elevenlabs` | Binary PCM audio | Streams audio to ElevenLabs for STT + translation. |
 
-All WebSocket endpoints require a valid auth cookie and matching origin header (when `AUTH_ENABLED=true`).
+All WebSocket endpoints require a matching origin header. A valid auth cookie is additionally required when `AUTH_ENABLED=true`.
 
 ### WebSocket Message Format
 
@@ -283,7 +309,7 @@ The first message can optionally be a JSON config:
 }
 ```
 
-All subsequent messages are raw binary PCM audio (16-bit, 16 kHz, mono).
+All subsequent messages are raw binary PCM audio (16-bit, 16 kHz, mono). In ElevenLabs manual-commit mode, the client may also send `{"type": "commit"}`.
 
 ## Testing
 
@@ -311,6 +337,7 @@ python -m compileall app tests
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow and known test issues.
+Trusted pushes and same-repository pull requests also run the pytest suite through `.github/workflows/ci.yml`.
 
 ## Deployment
 
@@ -334,7 +361,7 @@ services:
 ### Coolify
 
 1. Create a new service pointing to the GitHub repository.
-2. Set environment variables in the Coolify dashboard (see [Configuration](#configuration)).
+2. Set environment variables in the Coolify dashboard (see [Configuration](#configuration)). Besides `APP_PASSWORD`, set a separate `AUTH_SECRET`, `AUTH_COOKIE_SECURE=true`, and `FORWARDED_ALLOW_IPS` to Coolify's proxy network (check `docker network inspect coolify` for its subnet) so the login rate limiter sees real client IPs.
 3. Deploy. The `Dockerfile` includes a `HEALTHCHECK` that Coolify uses automatically.
 
 If `ENABLED_ENGINES` contains `nemotron`, the container starts Uvicorn immediately
@@ -355,7 +382,7 @@ When running behind nginx, Caddy, or similar:
 
 1. Set `AUTH_COOKIE_SECURE=true` if the proxy terminates TLS.
 2. Set `ALLOWED_ORIGINS=https://your-domain.com` to restrict WebSocket origins.
-3. Ensure the proxy forwards `Host`, `Origin`, and `X-Forwarded-For` headers.
+3. Ensure the proxy forwards `Host`, `Origin`, and `X-Forwarded-For` headers **and** set `FORWARDED_ALLOW_IPS` to the proxy's address so uvicorn honours them — otherwise the per-IP login rate limit (10 failures / 60 s) applies to the proxy's IP, i.e. to everyone at once.
 4. Enable WebSocket proxying for `/ws`, `/ws/deepgram`, and `/ws/elevenlabs`.
 5. For local Whisper: serve over HTTPS (microphone and WebGPU require a secure context) and pass the app's `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers through unmodified. If the proxy strips them, Whisper still works but loses the faster multi-threaded CPU path.
 
@@ -387,10 +414,12 @@ location ~ ^/ws {
 - **Login rate limiting** -- 10 attempts per 60 seconds per IP (in-memory).
 - **CSRF protection** -- Origin/Referer validation on login form submissions.
 - **Content Security Policy** -- Restricts script sources, frame ancestors, and connect targets.
+- **Permissions Policy** -- Limits microphone and on-device speech-recognition access to the same origin.
 - **Cross-origin isolation** -- `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` headers (also enable multi-threaded WASM for local Whisper).
 - **WebSocket origin check** -- Validates `Origin` header against `Host` or `ALLOWED_ORIGINS`.
 - **Safe redirects** -- `sanitize_next_path` prevents open redirects after login.
 - **No secrets in logs** -- Passwords and API keys are never logged.
+- **Memory-only browser keys** -- API keys entered in Settings are not persisted to `localStorage`.
 
 For vulnerability reporting, please see [SECURITY.md](SECURITY.md).
 
@@ -398,7 +427,7 @@ For vulnerability reporting, please see [SECURITY.md](SECURITY.md).
 
 The following improvements are planned or under consideration. Contributions welcome!
 
-- [ ] **Add CI pipeline** -- GitHub Actions workflow for linting, testing, and Docker build
+- [ ] **Extend CI** -- add linting and a Docker build to the existing pytest workflow
 - [ ] **Internationalize the UI** -- currently Czech labels are hardcoded in templates
 - [ ] **Session recording/export** -- save transcriptions and translations to a downloadable file
 
@@ -406,16 +435,11 @@ The following improvements are planned or under consideration. Contributions wel
 
 These items would improve the project but are not blocking. They make great first contributions:
 
-- [ ] **Pin dependency versions** in `requirements.txt` -- currently unpinned, which can cause breakage on fresh installs when upstream packages release breaking changes
 - [ ] **Expand test coverage** -- add tests for:
-  - ElevenLabs WebSocket happy-path
-  - `/api/translate/languages` endpoint
-  - `sanitize_next_path` edge cases
-  - WebSocket config message handling
-  - `MAX_TEXT_LENGTH` enforcement
-  - Auth token expiry
+  - Browser-driven Web Speech lifecycle behavior across supported Chrome/Edge versions
+  - Real vendor reconnect/error matrices for Deepgram, ElevenLabs, and Azure
 - [ ] **Extract duplicated AudioWorklet PCM processor** code into a shared JavaScript constant -- the same processor is currently inlined in three places (Deepgram, ElevenLabs server mode, ElevenLabs browser mode)
-- [ ] **Consider `google-cloud-translate` or `deepl` for production translation** -- the current `googletrans` library uses an unofficial API that can be slow (1--3 s per call) and occasionally breaks; a paid translation API would be more reliable for production deployments
+- [x] **Second translation provider** -- DeepL is available via `DEEPL_API_KEY`; `TRANSLATE_PROVIDER=auto` switches to it while `googletrans` (unofficial API, per-IP HTTP 429) is rate limited, and the Settings dialog can pin either. Another provider (e.g. `google-cloud-translate`, Azure Translator) slots into `TranslationRouter` the same way
 
 ## Contributing
 

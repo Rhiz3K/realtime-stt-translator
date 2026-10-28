@@ -6,8 +6,9 @@ Downloads the community ONNX export (encoder / decoder_joint / tokenizer) from
 it against the JS engine's assumptions), converts the ~2.45 GB fp32 encoder to
 fp16 (~1.2 GB — fits the browser's ~2 GB ArrayBuffer limit and halves WebGPU VRAM,
 while keeping fp32 model I/O via ``keep_io_types`` so the JS side stays simple),
-copies the small fp32 decoder_joint as-is, and extracts a flat ``vocab.json``
-(id -> SentencePiece piece) for detokenisation.
+copies the small fp32 decoder_joint as-is, writes small Concat-limited encoder
+graph variants for lower WebGPU storage-buffer limits, and extracts a flat
+``vocab.json`` (id -> SentencePiece piece) for detokenisation.
 
 Dev-only. Outputs land in ``app/static/nemotron/models/`` (gitignored).
 
@@ -17,6 +18,8 @@ Dev-only. Outputs land in ``app/static/nemotron/models/`` (gitignored).
 from __future__ import annotations
 
 import argparse
+import copy
+from dataclasses import dataclass
 import json
 import os
 import shutil
@@ -24,8 +27,19 @@ import sys
 from pathlib import Path
 
 REPO_ID = "altunenes/parakeet-rs"
+# Pinned: this is a community repo, and the Dockerfile auto-prepares on container
+# start, so an upstream force-push would silently change the weights served to every
+# browser — and could break the hand-verified ONNX I/O the engine is written against.
+# To move: `HfApi().repo_info(REPO_ID).sha`, bump, then re-run and re-verify.
+REVISION = "a61d2818df4659c956b9661a9447f46e98c15126"
 SUBDIR = "nemotron-3.5-asr-streaming-0.6b-onnx"
 FILES = ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model", "config.json"]
+ENCODER_BASE = "encoder_fp16.onnx"
+ENCODER_DATA = "encoder_fp16.onnx.data"
+ENCODER_CONCAT_VARIANTS = (
+    (16, "encoder_fp16_concat16.onnx"),
+    (8, "encoder_fp16_concat8.onnx"),
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -50,16 +64,144 @@ def _human(n: int) -> str:
     return f"{f:.1f} GB"
 
 
+@dataclass(frozen=True)
+class ConcatSplitPlanNode:
+    inputs: list[str]
+    output: str
+
+
+def _plan_concat_split(inputs: list[str], *, output_name: str, max_inputs: int, name_prefix: str) -> list[ConcatSplitPlanNode]:
+    """Plan a tree of Concat nodes where no node has more than max_inputs.
+
+    WebGPU storage-buffer limits count Concat inputs plus the output buffer in
+    onnxruntime-web's generated shader. A device limit of 16 therefore needs
+    Concat nodes with at most 15 inputs; limit 8 needs at most 7 inputs.
+    """
+    if max_inputs < 2:
+        raise ValueError("max_inputs must be at least 2")
+
+    pending = list(inputs)
+    nodes: list[ConcatSplitPlanNode] = []
+    level = 0
+    while len(pending) > max_inputs:
+        next_pending: list[str] = []
+        for chunk_index, start in enumerate(range(0, len(pending), max_inputs)):
+            chunk = pending[start:start + max_inputs]
+            if len(chunk) == 1:
+                next_pending.append(chunk[0])
+                continue
+            out = f"{output_name}__{name_prefix}_part_{level}_{chunk_index}"
+            nodes.append(ConcatSplitPlanNode(inputs=chunk, output=out))
+            next_pending.append(out)
+        pending = next_pending
+        level += 1
+
+    nodes.append(ConcatSplitPlanNode(inputs=pending, output=output_name))
+    return nodes
+
+
+def _make_concat_node_like(source_node, inputs: list[str], outputs: list[str], name: str):
+    from onnx import helper
+
+    node = helper.make_node(
+        source_node.op_type,
+        inputs,
+        outputs,
+        name=name,
+        domain=source_node.domain,
+    )
+    node.attribute.extend(source_node.attribute)
+    return node
+
+
+def _split_large_concat_nodes(model, *, max_storage_buffers: int) -> int:
+    max_inputs = max_storage_buffers - 1
+    rewritten = 0
+    nodes = []
+
+    for node_index, node in enumerate(model.graph.node):
+        if node.op_type != "Concat" or len(node.input) <= max_inputs:
+            nodes.append(node)
+            continue
+
+        output_name = node.output[0]
+        prefix = f"concat{max_storage_buffers}_{node_index}"
+        plan = _plan_concat_split(
+            list(node.input),
+            output_name=output_name,
+            max_inputs=max_inputs,
+            name_prefix=prefix,
+        )
+        for plan_index, planned in enumerate(plan):
+            is_final = plan_index == len(plan) - 1
+            name_base = node.name or output_name
+            name = name_base if is_final else f"{name_base}__{prefix}_{plan_index}"
+            nodes.append(_make_concat_node_like(node, planned.inputs, [planned.output], name))
+        rewritten += 1
+
+    if rewritten:
+        del model.graph.node[:]
+        model.graph.node.extend(nodes)
+    return rewritten
+
+
+def _write_concat_limited_encoder_variants(model) -> None:
+    import onnx
+
+    for max_storage_buffers, filename in ENCODER_CONCAT_VARIANTS:
+        variant = copy.deepcopy(model)
+        rewritten = _split_large_concat_nodes(variant, max_storage_buffers=max_storage_buffers)
+        _atomic_write(OUT_DIR / filename, lambda tmp, v=variant: onnx.save_model(v, str(tmp)))
+        print(
+            f"      wrote {filename} for WebGPU storage-buffer limit {max_storage_buffers} "
+            f"({rewritten} Concat node(s) split)"
+        )
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _base_browser_assets_exist() -> bool:
+    return all(
+        _is_nonempty_file(OUT_DIR / name)
+        for name in (ENCODER_BASE, ENCODER_DATA, "decoder_joint.onnx", "config.json", "vocab.json")
+    )
+
+
+def _missing_concat_variant_files() -> list[str]:
+    return [
+        filename
+        for _limit, filename in ENCODER_CONCAT_VARIANTS
+        if not _is_nonempty_file(OUT_DIR / filename)
+    ]
+
+
+def _write_missing_concat_variants_from_existing() -> bool:
+    missing = _missing_concat_variant_files()
+    if not missing or not _base_browser_assets_exist():
+        return False
+
+    import onnx
+
+    print("\n[preflight] Existing fp16 assets found; generating missing WebGPU Concat variants…")
+    model = onnx.load(str(OUT_DIR / ENCODER_BASE), load_external_data=False)
+    _write_concat_limited_encoder_variants(model)
+    return True
+
+
 def download() -> Path:
     from huggingface_hub import snapshot_download
 
     print(f"[1/4] Downloading {REPO_ID}/{SUBDIR}/* (~2.6 GB, cached after first run)…")
-    local = snapshot_download(repo_id=REPO_ID, allow_patterns=[f"{SUBDIR}/*"])
+    local = snapshot_download(repo_id=REPO_ID, revision=REVISION, allow_patterns=[f"{SUBDIR}/*"])
     src = Path(local) / SUBDIR
     for f in FILES:
         p = src / f
-        if not p.exists():
-            sys.exit(f"  ! missing expected file: {p}")
+        # Zero-length counts as missing: a truncated cache entry would otherwise
+        # only surface later as a confusing onnx.load failure.
+        if not _is_nonempty_file(p):
+            sys.exit(f"  ! missing or empty file: {p}")
         print(f"      {f:24s} {_human(p.stat().st_size)}")
     return src
 
@@ -126,19 +268,46 @@ def _to_fp16_uniform(model) -> None:
             vi.type.tensor_type.elem_type = F16
 
 
+# Peak usage: the ~2.3 GB fp32 working copy plus the ~1.3 GB of fp16 output, with
+# the graph variants and tmp files on top.
+REQUIRED_FREE_BYTES = 5 * 1024 ** 3
+
+
+def _require_free_space(directory: Path) -> None:
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:  # pragma: no cover - unreadable mount point
+        return
+    if free < REQUIRED_FREE_BYTES:
+        sys.exit(
+            f"  ! not enough free space in {directory}: {_human(free)} available, "
+            f"~{_human(REQUIRED_FREE_BYTES)} needed for the fp32 working copy + fp16 output"
+        )
+
+
 def convert_encoder_fp16(src: Path) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _require_free_space(OUT_DIR)
+    tmp = OUT_DIR / "_fp32tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        _convert_encoder_fp16(src, tmp)
+    finally:
+        # Also on failure: ENOSPC is exactly the case where leaving a 2.3 GB working
+        # copy behind makes the retry fail too.
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _convert_encoder_fp16(src: Path, tmp: Path) -> None:
     import onnx
     import onnxruntime as ort
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_onnx = OUT_DIR / "encoder_fp16.onnx"
-    out_data = "encoder_fp16.onnx.data"
+    out_onnx = OUT_DIR / ENCODER_BASE
+    out_data = ENCODER_DATA
 
     print("\n[3/4] Converting encoder fp32 -> fp16 (uniform, in-house)…")
     # The HF cache stores encoder.onnx.data as a symlink to a blob, which onnx's
     # external-data loader rejects. Materialise real copies into a temp dir first.
-    tmp = OUT_DIR / "_fp32tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
     print("      materialising real fp32 files (resolving HF symlinks)…")
     shutil.copy2(src / "encoder.onnx", tmp / "encoder.onnx")
     shutil.copy2(src / "encoder.onnx.data", tmp / "encoder.onnx.data")
@@ -154,19 +323,36 @@ def convert_encoder_fp16(src: Path) -> None:
 
     print("      writing external fp16 weights (manual, gap-free)…")
     offset = 0
-    with open(OUT_DIR / out_data, "wb") as f:
-        for init in model.graph.initializer:
-            if init.HasField("raw_data") and len(init.raw_data) >= 1024:
-                raw = init.raw_data
-                f.write(raw)
-                init.data_location = TensorProto.EXTERNAL
-                del init.external_data[:]
-                for k, v in (("location", out_data), ("offset", str(offset)), ("length", str(len(raw)))):
-                    e = init.external_data.add()
-                    e.key, e.value = k, v
-                init.ClearField("raw_data")
-                offset += len(raw)
-    onnx.save_model(model, str(out_onnx))  # graph + small inline tensors; refs our .data
+    data_destination = OUT_DIR / out_data
+    data_temporary = data_destination.with_name(data_destination.name + ".tmp")
+    try:
+        with open(data_temporary, "wb") as f:
+            for init in model.graph.initializer:
+                if init.HasField("raw_data") and len(init.raw_data) >= 1024:
+                    raw = init.raw_data
+                    f.write(raw)
+                    init.data_location = TensorProto.EXTERNAL
+                    del init.external_data[:]
+                    for k, v in (("location", out_data), ("offset", str(offset)), ("length", str(len(raw)))):
+                        e = init.external_data.add()
+                        e.key, e.value = k, v
+                    init.ClearField("raw_data")
+                    offset += len(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        # Drop the old graph first: it indexes the OLD weight offsets. If we die
+        # between these two lines, the graph is simply missing and the next run
+        # rebuilds — far better than a new .data paired with a stale graph, which
+        # is non-empty on both sides and so passes every "is it there?" check.
+        out_onnx.unlink(missing_ok=True)
+        os.replace(data_temporary, data_destination)
+    finally:
+        data_temporary.unlink(missing_ok=True)
+
+    # graph + small inline tensors; references the .data written above
+    _atomic_write(out_onnx, lambda tmp: onnx.save_model(model, str(tmp)))
+    print("      writing Concat-limited encoder graph variants for lower WebGPU limits…")
+    _write_concat_limited_encoder_variants(model)
 
     sess = ort.InferenceSession(str(out_onnx), providers=["CPUExecutionProvider"])
     itypes = {i.name: i.type for i in sess.get_inputs()}
@@ -177,11 +363,9 @@ def convert_encoder_fp16(src: Path) -> None:
     print(f"        outputs: {otypes}")
     print("      => uniform fp16 I/O (JS feeds fp16 via f16.js; encoded cast to fp32 for the decoder)")
 
-    shutil.rmtree(tmp, ignore_errors=True)  # drop the 2.3 GB fp32 working copy
-
     # decoder_joint stays fp32 (small; runs on WASM per-token).
-    shutil.copy2(src / "decoder_joint.onnx", OUT_DIR / "decoder_joint.onnx")
-    shutil.copy2(src / "config.json", OUT_DIR / "config.json")
+    for source_name in ("decoder_joint.onnx", "config.json"):
+        _atomic_write(OUT_DIR / source_name, lambda tmp, n=source_name: shutil.copy2(src / n, tmp))
     print(f"      copied decoder_joint.onnx ({_human((OUT_DIR / 'decoder_joint.onnx').stat().st_size)}) + config.json")
 
 
@@ -191,17 +375,62 @@ def extract_vocab(src: Path) -> None:
     print("\n[4/4] Extracting vocab.json from tokenizer.model…")
     sp = spm.SentencePieceProcessor(model_file=str(src / "tokenizer.model"))
     pieces = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
-    (OUT_DIR / "vocab.json").write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8")
+    _atomic_write(
+        OUT_DIR / "vocab.json",
+        lambda tmp: tmp.write_text(json.dumps(pieces, ensure_ascii=False), encoding="utf-8"),
+    )
     cfg = json.loads((src / "config.json").read_text())
     print(f"      sentencepiece pieces: {len(pieces)}  (config vocab_size={cfg.get('vocab_size')}, "
           f"blank_id={cfg.get('blank_id')})")
     print(f"      sample pieces: {pieces[:5]} … unk={sp.id_to_piece(sp.unk_id())!r}")
 
 
+def _atomic_write(destination: Path, write_fn) -> None:
+    """Write through `<destination>.tmp`, then rename into place.
+
+    A crash therefore never leaves a half-written asset where a complete one is
+    expected — the rename is the commit point. Callers that also need power-loss
+    durability fsync inside `write_fn` before it returns (the multi-GB weights
+    writer does); rename alone only orders the visibility, not the flush.
+    """
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        write_fn(temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sweep_stale_temporaries() -> None:
+    """Remove debris from a run that was killed mid-write.
+
+    try/finally cleans up after exceptions but not after SIGKILL/OOM, and this
+    script writes multi-GB temporaries — left behind they make the retry likelier
+    to hit ENOSPC, and `_fp32tmp` alone is ~2.3 GB.
+    """
+    if not OUT_DIR.exists():
+        return
+    for leftover in sorted(OUT_DIR.glob("*.tmp")):
+        print(f"      removing stale temporary {leftover.name}")
+        leftover.unlink(missing_ok=True)
+    stale_workdir = OUT_DIR / "_fp32tmp"
+    if stale_workdir.is_dir():
+        print("      removing stale fp32 working copy (_fp32tmp)")
+        shutil.rmtree(stale_workdir, ignore_errors=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inspect-only", action="store_true", help="download + print ONNX I/O, then stop")
     args = ap.parse_args()
+
+    _sweep_stale_temporaries()
+
+    if not args.inspect_only and _write_missing_concat_variants_from_existing():
+        print(f"\nDone. Assets in {OUT_DIR.relative_to(ROOT)}/:")
+        for p in sorted(OUT_DIR.iterdir()):
+            print(f"  {p.name:28s} {_human(p.stat().st_size)}")
+        return
 
     src = download()
     inspect(src)
